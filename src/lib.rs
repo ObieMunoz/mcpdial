@@ -22,6 +22,7 @@
 
 pub mod client;
 pub mod config;
+pub mod import_config;
 pub mod oauth;
 pub mod protocol;
 pub mod session;

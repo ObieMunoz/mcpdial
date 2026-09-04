@@ -624,3 +624,57 @@ fn stdio_env_and_cwd_are_passed_to_the_process() {
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("only apply to --stdio"));
 }
+
+#[test]
+fn import_reads_host_configs() {
+    let home = temp_home("import");
+    let echo = echo_server().display().to_string();
+    let s = start(Mode::Stateless);
+    let cfg = home.join("hostconfig.json");
+    std::fs::write(
+        &cfg,
+        serde_json::json!({
+            "mcpServers": {
+                "local": {"type": "stdio", "command": echo, "args": [], "env": {"ECHO_SERVER_TAG": "imported"}},
+                "web": {"type": "http", "url": s.url, "headers": {"X-From": "import"}}
+            },
+            "projects": {"/some/project": {"mcpServers": {"spaced": {"command": "npx", "args": ["-y", "pkg", "/tmp/a b"]}}}},
+            "oauthAccount": {"accessToken": "never-read"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let o = run(mcpdial(&home).args(["import", cfg.to_str().unwrap()]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("imported 3 server(s)"), "{}", o.stderr);
+    assert!(o.stderr.contains("projects./some/project"), "{}", o.stderr);
+
+    let o = run(mcpdial(&home).args(["info", "local"]));
+    assert!(
+        o.stdout.contains("tag=imported"),
+        "env came through: {}",
+        o.stdout
+    );
+    let o = run(mcpdial(&home).args(["info", "web"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(
+        s.requests.lock().unwrap()[0].header("x-from"),
+        Some("import")
+    );
+    let saved = std::fs::read_to_string(home.join("servers.json")).unwrap();
+    assert!(saved.contains("npx -y pkg '/tmp/a b'"), "{saved}");
+    assert!(!saved.contains("never-read"));
+
+    let o = run(mcpdial(&home).args(["import", cfg.to_str().unwrap()]));
+    assert!(
+        o.stderr.contains("skip") && o.stderr.contains("imported 0 server(s)"),
+        "{}",
+        o.stderr
+    );
+    let o = run(mcpdial(&home).args(["import", cfg.to_str().unwrap(), "--force"]));
+    assert!(o.stderr.contains("imported 3 server(s)"), "{}", o.stderr);
+
+    let o = run(mcpdial(&home).args(["import", "/nonexistent/file.json"]));
+    assert_eq!(o.code, 2);
+}

@@ -85,6 +85,14 @@ enum Cmd {
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
     },
+    /// Import servers from a host's config (Claude Code, Claude Desktop, Cursor, ...)
+    Import {
+        /// A JSON file with an `mcpServers` object. Omit to scan the usual locations.
+        file: Option<std::path::PathBuf>,
+        /// Overwrite servers that already exist under the same name
+        #[arg(long)]
+        force: bool,
+    },
     /// Forget a server and any credential saved for it
     Rm { name: String },
     /// List saved servers with their live connection status
@@ -250,6 +258,62 @@ fn run(cli: Cli) -> Result<u8, Error> {
             cfg.token_env = opts.token_env.clone();
             store.add_server(&name, cfg.clone())?;
             eprintln!("saved {name} ({} {})", cfg.kind(), cfg.location());
+            Ok(0)
+        }
+
+        Cmd::Import { file, force } => {
+            let files: Vec<std::path::PathBuf> = match file {
+                Some(f) => vec![f],
+                None => import_candidates()
+                    .into_iter()
+                    .filter(|p| p.exists())
+                    .collect(),
+            };
+            if files.is_empty() {
+                return Err(Error::usage(
+                    "no config files found; pass a path to a JSON file with an mcpServers object",
+                ));
+            }
+            let existing = store.servers()?;
+            let mut added = 0;
+            for path in &files {
+                let text = std::fs::read_to_string(path)
+                    .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
+                let doc: Value = serde_json::from_str(&text)
+                    .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
+                let found = mcpdial::import_config::extract(&doc);
+                if found.is_empty() {
+                    eprintln!("{}: no servers", path.display());
+                    continue;
+                }
+                for f in found {
+                    if existing.contains_key(&f.name) && !force {
+                        eprintln!(
+                            "  skip {:<16} already saved (use --force to overwrite)",
+                            f.name
+                        );
+                        continue;
+                    }
+                    match store.add_server(&f.name, f.config.clone()) {
+                        Ok(()) => {
+                            added += 1;
+                            eprintln!(
+                                "  add  {:<16} {} {}  [{} in {}]",
+                                f.name,
+                                f.config.kind(),
+                                f.config.location(),
+                                f.scope,
+                                path.display()
+                            );
+                            if let Some(n) = f.note {
+                                eprintln!("       note: {n}");
+                            }
+                        }
+                        Err(e) => eprintln!("  skip {:<16} {e}", f.name),
+                    }
+                }
+            }
+            eprintln!("imported {added} server(s)");
             Ok(0)
         }
 
@@ -608,6 +672,28 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(0)
         }
     }
+}
+
+/// Where hosts keep their `mcpServers` config, most specific first.
+fn import_candidates() -> Vec<std::path::PathBuf> {
+    let mut out = vec![std::path::PathBuf::from(".mcp.json")];
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        out.push(home.join(".claude.json"));
+        out.push(home.join(".cursor/mcp.json"));
+        out.push(home.join(".codeium/windsurf/mcp_config.json"));
+        if cfg!(target_os = "macos") {
+            out.push(home.join("Library/Application Support/Claude/claude_desktop_config.json"));
+        } else if cfg!(target_os = "windows") {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                out.push(
+                    std::path::PathBuf::from(appdata).join("Claude/claude_desktop_config.json"),
+                );
+            }
+        } else {
+            out.push(home.join(".config/Claude/claude_desktop_config.json"));
+        }
+    }
+    out
 }
 
 fn auth_label(p: &Probe) -> String {
