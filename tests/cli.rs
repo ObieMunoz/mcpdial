@@ -147,6 +147,19 @@ fn stdio_adhoc_call_and_timeout() {
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("no reply after"), "{}", o.stderr);
 
+    // A server that dies on startup explains itself: exit status plus its stderr.
+    let o = run(mcpdial(&home).args([
+        "info",
+        "stdio:/bin/sh -c 'echo npm error 404 Not Found >&2; exit 3'",
+    ]));
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("exited with status 3"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("| npm error 404 Not Found"),
+        "{}",
+        o.stderr
+    );
+
     let o = run(mcpdial(&home).args(["info", "stdio:/definitely/not/a/program"]));
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("could not start"), "{}", o.stderr);

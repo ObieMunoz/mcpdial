@@ -7,17 +7,24 @@
 use super::{silent, Logger, Transport};
 use crate::protocol::{Error, Result};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+/// How many trailing stderr lines to keep for the post-mortem.
+const STDERR_TAIL: usize = 12;
 
 pub struct StdioTransport {
     child: Child,
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
+    /// The server's most recent stderr lines, shown when it dies without replying.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     timeout: Duration,
     log: Logger,
 }
@@ -54,16 +61,35 @@ impl StdioTransport {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if forward_stderr {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::transport(format!("could not start {program:?}: {e}")))?;
 
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+
+        // Always read stderr, so a server that dies on startup (a typo in an npm
+        // package name, a missing binary, a bad flag) can explain itself.
+        let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL)));
+        {
+            let tail = stderr_tail.clone();
+            thread::spawn(move || {
+                for line in BufReader::new(stderr)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
+                    if forward_stderr {
+                        eprintln!("{line}");
+                    }
+                    let mut t = tail.lock().unwrap();
+                    if t.len() == STDERR_TAIL {
+                        t.pop_front();
+                    }
+                    t.push_back(line);
+                }
+            });
+        }
 
         // Read stdout on a thread so a hung server honours the timeout instead of
         // blocking forever on read_line. The channel closes when the server exits.
@@ -83,6 +109,7 @@ impl StdioTransport {
             child,
             stdin,
             lines: rx,
+            stderr_tail,
             timeout,
             log: log.unwrap_or_else(silent),
         })
@@ -97,6 +124,52 @@ impl StdioTransport {
     ) -> Result<Self> {
         let argv = split_command(command)?;
         Self::spawn(&argv, timeout, forward_stderr, log)
+    }
+}
+
+impl StdioTransport {
+    /// The server went away before answering. Say how it exited and what it said.
+    fn post_mortem(&mut self) -> Error {
+        // Give the stderr reader a moment to drain what the process wrote on its way out.
+        let status = match self.child.wait_timeout_polling(Duration::from_millis(500)) {
+            Some(st) => match st.code() {
+                Some(c) => format!("exited with status {c}"),
+                None => "was killed by a signal".to_string(),
+            },
+            None => "closed stdout but is still running".to_string(),
+        };
+        thread::sleep(Duration::from_millis(50));
+        let tail = self.stderr_tail.lock().unwrap();
+        let mut msg = format!("server {status} before replying");
+        if tail.is_empty() {
+            msg.push_str(" (it wrote nothing to stderr)");
+        } else {
+            msg.push_str(". Its last stderr lines:");
+            for line in tail.iter() {
+                msg.push_str("\n  | ");
+                msg.push_str(line);
+            }
+        }
+        Error::transport(msg)
+    }
+}
+
+trait WaitTimeout {
+    fn wait_timeout_polling(&mut self, dur: Duration) -> Option<std::process::ExitStatus>;
+}
+
+impl WaitTimeout for Child {
+    fn wait_timeout_polling(&mut self, dur: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = std::time::Instant::now() + dur;
+        loop {
+            if let Ok(Some(st)) = self.try_wait() {
+                return Some(st);
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -127,9 +200,7 @@ impl Transport for StdioTransport {
                         self.timeout.as_secs_f64()
                     )))
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(Error::transport("server closed stdout before replying"))
-                }
+                Err(RecvTimeoutError::Disconnected) => return Err(self.post_mortem()),
             };
             let line = line.trim();
             if line.is_empty() {
