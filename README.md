@@ -46,7 +46,8 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 
 ```
 mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR]
-mcpdial add NAME --stdio "command args..."
+mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR]
+mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
 mcpdial rm NAME
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
@@ -54,6 +55,7 @@ mcpdial tools [TARGET] [--long]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}']
 mcpdial raw TARGET METHOD ['{"json":"params"}']
+mcpdial shell TARGET             one session, many commands; state persists between calls
 
 mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--redirect-host H] [--no-browser]
 mcpdial logout TARGET
@@ -78,6 +80,50 @@ read_wiki_structure
     Get a list of documentation topics for a GitHub repository.
   parameters:
     repoName: string (required) - GitHub repository: owner/repo (e.g. "facebook/react")
+```
+
+### Stateful servers and the shell
+
+Every `call` starts a fresh session, and for a stdio server that means a fresh process.
+A browser automation server such as `chrome-devtools-mcp` launches a new Chrome each
+time, so a page opened by one call is gone by the next. `mcpdial shell` keeps one
+session open and reads commands from stdin, one per line:
+
+```
+$ mcpdial shell chrome
+chrome> call list_pages
+## Pages
+1: about:blank [selected]
+chrome> call navigate_page {"pageId":1,"url":"https://example.com"}
+Successfully navigated to https://example.com.
+chrome> call list_pages
+## Pages
+1: Example Domain (https://example.com/) [selected]
+chrome> quit
+```
+
+It reads a script from a pipe just as well. Commands are `call`, `tools`, `raw`, `info`,
+and `quit`; a `#` starts a comment. With `--json` each result is one line of JSON. In a
+script, any failed command makes the exit code 1 after the script finishes.
+
+### Importing from a host you already configured
+
+`mcpdial import` reads the `mcpServers` shape that Claude Code, Claude Desktop, Cursor,
+and Windsurf all use, including the per-project entries nested in `~/.claude.json`, and
+saves each server under its existing name. With no file argument it scans the usual
+locations. `command` plus `args` become one stdio command line, `env` and `cwd` are
+kept, and `url` plus `headers` become an HTTP server. Nothing else in those files is read.
+
+### When a stdio server dies on startup
+
+A stdio server's stderr is captured, and if the process exits before answering, the
+error shows its exit status and its last stderr lines. A typo in an npm package name
+looks like this instead of a bare "closed stdout":
+
+```
+error: server exited with status 1 before replying. Its last stderr lines:
+  | npm error code E404
+  | npm error 404 Not Found - GET https://registry.npmjs.org/chrome-dev-tools-mcp - Not found
 ```
 
 ### Status
