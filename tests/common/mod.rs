@@ -1,0 +1,352 @@
+//! A fake Streamable HTTP MCP server, with a fake OAuth authorization server on the
+//! same origin, so the whole client can be exercised without the network.
+
+#![allow(dead_code)]
+
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+use tiny_http::{Header, Response, Server};
+
+#[derive(Clone, Debug)]
+pub enum Mode {
+    /// SSE-framed replies, a session id, and `notifications/initialized` is mandatory.
+    Stateful,
+    /// Plain JSON replies, no session.
+    Stateless,
+    /// 401 with a challenge unless a valid bearer token is presented.
+    Auth { tokens: Vec<String> },
+    /// 403 with no challenge, like a WAF.
+    Blocked,
+}
+
+#[derive(Clone, Debug)]
+pub struct Recorded {
+    pub path: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+impl Recorded {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+    pub fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+#[derive(Default)]
+struct State {
+    initialized: bool,
+    valid_tokens: Vec<String>,
+    code_challenge: Option<String>,
+    issued: u32,
+}
+
+pub struct FakeServer {
+    pub base: String,
+    pub url: String,
+    pub requests: Arc<Mutex<Vec<Recorded>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+pub fn start(mode: Mode) -> FakeServer {
+    let server = Server::http("127.0.0.1:0").expect("bind");
+    let port = server.server_addr().to_ip().unwrap().port();
+    let base = format!("http://127.0.0.1:{port}");
+    let url = format!("{base}/mcp");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let state = Arc::new(Mutex::new(State {
+        valid_tokens: match &mode {
+            Mode::Auth { tokens } => tokens.clone(),
+            _ => Vec::new(),
+        },
+        ..Default::default()
+    }));
+
+    let handle = {
+        let requests = requests.clone();
+        let stop = stop.clone();
+        let base = base.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else { continue };
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let rec = Recorded {
+                    path: req.url().to_string(),
+                    headers: req
+                        .headers()
+                        .iter()
+                        .map(|h| (h.field.as_str().to_string(), h.value.as_str().to_string()))
+                        .collect(),
+                    body,
+                };
+                requests.lock().unwrap().push(rec.clone());
+                let resp = route(&mode, &base, &rec, &state);
+                let _ = req.respond(resp);
+            }
+        })
+    };
+
+    FakeServer { base, url, requests, stop, handle: Some(handle) }
+}
+
+type Resp = Response<std::io::Cursor<Vec<u8>>>;
+
+fn with_headers(resp: Resp, headers: &[(&str, &str)]) -> Resp {
+    headers.iter().fold(resp, |r, (k, v)| {
+        r.with_header(Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap())
+    })
+}
+
+fn json_resp(status: u16, v: &Value) -> Resp {
+    with_headers(
+        Response::from_string(v.to_string()).with_status_code(status),
+        &[("Content-Type", "application/json")],
+    )
+}
+
+fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
+    let (path, query) = rec.path.split_once('?').unwrap_or((&rec.path, ""));
+    match path {
+        "/mcp" => mcp(mode, base, rec, state),
+        "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp" => {
+            json_resp(200, &json!({
+                "resource": format!("{base}/mcp"),
+                "authorization_servers": [base],
+                "scopes_supported": ["mcp"],
+                "bearer_methods_supported": ["header"],
+            }))
+        }
+        "/.well-known/oauth-authorization-server" => json_resp(200, &json!({
+            "issuer": base,
+            "authorization_endpoint": format!("{base}/authorize"),
+            "token_endpoint": format!("{base}/token"),
+            "registration_endpoint": format!("{base}/register"),
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "scopes_supported": ["mcp"],
+        })),
+        "/register" => {
+            let body = rec.json();
+            assert_eq!(body["token_endpoint_auth_method"], "none", "must register as a public client");
+            let redirect = body["redirect_uris"][0].as_str().unwrap_or("").to_string();
+            json_resp(201, &json!({"client_id": "client-abc", "redirect_uris": [redirect]}))
+        }
+        "/authorize" => {
+            let q = form(query);
+            let get = |k: &str| q.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            assert_eq!(get("response_type"), "code");
+            assert_eq!(get("client_id"), "client-abc");
+            assert_eq!(get("code_challenge_method"), "S256");
+            assert_eq!(get("resource"), format!("{base}/mcp"), "must send the resource indicator");
+            state.lock().unwrap().code_challenge = Some(get("code_challenge"));
+            let location = format!("{}?code=code-123&state={}", get("redirect_uri"), get("state"));
+            with_headers(Response::from_string("").with_status_code(302), &[("Location", &location)])
+        }
+        "/token" => {
+            let f = form(&rec.body);
+            let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let mut st = state.lock().unwrap();
+            match get("grant_type").as_str() {
+                "authorization_code" => {
+                    if get("code") != "code-123" {
+                        return json_resp(400, &json!({"error": "invalid_grant"}));
+                    }
+                    let expected = st.code_challenge.clone().unwrap_or_default();
+                    let got = URL_SAFE_NO_PAD.encode(Sha256::digest(get("code_verifier").as_bytes()));
+                    if got != expected {
+                        return json_resp(400, &json!({"error": "invalid_grant", "error_description": "pkce mismatch"}));
+                    }
+                    st.issued += 1;
+                    let tok = format!("tok-{}", st.issued);
+                    st.valid_tokens.push(tok.clone());
+                    json_resp(200, &json!({"access_token": tok, "token_type": "Bearer",
+                        "expires_in": 3600, "refresh_token": "ref-1", "scope": "mcp"}))
+                }
+                "refresh_token" => {
+                    if !get("refresh_token").starts_with("ref-") {
+                        return json_resp(400, &json!({"error": "invalid_grant"}));
+                    }
+                    st.issued += 1;
+                    let tok = format!("tok-{}", st.issued);
+                    st.valid_tokens.push(tok.clone());
+                    json_resp(200, &json!({"access_token": tok, "token_type": "Bearer",
+                        "expires_in": 3600, "refresh_token": format!("ref-{}", st.issued)}))
+                }
+                other => json_resp(400, &json!({"error": "unsupported_grant_type", "got": other})),
+            }
+        }
+        _ => Response::from_string("not found").with_status_code(404),
+    }
+}
+
+fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
+    if let Mode::Blocked = mode {
+        return Response::from_string("error code: 1010").with_status_code(403);
+    }
+    if let Mode::Auth { .. } = mode {
+        let bearer = rec.header("authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
+        if !state.lock().unwrap().valid_tokens.iter().any(|t| t == bearer) {
+            let www = format!(
+                "Bearer realm=\"fake\", error=\"invalid_token\", resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\""
+            );
+            return with_headers(
+                Response::from_string("").with_status_code(401),
+                &[("WWW-Authenticate", &www)],
+            );
+        }
+    }
+
+    let msg = rec.json();
+    let Some(id) = msg.get("id").cloned() else {
+        // A notification. Remember that the client finished the handshake.
+        if msg["method"] == "notifications/initialized" {
+            state.lock().unwrap().initialized = true;
+        }
+        return Response::from_string("").with_status_code(202);
+    };
+    let method = msg["method"].as_str().unwrap_or("");
+    let stateful = matches!(mode, Mode::Stateful);
+
+    if stateful && method != "initialize" {
+        if rec.header("mcp-session-id") != Some("sess-1") {
+            return json_resp(400, &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}));
+        }
+        if !state.lock().unwrap().initialized {
+            return json_resp(200, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Server not initialized"}}));
+        }
+    }
+
+    let params = &msg["params"];
+    let reply = match method {
+        "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+            "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
+        "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
+            {"name":"echo","description":"Echo a message back.\nSecond line.",
+             "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}},
+            {"name":"add","description":"Add two numbers.",
+             "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}}
+        ]}}),
+        "tools/call" => match params["name"].as_str().unwrap_or("") {
+            "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
+                "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
+            "add" => {
+                let (a, b) = (params["arguments"]["a"].as_f64().unwrap_or(0.0), params["arguments"]["b"].as_f64().unwrap_or(0.0));
+                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}]}})
+            }
+            "fail" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}}),
+            other => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Tool {other} not found")}}),
+        },
+        other => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}}),
+    };
+
+    if stateful {
+        let sse = format!("event: message\ndata: {reply}\n\n");
+        let mut r = with_headers(Response::from_string(sse), &[("Content-Type", "text/event-stream")]);
+        if method == "initialize" {
+            r = with_headers(r, &[("Mcp-Session-Id", "sess-1")]);
+        }
+        r
+    } else {
+        json_resp(200, &reply)
+    }
+}
+
+fn form(s: &str) -> Vec<(String, String)> {
+    s.split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let (k, v) = p.split_once('=').unwrap_or((p, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+// -- helpers for driving the binary -------------------------------------------
+
+pub fn temp_home(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("mcpdial-{tag}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+pub fn mcpdial(home: &std::path::Path) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_mcpdial"));
+    c.env("MCPDIAL_HOME", home).env_remove("XDG_CONFIG_HOME");
+    c
+}
+
+/// `cargo test` builds examples alongside the tests; find the one we spawn.
+pub fn echo_server() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let debug = exe.parent().unwrap().parent().unwrap();
+    let candidates = [debug.join("examples/echo_server"), debug.join("examples/echo_server.exe")];
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .cloned()
+        .expect("examples/echo_server not built; run `cargo build --examples` first")
+}
+
+pub struct Out {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub fn run(cmd: &mut Command) -> Out {
+    let o = cmd.output().expect("spawn mcpdial");
+    Out {
+        code: o.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
