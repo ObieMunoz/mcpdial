@@ -20,3 +20,12 @@ pub type Logger = Box<dyn FnMut(&str)>;
 pub(crate) fn silent() -> Logger {
     Box::new(|_| {})
 }
+
+impl Transport for Box<dyn Transport> {
+    fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+        (**self).send(payload)
+    }
+    fn close(&mut self) {
+        (**self).close()
+    }
+}
