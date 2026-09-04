@@ -69,7 +69,8 @@ fn convert(name: &str, entry: &Value, scope: &str) -> Option<Found> {
         let mut c = ServerConfig::http(url);
         c.headers = string_map(&entry["headers"]);
         c
-    } else if let Some(command) = entry.get("command").and_then(Value::as_str) {
+    } else {
+        let command = entry.get("command").and_then(Value::as_str)?;
         let mut argv = vec![command.to_string()];
         argv.extend(
             entry["args"]
@@ -86,8 +87,6 @@ fn convert(name: &str, entry: &Value, scope: &str) -> Option<Found> {
         c.env = string_map(&entry["env"]);
         c.cwd = entry.get("cwd").and_then(Value::as_str).map(str::to_string);
         c
-    } else {
-        return None;
     };
 
     Some(Found {
