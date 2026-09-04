@@ -751,3 +751,101 @@ fn import_reads_host_configs() {
     let o = run(mcpdial(&home).args(["import", "/nonexistent/file.json"]));
     assert_eq!(o.code, 2);
 }
+
+#[test]
+fn agent_surface_json_errors_file_args_schema_and_guide() {
+    let s = start(Mode::Stateless);
+    let auth = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("agent");
+
+    // Errors are one JSON object on stderr under --json, with a kind to branch on.
+    let o = run(mcpdial(&home).args(["--json", "call", &s.url, "nope"]));
+    assert_eq!(o.code, 1);
+    let e: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(e["error"]["kind"], "rpc");
+    assert_eq!(e["error"]["code"], -32602);
+    assert!(o.stdout.is_empty());
+
+    let o = run(mcpdial(&home).args(["--json", "info", &auth.url]));
+    let e: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(e["error"]["kind"], "http");
+    assert_eq!(e["error"]["status"], 401);
+    assert!(e["error"]["www_authenticate"]
+        .as_str()
+        .unwrap()
+        .contains("resource_metadata"));
+
+    let o = run(mcpdial(&home).args(["--json", "call", &s.url, "echo", "{bad"]));
+    assert_eq!(o.code, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(o.stderr.trim()).unwrap()["error"]["kind"],
+        "usage"
+    );
+
+    // Arguments from a file and from stdin.
+    let f = home.join("args.json");
+    std::fs::write(&f, r#"{"message":"from a file"}"#).unwrap();
+    let at = format!("@{}", f.display());
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", &at]));
+    assert_eq!(o.stdout.trim(), "Echo: from a file", "{}", o.stderr);
+    let mut child = mcpdial(&home)
+        .args(["--json", "call", &s.url, "echo", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"message":"from stdin"}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["content"][0]["text"], "Echo: from stdin");
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", "@/nonexistent.json"]));
+    assert_eq!(o.code, 2);
+
+    // One tool's schema, and a helpful miss.
+    let o = run(mcpdial(&home).args(["schema", &s.url, "add"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["name"], "add");
+    assert_eq!(v["inputSchema"]["required"][0], "a");
+    let o = run(mcpdial(&home).args(["schema", &s.url, "nah"]));
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("available: echo, add"), "{}", o.stderr);
+
+    // The guide is embedded in the binary.
+    let o = run(mcpdial(&home).args(["guide"]));
+    assert_eq!(o.code, 0);
+    assert!(o.stdout.contains("# mcpdial for agents"));
+    assert!(o.stdout.contains("Exit codes"));
+
+    // Shell in JSON mode keeps errors on stdout, in order.
+    let mut child = mcpdial(&home)
+        .args(["--json", "shell", &s.url])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"call echo {\"message\":\"one\"}\ncall nope\ncall echo {\"message\":\"two\"}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let lines: Vec<Value> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(lines[0]["content"][0]["text"], "Echo: one");
+    assert_eq!(lines[1]["error"]["kind"], "rpc");
+    assert_eq!(lines[2]["content"][0]["text"], "Echo: two");
+    assert_eq!(out.status.code(), Some(1));
+}

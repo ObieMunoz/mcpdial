@@ -26,7 +26,9 @@ examples:
   mcpdial login work              # one-time browser step; the token is saved
   mcpdial call wiki read_wiki_structure '{\"repoName\":\"modelcontextprotocol/servers\"}'
   mcpdial call https://mcp.deepwiki.com/mcp read_wiki_structure '{\"repoName\":\"x/y\"}'
-  mcpdial tools 'stdio:npx -y @modelcontextprotocol/server-everything stdio'"
+  mcpdial tools 'stdio:npx -y @modelcontextprotocol/server-everything stdio'
+
+calling from a program or an agent: pass --json everywhere and run `mcpdial guide`."
 )]
 struct Cli {
     /// Seconds to wait for a reply
@@ -116,18 +118,22 @@ enum Cmd {
     Call {
         target: String,
         tool: String,
-        /// JSON object of arguments
+        /// JSON object of arguments: inline, @file, or - for stdin
         #[arg(default_value = "{}")]
         arguments: String,
     },
+    /// Show one tool's name, description, and input schema
+    Schema { target: String, tool: String },
     /// Send any JSON-RPC method
     Raw {
         target: String,
         method: String,
-        /// JSON object of params
+        /// JSON object of params: inline, @file, or - for stdin
         #[arg(default_value = "{}")]
         params: String,
     },
+    /// Print the usage guide written for programs and agents that call mcpdial
+    Guide,
     /// Authorize in the browser once and save the token (HTTP servers)
     Login {
         target: String,
@@ -171,16 +177,71 @@ enum TokenCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let json = cli.json;
     match run(cli) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("error: {e}");
+            if json {
+                eprintln!("{}", error_json(&e));
+            } else {
+                eprintln!("error: {e}");
+            }
             ExitCode::from(match e {
                 Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
                 _ => EXIT_ERROR,
             })
         }
     }
+}
+
+/// One JSON object per error, so a program can branch on `kind` without parsing prose.
+fn error_json(e: &Error) -> Value {
+    let mut v = json!({ "message": e.to_string() });
+    match e {
+        Error::Rpc { code, data, .. } => {
+            v["kind"] = json!("rpc");
+            v["code"] = json!(code);
+            if let Some(d) = data {
+                v["data"] = d.clone();
+            }
+        }
+        Error::Http {
+            status,
+            www_authenticate,
+            ..
+        } => {
+            v["kind"] = json!("http");
+            v["status"] = json!(status);
+            if let Some(w) = www_authenticate {
+                v["www_authenticate"] = json!(w);
+            }
+        }
+        Error::Transport(_) => v["kind"] = json!("transport"),
+        Error::Auth(_) => v["kind"] = json!("auth"),
+        Error::Config(_) => v["kind"] = json!("config"),
+        Error::Usage(_) => v["kind"] = json!("usage"),
+    }
+    json!({ "error": v })
+}
+
+/// A JSON object given inline, as `@path` to read a file, or `-` to read stdin.
+fn read_json_arg(text: &str, what: &str) -> Result<Value, Error> {
+    let owned;
+    let text = if text == "-" {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| Error::usage(format!("reading {what} from stdin: {e}")))?;
+        owned = buf;
+        &owned
+    } else if let Some(path) = text.strip_prefix('@') {
+        owned = std::fs::read_to_string(path)
+            .map_err(|e| Error::usage(format!("reading {what} from {path}: {e}")))?;
+        &owned
+    } else {
+        text
+    };
+    parse_object(text, what)
 }
 
 fn parse_object(text: &str, what: &str) -> Result<Value, Error> {
@@ -420,7 +481,11 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 };
                 if let Err(e) = outcome {
                     failures += 1;
-                    eprintln!("error: {e}");
+                    if cli.json {
+                        println!("{}", error_json(&e));
+                    } else {
+                        eprintln!("error: {e}");
+                    }
                 }
             }
             Ok(if failures > 0 && !interactive {
@@ -428,6 +493,27 @@ fn run(cli: Cli) -> Result<u8, Error> {
             } else {
                 0
             })
+        }
+
+        Cmd::Schema { target, tool } => {
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let tools = conn.session.list_tools()?;
+            let Some(t) = tools.iter().find(|t| t["name"] == tool) else {
+                let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+                return Err(Error::Rpc {
+                    code: -32602,
+                    message: format!("Tool {tool} not found; available: {}", names.join(", ")),
+                    data: None,
+                });
+            };
+            println!("{}", serde_json::to_string_pretty(t).unwrap());
+            Ok(0)
+        }
+
+        Cmd::Guide => {
+            print!("{}", include_str!("../docs/AGENTS.md"));
+            Ok(0)
         }
 
         Cmd::Rm { name } => {
@@ -614,7 +700,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             tool,
             arguments,
         } => {
-            let arguments = parse_object(&arguments, "arguments")?;
+            let arguments = read_json_arg(&arguments, "arguments")?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let result = conn.session.call_tool(&tool, arguments)?;
@@ -635,7 +721,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             method,
             params,
         } => {
-            let params = parse_object(&params, "params")?;
+            let params = read_json_arg(&params, "params")?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let result = conn.session.request(&method, Some(params))?;
