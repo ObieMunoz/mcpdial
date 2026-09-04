@@ -37,7 +37,8 @@ impl Default for Options {
 
 impl Options {
     fn logger(&self) -> Option<Logger> {
-        self.verbose.then(|| Box::new(|s: &str| eprintln!("{s}")) as Logger)
+        self.verbose
+            .then(|| Box::new(|s: &str| eprintln!("{s}")) as Logger)
     }
 }
 
@@ -55,17 +56,31 @@ pub struct Resolved {
 /// `stdio:<command>` for an ad-hoc local process.
 pub fn resolve(store: &Store, target: &str) -> Result<Resolved> {
     if let Some(cfg) = store.server(target)? {
-        return Ok(Resolved { name: target.to_string(), config: cfg, saved: true });
+        return Ok(Resolved {
+            name: target.to_string(),
+            config: cfg,
+            saved: true,
+        });
     }
     if target.starts_with("http://") || target.starts_with("https://") {
-        return Ok(Resolved { name: target.to_string(), config: ServerConfig::http(target), saved: false });
+        return Ok(Resolved {
+            name: target.to_string(),
+            config: ServerConfig::http(target),
+            saved: false,
+        });
     }
     if let Some(cmd) = target.strip_prefix("stdio:") {
         let cmd = cmd.trim();
         if cmd.is_empty() {
-            return Err(Error::usage("stdio: target needs a command after the colon"));
+            return Err(Error::usage(
+                "stdio: target needs a command after the colon",
+            ));
         }
-        return Ok(Resolved { name: target.to_string(), config: ServerConfig::stdio(cmd), saved: false });
+        return Ok(Resolved {
+            name: target.to_string(),
+            config: ServerConfig::stdio(cmd),
+            saved: false,
+        });
     }
     Err(Error::usage(format!(
         "unknown server {target:?}. Add it with `mcpdial add {target} --http URL` \
@@ -106,7 +121,10 @@ fn select_token(store: &Store, r: &Resolved, opts: &Options) -> Result<(Option<S
         return Ok((None, AuthUsed::None));
     };
     if cred.is_expired() && cred.can_refresh() {
-        cred = oauth::refresh(&oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())), &cred)?;
+        cred = oauth::refresh(
+            &oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())),
+            &cred,
+        )?;
         store.save_credential(&r.name, cred.clone())?;
     }
     Ok((cred.access_token.filter(|t| !t.is_empty()), AuthUsed::Saved))
@@ -139,7 +157,12 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         let t = StdioTransport::spawn_str(cmd, opts.timeout, opts.verbose, opts.logger())?;
         let mut session = Session::new(Box::new(t) as Box<dyn Transport>);
         let info = session.initialize()?.clone();
-        return Ok(Connection { name: r.name.clone(), session, server_info: info, auth: AuthUsed::None });
+        return Ok(Connection {
+            name: r.name.clone(),
+            session,
+            server_info: info,
+            auth: AuthUsed::None,
+        });
     }
 
     let (token, auth) = select_token(store, r, opts)?;
@@ -147,19 +170,33 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
     match session.initialize() {
         Ok(info) => {
             let info = info.clone();
-            Ok(Connection { name: r.name.clone(), session, server_info: info, auth })
+            Ok(Connection {
+                name: r.name.clone(),
+                session,
+                server_info: info,
+                auth,
+            })
         }
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
                 return Err(e);
             }
-            let cred = oauth::refresh(&oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())), &cred)?;
+            let cred = oauth::refresh(
+                &oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())),
+                &cred,
+            )?;
             store.save_credential(&r.name, cred.clone())?;
-            let mut session =
-                Session::new(Box::new(http_transport(r, cred.access_token, opts)) as Box<dyn Transport>);
+            let mut session = Session::new(
+                Box::new(http_transport(r, cred.access_token, opts)) as Box<dyn Transport>
+            );
             let info = session.initialize()?.clone();
-            Ok(Connection { name: r.name.clone(), session, server_info: info, auth })
+            Ok(Connection {
+                name: r.name.clone(),
+                session,
+                server_info: info,
+                auth,
+            })
         }
         Err(e) => Err(e),
     }
@@ -177,9 +214,15 @@ pub enum Status {
     TokenRejected,
     /// 403 without a challenge: WAF, allowlist, geo. A token will not help.
     Blocked,
-    Http { status: u16 },
-    Unreachable { detail: String },
-    Error { detail: String },
+    Http {
+        status: u16,
+    },
+    Unreachable {
+        detail: String,
+    },
+    Error {
+        detail: String,
+    },
 }
 
 impl Status {
@@ -228,22 +271,28 @@ pub fn probe(store: &Store, r: &Resolved, opts: &Options, with_tools: bool) -> P
     };
     let had_credential = r.config.token_env.is_some()
         || opts.token_env.is_some()
-        || store.credential(&r.name).ok().flatten().is_some_and(|c| c.has_token());
+        || store
+            .credential(&r.name)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.has_token());
 
     match connect(store, r, opts) {
         Ok(mut conn) => {
             p.auth = conn.auth;
             let si = &conn.server_info["serverInfo"];
-            p.server = si["name"].as_str().map(|n| {
-                match si["version"].as_str() {
-                    Some(v) if !v.is_empty() => format!("{n} {v}"),
-                    _ => n.to_string(),
-                }
+            p.server = si["name"].as_str().map(|n| match si["version"].as_str() {
+                Some(v) if !v.is_empty() => format!("{n} {v}"),
+                _ => n.to_string(),
             });
             if with_tools {
                 match conn.session.list_tools() {
                     Ok(t) => p.tools = Some(t),
-                    Err(e) => p.status = Status::Error { detail: e.to_string() },
+                    Err(e) => {
+                        p.status = Status::Error {
+                            detail: e.to_string(),
+                        }
+                    }
                 }
             }
         }
@@ -254,14 +303,20 @@ pub fn probe(store: &Store, r: &Resolved, opts: &Options, with_tools: bool) -> P
 
 fn classify(e: &Error, had_credential: bool) -> Status {
     match e {
-        Error::Http { status, www_authenticate, .. } => match (status, www_authenticate) {
+        Error::Http {
+            status,
+            www_authenticate,
+            ..
+        } => match (status, www_authenticate) {
             (_, Some(_)) | (401, None) if had_credential => Status::TokenRejected,
             (_, Some(_)) | (401, None) => Status::AuthRequired,
             (403, None) => Status::Blocked,
             (s, _) => Status::Http { status: *s },
         },
         Error::Transport(d) => Status::Unreachable { detail: d.clone() },
-        other => Status::Error { detail: other.to_string() },
+        other => Status::Error {
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -271,9 +326,16 @@ pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<
     let mut results: Vec<Option<Probe>> = vec![None; servers.len()];
     std::thread::scope(|scope| {
         for (slot, (name, cfg)) in results.iter_mut().zip(servers.iter()) {
-            let r = Resolved { name: name.clone(), config: cfg.clone(), saved: true };
+            let r = Resolved {
+                name: name.clone(),
+                config: cfg.clone(),
+                saved: true,
+            };
             let store = store.clone();
-            let opts = Options { verbose: false, ..opts.clone() };
+            let opts = Options {
+                verbose: false,
+                ..opts.clone()
+            };
             scope.spawn(move || *slot = Some(probe(&store, &r, &opts, with_tools)));
         }
     });
@@ -287,13 +349,19 @@ pub fn describe_params(tool: &Value) -> Vec<String> {
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
-    let Some(props) = schema["properties"].as_object() else { return Vec::new() };
+    let Some(props) = schema["properties"].as_object() else {
+        return Vec::new();
+    };
     props
         .iter()
         .map(|(name, spec)| {
             let ty = match &spec["type"] {
                 Value::String(s) => s.clone(),
-                Value::Array(a) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("|"),
+                Value::Array(a) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("|"),
                 _ if spec.get("enum").is_some() => "enum".into(),
                 _ => "any".into(),
             };
@@ -324,12 +392,27 @@ mod tests {
             body: String::new(),
             www_authenticate: www.map(str::to_string),
         };
-        assert_eq!(classify(&http(401, Some("Bearer")), false), Status::AuthRequired);
-        assert_eq!(classify(&http(401, Some("Bearer")), true), Status::TokenRejected);
-        assert_eq!(classify(&http(403, Some("Bearer")), false), Status::AuthRequired);
+        assert_eq!(
+            classify(&http(401, Some("Bearer")), false),
+            Status::AuthRequired
+        );
+        assert_eq!(
+            classify(&http(401, Some("Bearer")), true),
+            Status::TokenRejected
+        );
+        assert_eq!(
+            classify(&http(403, Some("Bearer")), false),
+            Status::AuthRequired
+        );
         assert_eq!(classify(&http(403, None), true), Status::Blocked);
-        assert_eq!(classify(&http(500, None), false), Status::Http { status: 500 });
-        assert!(matches!(classify(&Error::transport("x"), false), Status::Unreachable { .. }));
+        assert_eq!(
+            classify(&http(500, None), false),
+            Status::Http { status: 500 }
+        );
+        assert!(matches!(
+            classify(&Error::transport("x"), false),
+            Status::Unreachable { .. }
+        ));
     }
 
     #[test]

@@ -170,7 +170,10 @@ fn split_url(url: &str) -> (String, String) {
             let path = url[p..].split(['?', '#']).next().unwrap_or("");
             (url[..p].to_string(), path.trim_end_matches('/').to_string())
         }
-        None => (url.split(['?', '#']).next().unwrap_or(url).to_string(), String::new()),
+        None => (
+            url.split(['?', '#']).next().unwrap_or(url).to_string(),
+            String::new(),
+        ),
     }
 }
 
@@ -184,7 +187,9 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         prm_urls.push(u.to_string());
     }
     if !path.is_empty() {
-        prm_urls.push(format!("{origin}/.well-known/oauth-protected-resource{path}"));
+        prm_urls.push(format!(
+            "{origin}/.well-known/oauth-protected-resource{path}"
+        ));
     }
     prm_urls.push(format!("{origin}/.well-known/oauth-protected-resource"));
 
@@ -204,8 +209,12 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
     let (as_origin, as_path) = split_url(&issuer);
     let mut as_urls = Vec::new();
     if !as_path.is_empty() {
-        as_urls.push(format!("{as_origin}/.well-known/oauth-authorization-server{as_path}"));
-        as_urls.push(format!("{as_origin}/.well-known/openid-configuration{as_path}"));
+        as_urls.push(format!(
+            "{as_origin}/.well-known/oauth-authorization-server{as_path}"
+        ));
+        as_urls.push(format!(
+            "{as_origin}/.well-known/openid-configuration{as_path}"
+        ));
         as_urls.push(format!("{issuer}/.well-known/openid-configuration"));
     } else {
         as_urls.push(format!("{issuer}/.well-known/oauth-authorization-server"));
@@ -241,7 +250,12 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
 
 fn string_list(v: &Value) -> Vec<String> {
     v.as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -264,7 +278,9 @@ pub fn register(http: &Http, meta: &Metadata, redirect_uri: &str) -> Result<Stri
     });
     let (status, value, text) = http.post_json(endpoint, &body)?;
     if !(200..300).contains(&status) {
-        return Err(Error::auth(format!("registration at {endpoint} failed: HTTP {status}\n{text}")));
+        return Err(Error::auth(format!(
+            "registration at {endpoint} failed: HTTP {status}\n{text}"
+        )));
     }
     value["client_id"]
         .as_str()
@@ -290,7 +306,9 @@ pub fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -354,8 +372,12 @@ fn wait_for_code(listener: TcpListener, expected_state: &str, timeout: Duration)
             }
         }
     });
-    rx.recv_timeout(timeout)
-        .map_err(|_| Error::auth(format!("no authorization callback within {}s", timeout.as_secs())))?
+    rx.recv_timeout(timeout).map_err(|_| {
+        Error::auth(format!(
+            "no authorization callback within {}s",
+            timeout.as_secs()
+        ))
+    })?
 }
 
 fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result<String>> {
@@ -367,7 +389,8 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
     let target = line.split_whitespace().nth(1)?.to_string();
     let (path, query) = target.split_once('?').unwrap_or((&target, ""));
     if path != "/callback" {
-        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return None;
     }
     // Drain the headers so the browser does not see a reset.
@@ -379,7 +402,12 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
     }
 
     let params = query_params(query);
-    let get = |k: &str| params.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+    let get = |k: &str| {
+        params
+            .iter()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.as_str())
+    };
 
     let result = if let Some(err) = get("error") {
         Err(Error::auth(format!(
@@ -387,7 +415,9 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
             get("error_description").unwrap_or("")
         )))
     } else if get("state") != Some(expected_state) {
-        Err(Error::auth("state mismatch on callback; possible CSRF, aborting"))
+        Err(Error::auth(
+            "state mismatch on callback; possible CSRF, aborting",
+        ))
     } else if let Some(code) = get("code") {
         Ok(code.to_string())
     } else {
@@ -395,7 +425,10 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
     };
 
     let (title, msg) = match &result {
-        Ok(_) => ("Signed in", "mcpdial has the authorization code. You can close this tab."),
+        Ok(_) => (
+            "Signed in",
+            "mcpdial has the authorization code. You can close this tab.",
+        ),
         Err(e) => ("Sign-in failed", &*e.to_string()),
     };
     let html = format!(
@@ -424,7 +457,13 @@ pub struct LoginOptions {
 
 impl Default for LoginOptions {
     fn default() -> Self {
-        Self { scope: None, port: None, client_id: None, open_browser: true, timeout: Duration::from_secs(300) }
+        Self {
+            scope: None,
+            port: None,
+            client_id: None,
+            open_browser: true,
+            timeout: Duration::from_secs(300),
+        }
     }
 }
 
@@ -445,15 +484,24 @@ pub fn login(
     notify(&format!("authorization server: {}", meta.issuer));
 
     // A saved client id is only reusable on the port it was registered with.
-    let saved_port = existing.filter(|c| c.client_id.is_some()).and_then(|c| c.redirect_port);
+    let saved_port = existing
+        .filter(|c| c.client_id.is_some())
+        .and_then(|c| c.redirect_port);
     let want_port = opts.port.or(saved_port).unwrap_or(0);
     let listener = match TcpListener::bind(("127.0.0.1", want_port)) {
         Ok(l) => l,
         Err(_) if opts.port.is_none() && want_port != 0 => TcpListener::bind(("127.0.0.1", 0))
             .map_err(|e| Error::auth(format!("cannot open a loopback port: {e}")))?,
-        Err(e) => return Err(Error::auth(format!("cannot bind 127.0.0.1:{want_port}: {e}"))),
+        Err(e) => {
+            return Err(Error::auth(format!(
+                "cannot bind 127.0.0.1:{want_port}: {e}"
+            )))
+        }
     };
-    let port = listener.local_addr().map_err(|e| Error::auth(e.to_string()))?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|e| Error::auth(e.to_string()))?
+        .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
     let client_id = match (&opts.client_id, existing) {
@@ -490,7 +538,11 @@ pub fn login(
     let auth_url = format!(
         "{}{}{}",
         meta.authorization_endpoint,
-        if meta.authorization_endpoint.contains('?') { "&" } else { "?" },
+        if meta.authorization_endpoint.contains('?') {
+            "&"
+        } else {
+            "?"
+        },
         params
             .iter()
             .map(|(k, v)| format!("{k}={}", urlencode(v)))
@@ -522,7 +574,9 @@ pub fn login(
         ],
     )?;
     if !(200..300).contains(&status) {
-        return Err(Error::auth(format!("token exchange failed: HTTP {status}\n{text}")));
+        return Err(Error::auth(format!(
+            "token exchange failed: HTTP {status}\n{text}"
+        )));
     }
 
     let mut cred = credential_from_token_response(&value, Credential::default())?;
@@ -602,8 +656,14 @@ mod tests {
 
     #[test]
     fn splits_urls() {
-        assert_eq!(split_url("https://a.b/mcp"), ("https://a.b".into(), "/mcp".into()));
-        assert_eq!(split_url("https://a.b:8443/x/y/?q=1"), ("https://a.b:8443".into(), "/x/y".into()));
+        assert_eq!(
+            split_url("https://a.b/mcp"),
+            ("https://a.b".into(), "/mcp".into())
+        );
+        assert_eq!(
+            split_url("https://a.b:8443/x/y/?q=1"),
+            ("https://a.b:8443".into(), "/x/y".into())
+        );
         assert_eq!(split_url("https://a.b"), ("https://a.b".into(), "".into()));
     }
 
@@ -631,13 +691,24 @@ mod tests {
         let s = "a b&c=d/e~f%";
         assert_eq!(urlencode(s), "a%20b%26c%3Dd%2Fe~f%25");
         assert_eq!(urldecode(&urlencode(s)), s);
-        assert_eq!(query_params("code=ab%2Fc&state=x+y"), vec![("code".into(), "ab/c".into()), ("state".into(), "x y".into())]);
+        assert_eq!(
+            query_params("code=ab%2Fc&state=x+y"),
+            vec![
+                ("code".into(), "ab/c".into()),
+                ("state".into(), "x y".into())
+            ]
+        );
     }
 
     #[test]
     fn token_response_keeps_old_refresh_token_when_not_rotated() {
-        let base = Credential { refresh_token: Some("old".into()), ..Default::default() };
-        let c = credential_from_token_response(&json!({"access_token":"new","expires_in":60}), base).unwrap();
+        let base = Credential {
+            refresh_token: Some("old".into()),
+            ..Default::default()
+        };
+        let c =
+            credential_from_token_response(&json!({"access_token":"new","expires_in":60}), base)
+                .unwrap();
         assert_eq!(c.access_token.as_deref(), Some("new"));
         assert_eq!(c.refresh_token.as_deref(), Some("old"));
         assert!(c.expires_at.unwrap() > now());

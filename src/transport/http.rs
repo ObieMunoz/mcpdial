@@ -115,7 +115,9 @@ impl Transport for HttpTransport {
         }
 
         let mut resp = req.send(&body).map_err(|e| match e {
-            ureq::Error::Timeout(_) => Error::transport(format!("no reply from {} in time", self.url)),
+            ureq::Error::Timeout(_) => {
+                Error::transport(format!("no reply from {} in time", self.url))
+            }
             other => Error::transport(format!("could not reach {}: {other}", self.url)),
         })?;
 
@@ -134,10 +136,17 @@ impl Transport for HttpTransport {
             .body_mut()
             .read_to_string()
             .map_err(|e| Error::transport(format!("could not read response body: {e}")))?;
-        (self.log)(&format!("<- HTTP {status} {content_type}\n   {}", text.trim()));
+        (self.log)(&format!(
+            "<- HTTP {status} {content_type}\n   {}",
+            text.trim()
+        ));
 
         if !(200..300).contains(&status) {
-            return Err(Error::Http { status, body: text, www_authenticate });
+            return Err(Error::Http {
+                status,
+                body: text,
+                www_authenticate,
+            });
         }
         if let Some(sid) = session_id {
             self.session_id = Some(sid);

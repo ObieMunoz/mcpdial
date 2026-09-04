@@ -25,8 +25,12 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
-        let Some(id) = msg.get("id").cloned() else { continue }; // notification
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(id) = msg.get("id").cloned() else {
+            continue;
+        }; // notification
         if hang {
             continue;
         }
@@ -34,21 +38,33 @@ fn main() {
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
         let reply = match method {
-            "initialize" => ok(id, json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "echo-server", "version": "0.0.1"},
-            })),
-            "tools/list" => ok(id, json!({"tools": [
-                {"name": "echo", "description": "Echo a message back.",
-                 "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
-                {"name": "fail", "description": "Always returns a tool error.",
-                 "inputSchema": {"type": "object", "properties": {}}},
-            ]})),
+            "initialize" => ok(
+                id,
+                json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "echo-server", "version": "0.0.1"},
+                }),
+            ),
+            "tools/list" => ok(
+                id,
+                json!({"tools": [
+                    {"name": "echo", "description": "Echo a message back.",
+                     "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
+                    {"name": "fail", "description": "Always returns a tool error.",
+                     "inputSchema": {"type": "object", "properties": {}}},
+                ]}),
+            ),
             "tools/call" => match params["name"].as_str().unwrap_or("") {
-                "echo" => ok(id, json!({"content": [{"type": "text",
-                    "text": format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]})),
-                "fail" => ok(id, json!({"content": [{"type": "text", "text": "it failed"}], "isError": true})),
+                "echo" => ok(
+                    id,
+                    json!({"content": [{"type": "text",
+                    "text": format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}),
+                ),
+                "fail" => ok(
+                    id,
+                    json!({"content": [{"type": "text", "text": "it failed"}], "isError": true}),
+                ),
                 other => err(id, -32602, &format!("Tool {other} not found")),
             },
             other => err(id, -32601, &format!("Method not found: {other}")),

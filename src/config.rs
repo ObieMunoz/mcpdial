@@ -37,13 +37,23 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn http(url: impl Into<String>) -> Self {
-        Self { http: Some(url.into()), ..Default::default() }
+        Self {
+            http: Some(url.into()),
+            ..Default::default()
+        }
     }
     pub fn stdio(cmd: impl Into<String>) -> Self {
-        Self { stdio: Some(cmd.into()), ..Default::default() }
+        Self {
+            stdio: Some(cmd.into()),
+            ..Default::default()
+        }
     }
     pub fn kind(&self) -> &'static str {
-        if self.http.is_some() { "http" } else { "stdio" }
+        if self.http.is_some() {
+            "http"
+        } else {
+            "stdio"
+        }
     }
     pub fn location(&self) -> &str {
         self.http.as_deref().or(self.stdio.as_deref()).unwrap_or("")
@@ -91,7 +101,10 @@ impl Credential {
 }
 
 pub fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -116,15 +129,21 @@ impl Store {
     /// Resolve the config directory from the environment.
     pub fn from_env() -> Result<Self> {
         if let Some(d) = std::env::var_os(ENV_HOME).filter(|v| !v.is_empty()) {
-            return Ok(Self { dir: PathBuf::from(d) });
+            return Ok(Self {
+                dir: PathBuf::from(d),
+            });
         }
         if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Ok(Self { dir: PathBuf::from(x).join("mcpdial") });
+            return Ok(Self {
+                dir: PathBuf::from(x).join("mcpdial"),
+            });
         }
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .ok_or_else(|| Error::config("cannot locate a home directory; set MCPDIAL_HOME"))?;
-        Ok(Self { dir: PathBuf::from(home).join(".config").join("mcpdial") })
+        Ok(Self {
+            dir: PathBuf::from(home).join(".config").join("mcpdial"),
+        })
     }
 
     pub fn at(dir: impl Into<PathBuf>) -> Self {
@@ -194,7 +213,9 @@ impl Store {
 fn validate_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 64
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
         && !name.contains("://")
         && !name.starts_with("stdio:");
     if ok {
@@ -230,7 +251,9 @@ fn write_json<T: Serialize>(path: &Path, value: &T, private: bool) -> Result<()>
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp).map_err(|e| Error::config(format!("{}: {e}", tmp.display())))?;
+        let mut f = opts
+            .open(&tmp)
+            .map_err(|e| Error::config(format!("{}: {e}", tmp.display())))?;
         use std::io::Write;
         f.write_all(text.as_bytes())
             .map_err(|e| Error::config(format!("{}: {e}", tmp.display())))?;
@@ -249,7 +272,10 @@ mod tests {
     use super::*;
 
     fn temp_store() -> Store {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         Store::at(std::env::temp_dir().join(format!("mcpdial-cfg-{}-{nanos}", std::process::id())))
     }
 
@@ -258,26 +284,41 @@ mod tests {
         let s = temp_store();
         assert!(s.servers().unwrap().is_empty());
 
-        s.add_server("wiki", ServerConfig::http("https://mcp.deepwiki.com/mcp")).unwrap();
-        s.add_server("fs", ServerConfig::stdio("npx -y fs /tmp")).unwrap();
+        s.add_server("wiki", ServerConfig::http("https://mcp.deepwiki.com/mcp"))
+            .unwrap();
+        s.add_server("fs", ServerConfig::stdio("npx -y fs /tmp"))
+            .unwrap();
         let all = s.servers().unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all["wiki"].kind(), "http");
         assert_eq!(all["fs"].kind(), "stdio");
 
-        s.save_credential("wiki", Credential { access_token: Some("t".into()), ..Default::default() })
-            .unwrap();
+        s.save_credential(
+            "wiki",
+            Credential {
+                access_token: Some("t".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(s.credential("wiki").unwrap().unwrap().has_token());
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(s.credentials_path()).unwrap().permissions().mode() & 0o777;
+            let mode = fs::metadata(s.credentials_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "credentials must not be world readable");
         }
 
         assert!(s.remove_server("wiki").unwrap());
-        assert!(s.credential("wiki").unwrap().is_none(), "removing a server drops its token");
+        assert!(
+            s.credential("wiki").unwrap().is_none(),
+            "removing a server drops its token"
+        );
         assert!(!s.remove_server("wiki").unwrap());
         fs::remove_dir_all(&s.dir).unwrap();
     }
@@ -293,9 +334,15 @@ mod tests {
 
     #[test]
     fn expiry_has_a_safety_margin() {
-        let c = Credential { expires_at: Some(now() + 10), ..Default::default() };
+        let c = Credential {
+            expires_at: Some(now() + 10),
+            ..Default::default()
+        };
         assert!(c.is_expired(), "10s left counts as expired");
-        let c = Credential { expires_at: Some(now() + 3600), ..Default::default() };
+        let c = Credential {
+            expires_at: Some(now() + 3600),
+            ..Default::default()
+        };
         assert!(!c.is_expired());
         assert!(!Credential::default().is_expired());
     }

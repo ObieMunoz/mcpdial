@@ -23,7 +23,12 @@ pub struct StdioTransport {
 
 impl StdioTransport {
     /// Spawn `argv[0]` with the remaining arguments.
-    pub fn spawn(argv: &[String], timeout: Duration, forward_stderr: bool, log: Option<Logger>) -> Result<Self> {
+    pub fn spawn(
+        argv: &[String],
+        timeout: Duration,
+        forward_stderr: bool,
+        log: Option<Logger>,
+    ) -> Result<Self> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| Error::usage("--stdio needs a command to run"))?;
@@ -32,7 +37,11 @@ impl StdioTransport {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if forward_stderr { Stdio::inherit() } else { Stdio::null() })
+            .stderr(if forward_stderr {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .map_err(|e| Error::transport(format!("could not start {program:?}: {e}")))?;
 
@@ -43,18 +52,32 @@ impl StdioTransport {
         // blocking forever on read_line. The channel closes when the server exits.
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            for line in BufReader::new(stdout)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
                 if tx.send(line).is_err() {
                     break;
                 }
             }
         });
 
-        Ok(Self { child, stdin, lines: rx, timeout, log: log.unwrap_or_else(silent) })
+        Ok(Self {
+            child,
+            stdin,
+            lines: rx,
+            timeout,
+            log: log.unwrap_or_else(silent),
+        })
     }
 
     /// Spawn from a single shell-style string such as `"npx -y some-server /tmp"`.
-    pub fn spawn_str(command: &str, timeout: Duration, forward_stderr: bool, log: Option<Logger>) -> Result<Self> {
+    pub fn spawn_str(
+        command: &str,
+        timeout: Duration,
+        forward_stderr: bool,
+        log: Option<Logger>,
+    ) -> Result<Self> {
         let argv = split_command(command)?;
         Self::spawn(&argv, timeout, forward_stderr, log)
     }
@@ -159,7 +182,9 @@ pub fn split_command(s: &str) -> Result<Vec<String>> {
                                 cur.push('\\');
                                 cur.push(e)
                             }
-                            None => return Err(Error::usage("unterminated double quote in --stdio")),
+                            None => {
+                                return Err(Error::usage("unterminated double quote in --stdio"))
+                            }
                         },
                         Some(ch) => cur.push(ch),
                         None => return Err(Error::usage("unterminated double quote in --stdio")),
@@ -200,8 +225,14 @@ mod tests {
     #[test]
     fn splits_like_a_shell() {
         assert_eq!(split_command("a b  c").unwrap(), ["a", "b", "c"]);
-        assert_eq!(split_command("npx -y pkg '/tmp/my dir'").unwrap(), ["npx", "-y", "pkg", "/tmp/my dir"]);
-        assert_eq!(split_command(r#"x "say \"hi\"" y"#).unwrap(), ["x", "say \"hi\"", "y"]);
+        assert_eq!(
+            split_command("npx -y pkg '/tmp/my dir'").unwrap(),
+            ["npx", "-y", "pkg", "/tmp/my dir"]
+        );
+        assert_eq!(
+            split_command(r#"x "say \"hi\"" y"#).unwrap(),
+            ["x", "say \"hi\"", "y"]
+        );
         assert_eq!(split_command(r"a\ b").unwrap(), ["a b"]);
         assert_eq!(split_command("''").unwrap(), [""]);
     }

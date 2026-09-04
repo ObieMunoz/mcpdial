@@ -13,7 +13,11 @@ const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 ///
 /// TARGET is a saved server name, an http(s):// URL, or stdio:<command>.
 #[derive(Parser)]
-#[command(name = "mcpdial", version, about, after_help = "\
+#[command(
+    name = "mcpdial",
+    version,
+    about,
+    after_help = "\
 examples:
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
   mcpdial add fs --stdio \"npx -y @modelcontextprotocol/server-filesystem /tmp\"
@@ -22,7 +26,8 @@ examples:
   mcpdial login work              # one-time browser step; the token is saved
   mcpdial call wiki read_wiki_structure '{\"repoName\":\"modelcontextprotocol/servers\"}'
   mcpdial call https://mcp.deepwiki.com/mcp read_wiki_structure '{\"repoName\":\"x/y\"}'
-  mcpdial tools 'stdio:npx -y @modelcontextprotocol/server-everything stdio'")]
+  mcpdial tools 'stdio:npx -y @modelcontextprotocol/server-everything stdio'"
+)]
 struct Cli {
     /// Seconds to wait for a reply
     #[arg(long, global = true, default_value_t = 60.0, value_name = "SECS")]
@@ -41,7 +46,12 @@ struct Cli {
     user_agent: String,
 
     /// Extra HTTP header, repeatable. With `add`, saved to the server.
-    #[arg(short = 'H', long = "header", global = true, value_name = "'Name: value'")]
+    #[arg(
+        short = 'H',
+        long = "header",
+        global = true,
+        value_name = "'Name: value'"
+    )]
     headers: Vec<String>,
 
     /// Env var holding a bearer token; beats any saved credential. With `add`, saved.
@@ -58,7 +68,12 @@ enum Cmd {
     Add {
         name: String,
         /// Streamable HTTP endpoint
-        #[arg(long, value_name = "URL", conflicts_with = "stdio", required_unless_present = "stdio")]
+        #[arg(
+            long,
+            value_name = "URL",
+            conflicts_with = "stdio",
+            required_unless_present = "stdio"
+        )]
         http: Option<String>,
         /// Command that speaks MCP on stdio
         #[arg(long, value_name = "CMD")]
@@ -164,7 +179,9 @@ fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
             Some((name, value)) if !name.trim().is_empty() => {
                 Ok((name.trim().to_string(), value.trim().to_string()))
             }
-            _ => Err(Error::usage(format!("--header must look like 'Name: value', got {item:?}"))),
+            _ => Err(Error::usage(format!(
+                "--header must look like 'Name: value', got {item:?}"
+            ))),
         })
         .collect()
 }
@@ -184,10 +201,16 @@ fn run(cli: Cli) -> Result<u8, Error> {
             let mut cfg = match (http, stdio) {
                 (Some(url), None) => ServerConfig::http(url),
                 (None, Some(cmd)) => ServerConfig::stdio(cmd),
-                _ => return Err(Error::usage("pass exactly one of --http URL or --stdio CMD")),
+                _ => {
+                    return Err(Error::usage(
+                        "pass exactly one of --http URL or --stdio CMD",
+                    ))
+                }
             };
             if cfg.stdio.is_some() && (!opts.extra_headers.is_empty() || opts.token_env.is_some()) {
-                return Err(Error::usage("--header and --token-env only apply to --http servers"));
+                return Err(Error::usage(
+                    "--header and --token-env only apply to --http servers",
+                ));
             }
             cfg.headers = opts.extra_headers.iter().cloned().collect();
             cfg.token_env = opts.token_env.clone();
@@ -212,11 +235,13 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 if cli.json {
                     let rows: Vec<Value> = servers
                         .iter()
-                        .map(|(n, c)| json!({
-                            "name": n, "kind": c.kind(), "location": c.location(),
-                            "headers": c.headers, "token_env": c.token_env,
-                            "credential": creds.get(n).map(|c| c.has_token()).unwrap_or(false),
-                        }))
+                        .map(|(n, c)| {
+                            json!({
+                                "name": n, "kind": c.kind(), "location": c.location(),
+                                "headers": c.headers, "token_env": c.token_env,
+                                "credential": creds.get(n).map(|c| c.has_token()).unwrap_or(false),
+                            })
+                        })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&rows).unwrap());
                 } else {
@@ -261,12 +286,21 @@ fn run(cli: Cli) -> Result<u8, Error> {
                             p.kind.into(),
                             p.status.label(),
                             auth_label(p),
-                            p.server.clone().or_else(|| p.status.detail().map(truncate)).unwrap_or_else(|| "-".into()),
-                            p.tools.as_ref().map(|t| t.len().to_string()).unwrap_or_else(|| "-".into()),
+                            p.server
+                                .clone()
+                                .or_else(|| p.status.detail().map(truncate))
+                                .unwrap_or_else(|| "-".into()),
+                            p.tools
+                                .as_ref()
+                                .map(|t| t.len().to_string())
+                                .unwrap_or_else(|| "-".into()),
                         ]
                     })
                     .collect();
-                print_table(&["NAME", "TYPE", "STATUS", "AUTH", "SERVER", "TOOLS"], &rows);
+                print_table(
+                    &["NAME", "TYPE", "STATUS", "AUTH", "SERVER", "TOOLS"],
+                    &rows,
+                );
             }
             Ok(0)
         }
@@ -287,26 +321,40 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 }
                 match &p.tools {
                     Some(tools) => {
-                        println!("## {}  {}  ({} tools)", p.name, p.server.as_deref().unwrap_or(""), tools.len());
+                        println!(
+                            "## {}  {}  ({} tools)",
+                            p.name,
+                            p.server.as_deref().unwrap_or(""),
+                            tools.len()
+                        );
                         print_tools(tools, long);
                     }
                     None => println!(
                         "## {}  {}{}",
                         p.name,
                         p.status.label(),
-                        p.status.detail().map(|d| format!(": {}", truncate(d))).unwrap_or_default()
+                        p.status
+                            .detail()
+                            .map(|d| format!(": {}", truncate(d)))
+                            .unwrap_or_default()
                     ),
                 }
             }
             Ok(0)
         }
 
-        Cmd::Tools { target: Some(target), long } => {
+        Cmd::Tools {
+            target: Some(target),
+            long,
+        } => {
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let tools = conn.session.list_tools()?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&json!({ "tools": tools })).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "tools": tools })).unwrap()
+                );
             } else {
                 println!("{} tool(s):\n", tools.len());
                 print_tools(&tools, long);
@@ -322,13 +370,27 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 println!("{}", serde_json::to_string_pretty(init).unwrap());
             } else {
                 let si = &init["serverInfo"];
-                println!("{} {}", si["name"].as_str().unwrap_or("?"), si["version"].as_str().unwrap_or(""));
-                println!("protocol {}", init["protocolVersion"].as_str().unwrap_or("?"));
+                println!(
+                    "{} {}",
+                    si["name"].as_str().unwrap_or("?"),
+                    si["version"].as_str().unwrap_or("")
+                );
+                println!(
+                    "protocol {}",
+                    init["protocolVersion"].as_str().unwrap_or("?")
+                );
                 let caps: Vec<&str> = init["capabilities"]
                     .as_object()
                     .map(|o| o.keys().map(String::as_str).collect())
                     .unwrap_or_default();
-                println!("capabilities: {}", if caps.is_empty() { "(none)".into() } else { caps.join(", ") });
+                println!(
+                    "capabilities: {}",
+                    if caps.is_empty() {
+                        "(none)".into()
+                    } else {
+                        caps.join(", ")
+                    }
+                );
                 if let Some(instr) = init["instructions"].as_str() {
                     println!("\n{}", instr.trim());
                 }
@@ -336,7 +398,11 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(0)
         }
 
-        Cmd::Call { target, tool, arguments } => {
+        Cmd::Call {
+            target,
+            tool,
+            arguments,
+        } => {
             let arguments = parse_object(&arguments, "arguments")?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
@@ -353,7 +419,11 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(if is_error { EXIT_ERROR } else { 0 })
         }
 
-        Cmd::Raw { target, method, params } => {
+        Cmd::Raw {
+            target,
+            method,
+            params,
+        } => {
             let params = parse_object(&params, "params")?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
@@ -362,10 +432,18 @@ fn run(cli: Cli) -> Result<u8, Error> {
             Ok(0)
         }
 
-        Cmd::Login { target, scope, port, client_id, no_browser } => {
+        Cmd::Login {
+            target,
+            scope,
+            port,
+            client_id,
+            no_browser,
+        } => {
             let r = client::resolve(&store, &target)?;
             let Some(url) = r.config.http.clone() else {
-                return Err(Error::usage("login only applies to HTTP servers; stdio servers need no token"));
+                return Err(Error::usage(
+                    "login only applies to HTTP servers; stdio servers need no token",
+                ));
             };
             let existing = store.credential(&r.name)?;
             let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
@@ -376,19 +454,27 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
             };
-            let cred = oauth::login(&http, &url, existing.as_ref(), &login_opts, |line| eprintln!("{line}"))?;
+            let cred = oauth::login(&http, &url, existing.as_ref(), &login_opts, |line| {
+                eprintln!("{line}")
+            })?;
             store.save_credential(&r.name, cred.clone())?;
             eprintln!(
                 "saved token for {} ({}{})",
                 r.name,
                 expiry_label(&cred),
-                if cred.refresh_token.is_some() { ", refreshable" } else { "" }
+                if cred.refresh_token.is_some() {
+                    ", refreshable"
+                } else {
+                    ""
+                }
             );
             Ok(0)
         }
 
         Cmd::Logout { target } | Cmd::Token(TokenCmd::Rm { name: target }) => {
-            let name = client::resolve(&store, &target).map(|r| r.name).unwrap_or(target);
+            let name = client::resolve(&store, &target)
+                .map(|r| r.name)
+                .unwrap_or(target);
             if store.remove_credential(&name)? {
                 eprintln!("removed credential for {name}");
             } else {
@@ -398,11 +484,14 @@ fn run(cli: Cli) -> Result<u8, Error> {
         }
 
         Cmd::Token(TokenCmd::Set { name, env }) => {
-            let key = client::resolve(&store, &name).map(|r| r.name).unwrap_or(name);
+            let key = client::resolve(&store, &name)
+                .map(|r| r.name)
+                .unwrap_or(name);
             let token = match env {
-                Some(var) => std::env::var(&var).ok().filter(|t| !t.is_empty()).ok_or_else(|| {
-                    Error::usage(format!("${var} is unset or empty"))
-                })?,
+                Some(var) => std::env::var(&var)
+                    .ok()
+                    .filter(|t| !t.is_empty())
+                    .ok_or_else(|| Error::usage(format!("${var} is unset or empty")))?,
                 None => {
                     let mut stdin = std::io::stdin();
                     if stdin.is_terminal() {
@@ -410,7 +499,9 @@ fn run(cli: Cli) -> Result<u8, Error> {
                         std::io::stderr().flush().ok();
                     }
                     let mut buf = String::new();
-                    stdin.read_to_string(&mut buf).map_err(|e| Error::usage(e.to_string()))?;
+                    stdin
+                        .read_to_string(&mut buf)
+                        .map_err(|e| Error::usage(e.to_string()))?;
                     let t = buf.trim().to_string();
                     if t.is_empty() {
                         return Err(Error::usage("no token on stdin"));
@@ -428,7 +519,9 @@ fn run(cli: Cli) -> Result<u8, Error> {
         }
 
         Cmd::Token(TokenCmd::Show { name }) => {
-            let key = client::resolve(&store, &name).map(|r| r.name).unwrap_or(name);
+            let key = client::resolve(&store, &name)
+                .map(|r| r.name)
+                .unwrap_or(name);
             let Some(cred) = store.credential(&key)? else {
                 eprintln!("no credential saved for {key}");
                 return Ok(EXIT_ERROR);
@@ -452,9 +545,19 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 );
             } else {
                 println!("{key}");
-                println!("  access token:  {}", if cred.has_token() { "present" } else { "none" });
+                println!(
+                    "  access token:  {}",
+                    if cred.has_token() { "present" } else { "none" }
+                );
                 println!("  expiry:        {}", expiry_label(&cred));
-                println!("  refresh token: {}", if cred.refresh_token.is_some() { "present" } else { "none" });
+                println!(
+                    "  refresh token: {}",
+                    if cred.refresh_token.is_some() {
+                        "present"
+                    } else {
+                        "none"
+                    }
+                );
                 println!("  source:        {}", cred.source.as_deref().unwrap_or("?"));
                 if let Some(s) = &cred.scope {
                     println!("  scope:         {s}");

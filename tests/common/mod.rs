@@ -93,7 +93,9 @@ pub fn start(mode: Mode) -> FakeServer {
         let base = base.clone();
         thread::spawn(move || {
             while !stop.load(Ordering::SeqCst) {
-                let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else { continue };
+                let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else {
+                    continue;
+                };
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
                 let rec = Recorded {
@@ -112,7 +114,13 @@ pub fn start(mode: Mode) -> FakeServer {
         })
     };
 
-    FakeServer { base, url, requests, stop, handle: Some(handle) }
+    FakeServer {
+        base,
+        url,
+        requests,
+        stop,
+        handle: Some(handle),
+    }
 }
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
@@ -135,42 +143,75 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
     match path {
         "/mcp" => mcp(mode, base, rec, state),
         "/.well-known/oauth-protected-resource" | "/.well-known/oauth-protected-resource/mcp" => {
-            json_resp(200, &json!({
-                "resource": format!("{base}/mcp"),
-                "authorization_servers": [base],
-                "scopes_supported": ["mcp"],
-                "bearer_methods_supported": ["header"],
-            }))
+            json_resp(
+                200,
+                &json!({
+                    "resource": format!("{base}/mcp"),
+                    "authorization_servers": [base],
+                    "scopes_supported": ["mcp"],
+                    "bearer_methods_supported": ["header"],
+                }),
+            )
         }
-        "/.well-known/oauth-authorization-server" => json_resp(200, &json!({
-            "issuer": base,
-            "authorization_endpoint": format!("{base}/authorize"),
-            "token_endpoint": format!("{base}/token"),
-            "registration_endpoint": format!("{base}/register"),
-            "grant_types_supported": ["authorization_code", "refresh_token"],
-            "code_challenge_methods_supported": ["S256"],
-            "scopes_supported": ["mcp"],
-        })),
+        "/.well-known/oauth-authorization-server" => json_resp(
+            200,
+            &json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "registration_endpoint": format!("{base}/register"),
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["mcp"],
+            }),
+        ),
         "/register" => {
             let body = rec.json();
-            assert_eq!(body["token_endpoint_auth_method"], "none", "must register as a public client");
+            assert_eq!(
+                body["token_endpoint_auth_method"], "none",
+                "must register as a public client"
+            );
             let redirect = body["redirect_uris"][0].as_str().unwrap_or("").to_string();
-            json_resp(201, &json!({"client_id": "client-abc", "redirect_uris": [redirect]}))
+            json_resp(
+                201,
+                &json!({"client_id": "client-abc", "redirect_uris": [redirect]}),
+            )
         }
         "/authorize" => {
             let q = form(query);
-            let get = |k: &str| q.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |k: &str| {
+                q.iter()
+                    .find(|(a, _)| a == k)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
             assert_eq!(get("response_type"), "code");
             assert_eq!(get("client_id"), "client-abc");
             assert_eq!(get("code_challenge_method"), "S256");
-            assert_eq!(get("resource"), format!("{base}/mcp"), "must send the resource indicator");
+            assert_eq!(
+                get("resource"),
+                format!("{base}/mcp"),
+                "must send the resource indicator"
+            );
             state.lock().unwrap().code_challenge = Some(get("code_challenge"));
-            let location = format!("{}?code=code-123&state={}", get("redirect_uri"), get("state"));
-            with_headers(Response::from_string("").with_status_code(302), &[("Location", &location)])
+            let location = format!(
+                "{}?code=code-123&state={}",
+                get("redirect_uri"),
+                get("state")
+            );
+            with_headers(
+                Response::from_string("").with_status_code(302),
+                &[("Location", &location)],
+            )
         }
         "/token" => {
             let f = form(&rec.body);
-            let get = |k: &str| f.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone()).unwrap_or_default();
+            let get = |k: &str| {
+                f.iter()
+                    .find(|(a, _)| a == k)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
             let mut st = state.lock().unwrap();
             match get("grant_type").as_str() {
                 "authorization_code" => {
@@ -178,15 +219,22 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                         return json_resp(400, &json!({"error": "invalid_grant"}));
                     }
                     let expected = st.code_challenge.clone().unwrap_or_default();
-                    let got = URL_SAFE_NO_PAD.encode(Sha256::digest(get("code_verifier").as_bytes()));
+                    let got =
+                        URL_SAFE_NO_PAD.encode(Sha256::digest(get("code_verifier").as_bytes()));
                     if got != expected {
-                        return json_resp(400, &json!({"error": "invalid_grant", "error_description": "pkce mismatch"}));
+                        return json_resp(
+                            400,
+                            &json!({"error": "invalid_grant", "error_description": "pkce mismatch"}),
+                        );
                     }
                     st.issued += 1;
                     let tok = format!("tok-{}", st.issued);
                     st.valid_tokens.push(tok.clone());
-                    json_resp(200, &json!({"access_token": tok, "token_type": "Bearer",
-                        "expires_in": 3600, "refresh_token": "ref-1", "scope": "mcp"}))
+                    json_resp(
+                        200,
+                        &json!({"access_token": tok, "token_type": "Bearer",
+                        "expires_in": 3600, "refresh_token": "ref-1", "scope": "mcp"}),
+                    )
                 }
                 "refresh_token" => {
                     if !get("refresh_token").starts_with("ref-") {
@@ -195,10 +243,16 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                     st.issued += 1;
                     let tok = format!("tok-{}", st.issued);
                     st.valid_tokens.push(tok.clone());
-                    json_resp(200, &json!({"access_token": tok, "token_type": "Bearer",
-                        "expires_in": 3600, "refresh_token": format!("ref-{}", st.issued)}))
+                    json_resp(
+                        200,
+                        &json!({"access_token": tok, "token_type": "Bearer",
+                        "expires_in": 3600, "refresh_token": format!("ref-{}", st.issued)}),
+                    )
                 }
-                other => json_resp(400, &json!({"error": "unsupported_grant_type", "got": other})),
+                other => json_resp(
+                    400,
+                    &json!({"error": "unsupported_grant_type", "got": other}),
+                ),
             }
         }
         _ => Response::from_string("not found").with_status_code(404),
@@ -210,8 +264,17 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("error code: 1010").with_status_code(403);
     }
     if let Mode::Auth { .. } = mode {
-        let bearer = rec.header("authorization").and_then(|a| a.strip_prefix("Bearer ")).unwrap_or("");
-        if !state.lock().unwrap().valid_tokens.iter().any(|t| t == bearer) {
+        let bearer = rec
+            .header("authorization")
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !state
+            .lock()
+            .unwrap()
+            .valid_tokens
+            .iter()
+            .any(|t| t == bearer)
+        {
             let www = format!(
                 "Bearer realm=\"fake\", error=\"invalid_token\", resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\""
             );
@@ -235,10 +298,16 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
 
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
-            return json_resp(400, &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}));
+            return json_resp(
+                400,
+                &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}),
+            );
         }
         if !state.lock().unwrap().initialized {
-            return json_resp(200, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Server not initialized"}}));
+            return json_resp(
+                200,
+                &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,"message":"Server not initialized"}}),
+            );
         }
     }
 
@@ -257,18 +326,30 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
             "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
                 "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
             "add" => {
-                let (a, b) = (params["arguments"]["a"].as_f64().unwrap_or(0.0), params["arguments"]["b"].as_f64().unwrap_or(0.0));
+                let (a, b) = (
+                    params["arguments"]["a"].as_f64().unwrap_or(0.0),
+                    params["arguments"]["b"].as_f64().unwrap_or(0.0),
+                );
                 json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}]}})
             }
-            "fail" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}}),
-            other => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Tool {other} not found")}}),
+            "fail" => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}})
+            }
+            other => {
+                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Tool {other} not found")}})
+            }
         },
-        other => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}}),
+        other => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}})
+        }
     };
 
     if stateful {
         let sse = format!("event: message\ndata: {reply}\n\n");
-        let mut r = with_headers(Response::from_string(sse), &[("Content-Type", "text/event-stream")]);
+        let mut r = with_headers(
+            Response::from_string(sse),
+            &[("Content-Type", "text/event-stream")],
+        );
         if method == "initialize" {
             r = with_headers(r, &[("Mcp-Session-Id", "sess-1")]);
         }
@@ -328,7 +409,10 @@ pub fn mcpdial(home: &std::path::Path) -> Command {
 pub fn echo_server() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let debug = exe.parent().unwrap().parent().unwrap();
-    let candidates = [debug.join("examples/echo_server"), debug.join("examples/echo_server.exe")];
+    let candidates = [
+        debug.join("examples/echo_server"),
+        debug.join("examples/echo_server.exe"),
+    ];
     candidates
         .iter()
         .find(|p| p.exists())

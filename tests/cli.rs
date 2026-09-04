@@ -19,7 +19,10 @@ fn stateful_http_handshake_session_and_call() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert!(o.stdout.starts_with("2 tool(s):"));
     assert!(o.stdout.contains("echo") && o.stdout.contains("Echo a message back."));
-    assert!(!o.stdout.contains("Second line"), "short listing shows the first line only");
+    assert!(
+        !o.stdout.contains("Second line"),
+        "short listing shows the first line only"
+    );
 
     let o = run(mcpdial(&home).args(["call", &s.url, "add", r#"{"a":40,"b":2}"#]));
     assert_eq!(o.code, 0, "{}", o.stderr);
@@ -29,12 +32,25 @@ fn stateful_http_handshake_session_and_call() {
     let reqs = s.requests.lock().unwrap();
     let last3 = &reqs[reqs.len() - 3..];
     assert_eq!(last3[0].json()["method"], "initialize");
-    assert!(last3[0].header("user-agent").unwrap().starts_with("Mozilla/5.0"), "browser UA is mandatory");
-    assert_eq!(last3[0].header("accept").unwrap(), "application/json, text/event-stream");
+    assert!(
+        last3[0]
+            .header("user-agent")
+            .unwrap()
+            .starts_with("Mozilla/5.0"),
+        "browser UA is mandatory"
+    );
+    assert_eq!(
+        last3[0].header("accept").unwrap(),
+        "application/json, text/event-stream"
+    );
     assert!(last3[0].header("mcp-session-id").is_none());
     assert_eq!(last3[1].json()["method"], "notifications/initialized");
     assert!(last3[1].json().get("id").is_none());
-    assert_eq!(last3[1].header("mcp-session-id"), Some("sess-1"), "session id is echoed back");
+    assert_eq!(
+        last3[1].header("mcp-session-id"),
+        Some("sess-1"),
+        "session id is echoed back"
+    );
     assert_eq!(last3[2].json()["method"], "tools/call");
     assert_eq!(last3[2].header("mcp-protocol-version"), Some("2025-06-18"));
 }
@@ -43,7 +59,13 @@ fn stateful_http_handshake_session_and_call() {
 fn stateless_http_and_json_output() {
     let s = start(Mode::Stateless);
     let home = temp_home("stateless");
-    let o = run(mcpdial(&home).args(["--json", "call", &s.url, "echo", r#"{"message":"plain json"}"#]));
+    let o = run(mcpdial(&home).args([
+        "--json",
+        "call",
+        &s.url,
+        "echo",
+        r#"{"message":"plain json"}"#,
+    ]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let v: Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(v["content"][0]["text"], "Echo: plain json");
@@ -68,7 +90,11 @@ fn errors_map_to_exit_codes() {
 
     let o = run(mcpdial(&home).args(["call", &s.url, "nope"]));
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("MCP error -32602: Tool nope not found"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("MCP error -32602: Tool nope not found"),
+        "{}",
+        o.stderr
+    );
 
     let before = s.requests.lock().unwrap().len();
     let o = run(mcpdial(&home).args(["call", &s.url, "echo", "{not json"]));
@@ -114,7 +140,10 @@ fn stdio_adhoc_call_and_timeout() {
     let o = run(mcpdial(&home).args(["call", &target, "fail"]));
     assert_eq!(o.code, 1);
 
-    let o = run(mcpdial(&home).env("ECHO_SERVER_HANG", "1").args(["--timeout", "1", "info", &target]));
+    let o =
+        run(mcpdial(&home)
+            .env("ECHO_SERVER_HANG", "1")
+            .args(["--timeout", "1", "info", &target]));
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("no reply after"), "{}", o.stderr);
 
@@ -130,17 +159,45 @@ fn stdio_adhoc_call_and_timeout() {
 #[test]
 fn saved_servers_and_status_listing() {
     let http = start(Mode::Stateful);
-    let auth = start(Mode::Auth { tokens: vec!["secret".into()] });
+    let auth = start(Mode::Auth {
+        tokens: vec!["secret".into()],
+    });
     let blocked = start(Mode::Blocked);
     let home = temp_home("ls");
     let echo = echo_server().display().to_string();
 
-    assert_eq!(run(mcpdial(&home).args(["add", "web", "--http", &http.url])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["add", "local", "--stdio", &echo])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["add", "locked", "--http", &auth.url])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["add", "wall", "--http", &blocked.url])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["add", "dead", "--http", "http://127.0.0.1:1/mcp"])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["add", "envtok", "--http", &auth.url, "--token-env", "FAKE_TOKEN"])).code, 0);
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "web", "--http", &http.url])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "local", "--stdio", &echo])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "locked", "--http", &auth.url])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "wall", "--http", &blocked.url])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "dead", "--http", "http://127.0.0.1:1/mcp"])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args([
+            "add",
+            "envtok",
+            "--http",
+            &auth.url,
+            "--token-env",
+            "FAKE_TOKEN"
+        ]))
+        .code,
+        0
+    );
     let o = run(mcpdial(&home).args(["add", "bad name", "--http", "x"]));
     assert_eq!(o.code, 2);
     let o = run(mcpdial(&home).args(["add", "both", "--http", "x", "--stdio", "y"]));
@@ -151,7 +208,10 @@ fn saved_servers_and_status_listing() {
     assert!(o.stdout.contains("web") && o.stdout.contains("local") && o.stdout.contains("stdio"));
     assert!(o.stdout.contains("$FAKE_TOKEN"));
 
-    let o = run(mcpdial(&home).env("FAKE_TOKEN", "secret").args(["--timeout", "3", "--json", "ls"]));
+    let o =
+        run(mcpdial(&home)
+            .env("FAKE_TOKEN", "secret")
+            .args(["--timeout", "3", "--json", "ls"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let rows: Vec<Value> = serde_json::from_str(&o.stdout).unwrap();
     let by_name = |n: &str| rows.iter().find(|r| r["name"] == n).unwrap().clone();
@@ -166,23 +226,39 @@ fn saved_servers_and_status_listing() {
     assert_eq!(by_name("envtok")["status"]["state"], "connected");
     assert_eq!(by_name("envtok")["auth"], "env");
 
-    let o = run(mcpdial(&home).env("FAKE_TOKEN", "wrong").args(["--timeout", "3", "ls"]));
+    let o = run(mcpdial(&home)
+        .env("FAKE_TOKEN", "wrong")
+        .args(["--timeout", "3", "ls"]));
     assert!(o.stdout.contains("token rejected"), "{}", o.stdout);
     assert!(o.stdout.contains("auth required"));
     assert!(o.stdout.contains("blocked (403)"));
     assert!(o.stdout.contains("unreachable"));
 
     // Every server's tools at once.
-    let o = run(mcpdial(&home).env("FAKE_TOKEN", "secret").args(["--timeout", "3", "tools"]));
+    let o = run(mcpdial(&home)
+        .env("FAKE_TOKEN", "secret")
+        .args(["--timeout", "3", "tools"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert!(o.stdout.contains("## web  fake-mcp 1.0  (2 tools)"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("## web  fake-mcp 1.0  (2 tools)"),
+        "{}",
+        o.stdout
+    );
     assert!(o.stdout.contains("## local  echo-server 0.0.1  (2 tools)"));
     assert!(o.stdout.contains("## locked  auth required"));
     assert!(o.stdout.contains("## dead  unreachable:"));
 
     let o = run(mcpdial(&home).args(["tools", "web", "--long"]));
-    assert!(o.stdout.contains("Second line"), "long listing shows the full description");
-    assert!(o.stdout.contains("message: string (required) - What to echo"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("Second line"),
+        "long listing shows the full description"
+    );
+    assert!(
+        o.stdout
+            .contains("message: string (required) - What to echo"),
+        "{}",
+        o.stdout
+    );
 
     assert_eq!(run(mcpdial(&home).args(["rm", "dead"])).code, 0);
     assert_eq!(run(mcpdial(&home).args(["rm", "dead"])).code, 2);
@@ -194,11 +270,18 @@ fn saved_servers_and_status_listing() {
 fn oauth_login_saves_a_token_and_refreshes_it() {
     let s = start(Mode::Auth { tokens: vec![] });
     let home = temp_home("oauth");
-    assert_eq!(run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code, 0);
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code,
+        0
+    );
 
     let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"x"}"#]));
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("HTTP 401") && o.stderr.contains("mcpdial login"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("HTTP 401") && o.stderr.contains("mcpdial login"),
+        "{}",
+        o.stderr
+    );
 
     // Run login with no browser, scrape the auth URL, and play the browser ourselves.
     let mut child = mcpdial(&home)
@@ -227,11 +310,18 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("login printed an authorization URL");
     assert!(auth_url.contains("code_challenge_method=S256"));
-    assert!(auth_url.contains("scope=mcp"), "scope from discovery: {auth_url}");
+    assert!(
+        auth_url.contains("scope=mcp"),
+        "scope from discovery: {auth_url}"
+    );
     // Follows the 302 to the loopback callback, which hands mcpdial the code.
     let mut resp = ureq::get(&auth_url).call().expect("authorize -> callback");
     assert_eq!(resp.status().as_u16(), 200);
-    assert!(resp.body_mut().read_to_string().unwrap().contains("close this tab"));
+    assert!(resp
+        .body_mut()
+        .read_to_string()
+        .unwrap()
+        .contains("close this tab"));
     let status = child.wait().unwrap();
     let log = drain.join().unwrap();
     assert!(status.success(), "login exited {status}:\n{log}");
@@ -245,7 +335,11 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(home.join("credentials.json")).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(home.join("credentials.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -257,7 +351,11 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
     assert_eq!(last.header("authorization"), Some("Bearer tok-1"));
 
     let o = run(mcpdial(&home).args(["ls"]));
-    assert!(o.stdout.contains("connected") && o.stdout.contains("saved"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("connected") && o.stdout.contains("saved"),
+        "{}",
+        o.stdout
+    );
 
     let o = run(mcpdial(&home).args(["token", "show", "work"]));
     assert_eq!(o.code, 0);
@@ -275,7 +373,10 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
     assert_eq!(last.header("authorization"), Some("Bearer tok-2"));
     let creds = std::fs::read_to_string(home.join("credentials.json")).unwrap();
     assert!(creds.contains("\"access_token\": \"tok-2\""));
-    assert!(creds.contains("\"refresh_token\": \"ref-2\""), "rotated refresh token is kept: {creds}");
+    assert!(
+        creds.contains("\"refresh_token\": \"ref-2\""),
+        "rotated refresh token is kept: {creds}"
+    );
 
     // Clock says fine but the server disagrees: one refresh and retry, transparently.
     let mut v: Value = serde_json::from_str(&creds).unwrap();
@@ -298,9 +399,14 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
 
 #[test]
 fn manual_token_from_stdin_or_env() {
-    let s = start(Mode::Auth { tokens: vec!["pasted".into(), "from-env".into()] });
+    let s = start(Mode::Auth {
+        tokens: vec!["pasted".into(), "from-env".into()],
+    });
     let home = temp_home("manual");
-    assert_eq!(run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code, 0);
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code,
+        0
+    );
 
     let mut child = mcpdial(&home)
         .args(["token", "set", "work"])
@@ -314,25 +420,61 @@ fn manual_token_from_stdin_or_env() {
 
     let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"ok"}"#]));
     assert_eq!(o.code, 0, "{}", o.stderr);
-    assert_eq!(s.requests.lock().unwrap().last().unwrap().header("authorization"), Some("Bearer pasted"));
+    assert_eq!(
+        s.requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .header("authorization"),
+        Some("Bearer pasted")
+    );
 
-    let o = run(mcpdial(&home).env("T", "from-env").args(["token", "set", "work", "--env", "T"]));
+    let o = run(mcpdial(&home)
+        .env("T", "from-env")
+        .args(["token", "set", "work", "--env", "T"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"ok"}"#]));
     assert_eq!(o.code, 0);
-    assert_eq!(s.requests.lock().unwrap().last().unwrap().header("authorization"), Some("Bearer from-env"));
+    assert_eq!(
+        s.requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .header("authorization"),
+        Some("Bearer from-env")
+    );
 
     // --token-env on the command line beats the saved credential.
-    let o = run(mcpdial(&home).env("OVERRIDE", "pasted").args(["--token-env", "OVERRIDE", "call", "work", "echo", "{}"]));
+    let o = run(mcpdial(&home).env("OVERRIDE", "pasted").args([
+        "--token-env",
+        "OVERRIDE",
+        "call",
+        "work",
+        "echo",
+        "{}",
+    ]));
     assert_eq!(o.code, 0);
-    assert_eq!(s.requests.lock().unwrap().last().unwrap().header("authorization"), Some("Bearer pasted"));
+    assert_eq!(
+        s.requests
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .header("authorization"),
+        Some("Bearer pasted")
+    );
 
     let o = run(mcpdial(&home).args(["--token-env", "UNSET_VAR_X", "call", "work", "echo", "{}"]));
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("$UNSET_VAR_X is unset"));
 
     assert_eq!(run(mcpdial(&home).args(["token", "rm", "work"])).code, 0);
-    assert_eq!(run(mcpdial(&home).args(["call", "work", "echo", "{}"])).code, 1);
+    assert_eq!(
+        run(mcpdial(&home).args(["call", "work", "echo", "{}"])).code,
+        1
+    );
 }
 
 #[test]
@@ -343,10 +485,16 @@ fn extra_headers_are_sent_and_saved() {
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(s.requests.lock().unwrap()[0].header("x-team"), Some("blue"));
 
-    assert_eq!(run(mcpdial(&home).args(["add", "t", "--http", &s.url, "-H", "X-Saved: yes"])).code, 0);
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "t", "--http", &s.url, "-H", "X-Saved: yes"])).code,
+        0
+    );
     let o = run(mcpdial(&home).args(["info", "t"]));
     assert_eq!(o.code, 0);
-    assert_eq!(s.requests.lock().unwrap().last().unwrap().header("x-saved"), Some("yes"));
+    assert_eq!(
+        s.requests.lock().unwrap().last().unwrap().header("x-saved"),
+        Some("yes")
+    );
 
     let o = run(mcpdial(&home).args(["-H", "nocolon", "info", &s.url]));
     assert_eq!(o.code, 2);

@@ -19,9 +19,17 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     /// The server answered with a JSON-RPC error object.
-    Rpc { code: i64, message: String, data: Option<Value> },
+    Rpc {
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
     /// The server answered with a non-2xx HTTP status.
-    Http { status: u16, body: String, www_authenticate: Option<String> },
+    Http {
+        status: u16,
+        body: String,
+        www_authenticate: Option<String>,
+    },
     /// The transport itself failed: socket, process, timeout, malformed frame.
     Transport(String),
     /// The OAuth dance failed somewhere between discovery and token exchange.
@@ -48,8 +56,13 @@ impl Error {
 
     /// True when the server asked for a credential (any status with a challenge).
     pub fn is_auth_challenge(&self) -> bool {
-        matches!(self, Error::Http { www_authenticate: Some(_), .. })
-            || matches!(self, Error::Http { status: 401, .. })
+        matches!(
+            self,
+            Error::Http {
+                www_authenticate: Some(_),
+                ..
+            }
+        ) || matches!(self, Error::Http { status: 401, .. })
     }
 }
 
@@ -57,7 +70,11 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Rpc { code, message, .. } => write!(f, "MCP error {code}: {message}"),
-            Error::Http { status, body, www_authenticate } => {
+            Error::Http {
+                status,
+                body,
+                www_authenticate,
+            } => {
                 write!(f, "HTTP {status}")?;
                 let body = body.trim();
                 if !body.is_empty() {
@@ -66,7 +83,9 @@ impl fmt::Display for Error {
                 }
                 write!(f, "{}", http_hint(*status, www_authenticate.as_deref()))
             }
-            Error::Transport(m) | Error::Auth(m) | Error::Config(m) | Error::Usage(m) => write!(f, "{m}"),
+            Error::Transport(m) | Error::Auth(m) | Error::Config(m) | Error::Usage(m) => {
+                write!(f, "{m}")
+            }
         }
     }
 }
@@ -117,7 +136,9 @@ pub fn decode_body(body: &str, content_type: &str) -> Result<Option<Value>> {
         return Ok(None);
     }
 
-    let looks_like_sse = content_type.to_ascii_lowercase().contains("text/event-stream")
+    let looks_like_sse = content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream")
         || body.starts_with("event:")
         || body.starts_with("data:");
 
@@ -175,15 +196,19 @@ mod tests {
 
     #[test]
     fn plain_json_passes_through() {
-        let v = decode_body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, "application/json")
-            .unwrap()
-            .unwrap();
+        let v = decode_body(
+            r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            "application/json",
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(v["id"], 1);
     }
 
     #[test]
     fn sse_framing_is_stripped() {
-        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"ok\":true}}\n\n";
         let v = decode_body(body, "text/event-stream").unwrap().unwrap();
         assert_eq!(v["result"]["ok"], true);
     }
@@ -206,17 +231,23 @@ mod tests {
     fn empty_body_is_none() {
         assert!(decode_body("", "application/json").unwrap().is_none());
         assert!(decode_body("   \n", "text/event-stream").unwrap().is_none());
-        assert!(decode_body("event: message\n\n", "text/event-stream").unwrap().is_none());
+        assert!(decode_body("event: message\n\n", "text/event-stream")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn garbage_is_a_transport_error() {
-        assert!(matches!(decode_body("<html>nope</html>", "text/html"), Err(Error::Transport(_))));
+        assert!(matches!(
+            decode_body("<html>nope</html>", "text/html"),
+            Err(Error::Transport(_))
+        ));
     }
 
     #[test]
     fn rpc_error_is_raised() {
-        let msg = json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Tool nope not found"}});
+        let msg =
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Tool nope not found"}});
         match check(Some(msg)) {
             Err(Error::Rpc { code, message, .. }) => {
                 assert_eq!(code, -32602);

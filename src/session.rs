@@ -1,6 +1,8 @@
 //! Request id allocation, the initialize handshake, and the three methods that matter.
 
-use crate::protocol::{check, notification, request, Result, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION};
+use crate::protocol::{
+    check, notification, request, Result, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION,
+};
 use crate::transport::Transport;
 use serde_json::{json, Value};
 
@@ -13,13 +15,20 @@ pub struct Session<T: Transport> {
 
 impl<T: Transport> Session<T> {
     pub fn new(transport: T) -> Self {
-        Self { transport, next_id: 0, server_info: Value::Null }
+        Self {
+            transport,
+            next_id: 0,
+            server_info: Value::Null,
+        }
     }
 
     /// Send a request and return its `result`. JSON-RPC errors become [`crate::Error::Rpc`].
     pub fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         self.next_id += 1;
-        let msg = check(self.transport.send(&request(method, self.next_id, params))?)?;
+        let msg = check(
+            self.transport
+                .send(&request(method, self.next_id, params))?,
+        )?;
         Ok(msg
             .and_then(|mut m| m.get_mut("result").map(Value::take))
             .unwrap_or_else(|| json!({})))
@@ -55,7 +64,10 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.request("tools/call", Some(json!({ "name": name, "arguments": arguments })))
+        self.request(
+            "tools/call",
+            Some(json!({ "name": name, "arguments": arguments })),
+        )
     }
 
     pub fn close(&mut self) {
@@ -78,10 +90,12 @@ pub fn render_content(result: &Value) -> String {
         .map(|blocks| {
             blocks
                 .iter()
-                .map(|b| match (b.get("type").and_then(Value::as_str), b.get("text")) {
-                    (Some("text"), Some(Value::String(t))) => t.clone(),
-                    _ => b.to_string(),
-                })
+                .map(
+                    |b| match (b.get("type").and_then(Value::as_str), b.get("text")) {
+                        (Some("text"), Some(Value::String(t))) => t.clone(),
+                        _ => b.to_string(),
+                    },
+                )
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -108,12 +122,17 @@ mod tests {
     }
 
     fn fake(replies: Vec<Option<Value>>) -> Session<Fake> {
-        Session::new(Fake { sent: Vec::new(), replies: replies.into() })
+        Session::new(Fake {
+            sent: Vec::new(),
+            replies: replies.into(),
+        })
     }
 
     #[test]
     fn initialize_sends_the_mandatory_notification() {
-        let mut s = fake(vec![Some(json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"x"}}}))]);
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"x"}}}),
+        )]);
         let info = s.initialize().unwrap().clone();
         assert_eq!(info["serverInfo"]["name"], "x");
         let sent = &s.transport.sent;
@@ -121,14 +140,19 @@ mod tests {
         assert_eq!(sent[0]["method"], "initialize");
         assert_eq!(sent[0]["id"], 1);
         assert_eq!(sent[1]["method"], "notifications/initialized");
-        assert!(sent[1].get("id").is_none(), "a notification must not carry an id");
+        assert!(
+            sent[1].get("id").is_none(),
+            "a notification must not carry an id"
+        );
     }
 
     #[test]
     fn ids_increase_and_results_are_unwrapped() {
         let mut s = fake(vec![
             Some(json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}]}})),
-            Some(json!({"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hi"}]}})),
+            Some(
+                json!({"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"hi"}]}}),
+            ),
         ]);
         assert_eq!(s.list_tools().unwrap()[0]["name"], "a");
         let r = s.call_tool("a", json!({})).unwrap();
@@ -139,8 +163,13 @@ mod tests {
 
     #[test]
     fn rpc_errors_surface() {
-        let mut s = fake(vec![Some(json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}))]);
-        assert!(matches!(s.request("x", None), Err(Error::Rpc { code: -32601, .. })));
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"nope"}}),
+        )]);
+        assert!(matches!(
+            s.request("x", None),
+            Err(Error::Rpc { code: -32601, .. })
+        ));
     }
 
     #[test]
