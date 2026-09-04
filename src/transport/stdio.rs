@@ -8,6 +8,7 @@ use super::{silent, Logger, Transport};
 use crate::protocol::{Error, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
@@ -29,12 +30,28 @@ impl StdioTransport {
         forward_stderr: bool,
         log: Option<Logger>,
     ) -> Result<Self> {
+        Self::spawn_with(argv, &[], None, timeout, forward_stderr, log)
+    }
+
+    /// Spawn with extra environment variables and an optional working directory.
+    pub fn spawn_with(
+        argv: &[String],
+        env: &[(String, String)],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        forward_stderr: bool,
+        log: Option<Logger>,
+    ) -> Result<Self> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| Error::usage("--stdio needs a command to run"))?;
 
-        let mut child = Command::new(program)
-            .args(args)
+        let mut cmd = Command::new(program);
+        cmd.args(args).envs(env.iter().map(|(k, v)| (k, v)));
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(if forward_stderr {

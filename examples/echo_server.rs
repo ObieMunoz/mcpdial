@@ -6,12 +6,14 @@
 //!     mcpdial call 'stdio:target/debug/examples/echo_server' echo '{"message":"hi"}'
 //!
 //! Set `ECHO_SERVER_HANG=1` to make it swallow every request, for timeout tests.
+//! Set `ECHO_SERVER_TAG` to have it echoed back as the server's `instructions`.
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
 fn main() {
     let hang = std::env::var_os("ECHO_SERVER_HANG").is_some();
+    let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
@@ -29,8 +31,8 @@ fn main() {
             continue;
         };
         let Some(id) = msg.get("id").cloned() else {
-            continue;
-        }; // notification
+            continue; // notification
+        };
         if hang {
             continue;
         }
@@ -38,14 +40,17 @@ fn main() {
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
         let reply = match method {
-            "initialize" => ok(
-                id,
-                json!({
+            "initialize" => {
+                let mut result = json!({
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "echo-server", "version": "0.0.1"},
-                }),
-            ),
+                });
+                if let Some(t) = &tag {
+                    result["instructions"] = json!(format!("tag={t}"));
+                }
+                ok(id, result)
+            }
             "tools/list" => ok(
                 id,
                 json!({"tools": [
@@ -59,7 +64,7 @@ fn main() {
                 "echo" => ok(
                     id,
                     json!({"content": [{"type": "text",
-                    "text": format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}),
+                        "text": format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}),
                 ),
                 "fail" => ok(
                     id,

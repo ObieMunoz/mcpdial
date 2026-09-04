@@ -154,7 +154,21 @@ fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTr
 /// works without a visible hiccup.
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
     if let Some(cmd) = &r.config.stdio {
-        let t = StdioTransport::spawn_str(cmd, opts.timeout, opts.verbose, opts.logger())?;
+        let argv = crate::transport::stdio::split_command(cmd)?;
+        let env: Vec<(String, String)> = r
+            .config
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let t = StdioTransport::spawn_with(
+            &argv,
+            &env,
+            r.config.cwd.as_deref().map(std::path::Path::new),
+            opts.timeout,
+            opts.verbose,
+            opts.logger(),
+        )?;
         let mut session = Session::new(Box::new(t) as Box<dyn Transport>);
         let info = session.initialize()?.clone();
         return Ok(Connection {

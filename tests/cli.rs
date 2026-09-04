@@ -585,3 +585,29 @@ fn extra_headers_are_sent_and_saved() {
     let o = run(mcpdial(&home).args(["-H", "nocolon", "info", &s.url]));
     assert_eq!(o.code, 2);
 }
+
+#[test]
+fn stdio_env_and_cwd_are_passed_to_the_process() {
+    let home = temp_home("env");
+    let echo = echo_server().display().to_string();
+    let o = run(mcpdial(&home).args([
+        "add",
+        "tagged",
+        "--stdio",
+        &echo,
+        "--env",
+        "ECHO_SERVER_TAG=hello",
+        "--cwd",
+        "/",
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["info", "tagged"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("tag=hello"), "{}", o.stdout);
+
+    let o = run(mcpdial(&home).args(["add", "bad", "--stdio", &echo, "--env", "NOEQUALS"]));
+    assert_eq!(o.code, 2);
+    let o = run(mcpdial(&home).args(["add", "bad", "--http", "http://x/mcp", "--env", "A=1"]));
+    assert_eq!(o.code, 2);
+    assert!(o.stderr.contains("only apply to --stdio"));
+}

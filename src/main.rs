@@ -78,6 +78,12 @@ enum Cmd {
         /// Command that speaks MCP on stdio
         #[arg(long, value_name = "CMD")]
         stdio: Option<String>,
+        /// Environment variable for the stdio process, repeatable
+        #[arg(long, value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Working directory for the stdio process
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<String>,
     },
     /// Forget a server and any credential saved for it
     Rm { name: String },
@@ -201,7 +207,13 @@ fn run(cli: Cli) -> Result<u8, Error> {
     };
 
     match cli.cmd {
-        Cmd::Add { name, http, stdio } => {
+        Cmd::Add {
+            name,
+            http,
+            stdio,
+            env,
+            cwd,
+        } => {
             let mut cfg = match (http, stdio) {
                 (Some(url), None) => ServerConfig::http(url),
                 (None, Some(cmd)) => ServerConfig::stdio(cmd),
@@ -216,6 +228,24 @@ fn run(cli: Cli) -> Result<u8, Error> {
                     "--header and --token-env only apply to --http servers",
                 ));
             }
+            if cfg.http.is_some() && (!env.is_empty() || cwd.is_some()) {
+                return Err(Error::usage(
+                    "--env and --cwd only apply to --stdio servers",
+                ));
+            }
+            for item in &env {
+                match item.split_once('=') {
+                    Some((k, v)) if !k.trim().is_empty() => {
+                        cfg.env.insert(k.trim().to_string(), v.to_string());
+                    }
+                    _ => {
+                        return Err(Error::usage(format!(
+                            "--env must look like KEY=VALUE, got {item:?}"
+                        )))
+                    }
+                }
+            }
+            cfg.cwd = cwd;
             cfg.headers = opts.extra_headers.iter().cloned().collect();
             cfg.token_env = opts.token_env.clone();
             store.add_server(&name, cfg.clone())?;

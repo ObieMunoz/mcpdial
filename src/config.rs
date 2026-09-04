@@ -33,6 +33,12 @@ pub struct ServerConfig {
     /// Env var to read a bearer token from. Takes precedence over a saved credential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+    /// Extra environment for a stdio server's process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Working directory for a stdio server's process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 impl ServerConfig {
