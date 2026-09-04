@@ -13,7 +13,7 @@
 
 use crate::config::{now, Credential};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
-use crate::transport::http::USER_AGENT;
+use crate::transport::http::{redirect_error, USER_AGENT};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -122,8 +122,14 @@ pub fn challenge(http: &Http, mcp_url: &str) -> Result<Option<String>> {
             "clientInfo": {"name": CLIENT_NAME, "version": crate::VERSION},
         })),
     );
-    let mut resp = http
-        .agent
+    let no_redirect = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    let mut resp = no_redirect
         .post(mcp_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
@@ -131,6 +137,14 @@ pub fn challenge(http: &Http, mcp_url: &str) -> Result<Option<String>> {
         .send(&init.to_string())
         .map_err(|e| Error::auth(format!("could not reach {mcp_url}: {e}")))?;
     let status = resp.status().as_u16();
+    if (300..400).contains(&status) {
+        let to = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        return Err(redirect_error(mcp_url, status, to.as_deref()));
+    }
     let www = resp
         .headers()
         .get("www-authenticate")
@@ -261,6 +275,24 @@ fn string_list(v: &Value) -> Vec<String> {
 
 // -- registration ---------------------------------------------------------------
 
+const REDIRECT_REFUSED: &str = "authorization server refused the loopback redirect URI";
+
+/// What to tell a human when neither loopback host is accepted.
+pub fn loopback_hint(issuer: &str) -> String {
+    format!(
+        "\nHint: {issuer} rejects http://127.0.0.1 and http://localhost redirect URIs. RFC 8252 \
+         section 7.3 requires an authorization server to accept them for native clients, and \
+         the MCP authorization spec builds on that. This is a server-side setting.\n\
+         If the server is Doorkeeper (Rails), in config/initializers/doorkeeper.rb set:\n\
+         \n    force_ssl_in_redirect_uri {{ |uri| !%w[localhost 127.0.0.1 ::1].include?(uri.host) }}\n\
+         \nOtherwise register a client out of band and pass --client-id."
+    )
+}
+
+fn is_redirect_refused(e: &Error) -> bool {
+    matches!(e, Error::Auth(m) if m.starts_with(REDIRECT_REFUSED))
+}
+
 pub fn register(http: &Http, meta: &Metadata, redirect_uri: &str) -> Result<String> {
     let endpoint = meta.registration_endpoint.as_deref().ok_or_else(|| {
         Error::auth(format!(
@@ -278,6 +310,12 @@ pub fn register(http: &Http, meta: &Metadata, redirect_uri: &str) -> Result<Stri
     });
     let (status, value, text) = http.post_json(endpoint, &body)?;
     if !(200..300).contains(&status) {
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("redirect") || lower.contains("invalid_client_metadata") {
+            return Err(Error::Auth(format!(
+                "{REDIRECT_REFUSED}: HTTP {status}\n{text}"
+            )));
+        }
         return Err(Error::auth(format!(
             "registration at {endpoint} failed: HTTP {status}\n{text}"
         )));
@@ -357,21 +395,29 @@ fn query_params(query: &str) -> Vec<(String, String)> {
 // -- the loopback redirect ----------------------------------------------------
 
 /// Serve exactly one `/callback` request on `listener` and return the `code`.
-fn wait_for_code(listener: TcpListener, expected_state: &str, timeout: Duration) -> Result<String> {
+fn wait_for_code(
+    listeners: Vec<TcpListener>,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
     let (tx, rx) = mpsc::channel::<Result<String>>();
-    let state = expected_state.to_string();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { continue };
-            match handle_callback(stream, &state) {
-                Some(result) => {
-                    let _ = tx.send(result);
-                    return;
+    for listener in listeners {
+        let tx = tx.clone();
+        let state = expected_state.to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                match handle_callback(stream, &state) {
+                    Some(result) => {
+                        let _ = tx.send(result);
+                        return;
+                    }
+                    None => continue, // favicon, health checks, a stray browser prefetch
                 }
-                None => continue, // favicon, health checks, a stray browser prefetch
             }
-        }
-    });
+        });
+    }
+    drop(tx);
     rx.recv_timeout(timeout).map_err(|_| {
         Error::auth(format!(
             "no authorization callback within {}s",
@@ -451,6 +497,9 @@ pub struct LoginOptions {
     pub scope: Option<String>,
     pub port: Option<u16>,
     pub client_id: Option<String>,
+    /// Loopback host for the redirect URI. `None` tries 127.0.0.1 first and falls
+    /// back to localhost if the server refuses it (Doorkeeper's common allowlist).
+    pub redirect_host: Option<String>,
     pub open_browser: bool,
     pub timeout: Duration,
 }
@@ -461,10 +510,27 @@ impl Default for LoginOptions {
             scope: None,
             port: None,
             client_id: None,
+            redirect_host: None,
             open_browser: true,
             timeout: Duration::from_secs(300),
         }
     }
+}
+
+/// Bind the loopback port on IPv4, and on IPv6 too when possible, so a browser that
+/// resolves `localhost` to `::1` still reaches us.
+fn bind_loopback(port: u16) -> Result<(Vec<TcpListener>, u16)> {
+    let v4 = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| Error::auth(format!("cannot bind 127.0.0.1:{port}: {e}")))?;
+    let port = v4
+        .local_addr()
+        .map_err(|e| Error::auth(e.to_string()))?
+        .port();
+    let mut listeners = vec![v4];
+    if let Ok(v6) = TcpListener::bind(("::1", port)) {
+        listeners.push(v6);
+    }
+    Ok((listeners, port))
 }
 
 /// Run the authorization-code flow for `mcp_url` and return a credential to save.
@@ -483,38 +549,63 @@ pub fn login(
     let meta = discover(http, mcp_url, chal.as_deref())?;
     notify(&format!("authorization server: {}", meta.issuer));
 
-    // A saved client id is only reusable on the port it was registered with.
-    let saved_port = existing
-        .filter(|c| c.client_id.is_some())
-        .and_then(|c| c.redirect_port);
+    // A saved client id is only reusable with the exact redirect URI it was
+    // registered for, which means the same port and the same loopback host.
+    let saved = existing.filter(|c| c.client_id.is_some());
+    let saved_port = saved.and_then(|c| c.redirect_port);
     let want_port = opts.port.or(saved_port).unwrap_or(0);
-    let listener = match TcpListener::bind(("127.0.0.1", want_port)) {
+    let (listeners, port) = match bind_loopback(want_port) {
         Ok(l) => l,
-        Err(_) if opts.port.is_none() && want_port != 0 => TcpListener::bind(("127.0.0.1", 0))
-            .map_err(|e| Error::auth(format!("cannot open a loopback port: {e}")))?,
-        Err(e) => {
-            return Err(Error::auth(format!(
-                "cannot bind 127.0.0.1:{want_port}: {e}"
-            )))
-        }
+        Err(_) if opts.port.is_none() && want_port != 0 => bind_loopback(0)?,
+        Err(e) => return Err(e),
     };
-    let port = listener
-        .local_addr()
-        .map_err(|e| Error::auth(e.to_string()))?
-        .port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let client_id = match (&opts.client_id, existing) {
+    let mut host = opts
+        .redirect_host
+        .clone()
+        .or_else(|| {
+            saved
+                .filter(|c| c.redirect_port == Some(port))
+                .and_then(|c| c.redirect_host.clone())
+        })
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let redirect_for = |h: &str| format!("http://{h}:{port}/callback");
+
+    let client_id = match (&opts.client_id, saved) {
         (Some(id), _) => id.clone(),
-        (None, Some(c)) if c.redirect_port == Some(port) && c.client_id.is_some() => {
+        (None, Some(c))
+            if c.redirect_port == Some(port)
+                && c.redirect_host.as_deref() == Some(host.as_str()) =>
+        {
             c.client_id.clone().unwrap()
         }
-        _ => {
-            let id = register(http, &meta, &redirect_uri)?;
-            notify(&format!("registered client {id}"));
-            id
-        }
+        _ => match register(http, &meta, &redirect_for(&host)) {
+            Ok(id) => id,
+            Err(e)
+                if is_redirect_refused(&e)
+                    && opts.redirect_host.is_none()
+                    && host == "127.0.0.1" =>
+            {
+                notify("server refused http://127.0.0.1 as a redirect URI; retrying with http://localhost");
+                host = "localhost".to_string();
+                match register(http, &meta, &redirect_for(&host)) {
+                    Ok(id) => id,
+                    Err(e) if is_redirect_refused(&e) => {
+                        return Err(Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer))))
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) if is_redirect_refused(&e) => {
+                return Err(Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer))))
+            }
+            Err(e) => return Err(e),
+        },
     };
+    let redirect_uri = redirect_for(&host);
+    if !saved.is_some_and(|c| c.client_id.as_deref() == Some(client_id.as_str())) {
+        notify(&format!("registered client {client_id}"));
+    }
 
     let (verifier, code_challenge) = pkce()?;
     let state = random_urlsafe(16)?;
@@ -560,7 +651,7 @@ pub fn login(
     }
     notify(&format!("waiting for the callback on {redirect_uri} ..."));
 
-    let code = wait_for_code(listener, &state, opts.timeout)?;
+    let code = wait_for_code(listeners, &state, opts.timeout)?;
 
     let (status, value, text) = http.post_form(
         &meta.token_endpoint,
@@ -583,6 +674,7 @@ pub fn login(
     cred.token_endpoint = Some(meta.token_endpoint.clone());
     cred.client_id = Some(client_id);
     cred.redirect_port = Some(port);
+    cred.redirect_host = Some(host);
     cred.resource = Some(meta.resource.clone());
     cred.source = Some("oauth".into());
     if cred.scope.is_none() {

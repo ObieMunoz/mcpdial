@@ -77,6 +77,9 @@ impl HttpTransportBuilder {
             // We want the response object for 4xx/5xx so we can read the body and
             // the WWW-Authenticate header, not a bare status error.
             .http_status_as_error(false)
+            // A redirect turns the POST into a GET and the reply into a web page.
+            // Surface it so the user fixes the URL instead of chasing a phantom.
+            .max_redirects(0)
             .build();
         HttpTransport {
             url: self.url,
@@ -87,6 +90,17 @@ impl HttpTransportBuilder {
             log: self.log.unwrap_or_else(silent),
             session_id: None,
         }
+    }
+}
+
+/// MCP endpoints must be called at their final URL: a redirect would turn the POST
+/// into a GET and the JSON-RPC reply into a web page.
+pub fn redirect_error(url: &str, status: u16, location: Option<&str>) -> Error {
+    match location {
+        Some(to) => Error::transport(format!(
+            "{url} redirected ({status}) to {to}\nHint: use that URL instead; MCP servers must be called at their final address."
+        )),
+        None => Error::transport(format!("{url} redirected ({status}) with no Location header")),
     }
 }
 
@@ -131,6 +145,7 @@ impl Transport for HttpTransport {
         let content_type = header("content-type").unwrap_or_default();
         let www_authenticate = header("www-authenticate");
         let session_id = header("mcp-session-id");
+        let location = header("location");
 
         let text = resp
             .body_mut()
@@ -141,6 +156,9 @@ impl Transport for HttpTransport {
             text.trim()
         ));
 
+        if (300..400).contains(&status) {
+            return Err(redirect_error(&self.url, status, location.as_deref()));
+        }
         if !(200..300).contains(&status) {
             return Err(Error::Http {
                 status,

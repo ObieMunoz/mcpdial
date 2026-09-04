@@ -80,6 +80,9 @@ pub struct Credential {
     /// The loopback port the client id was registered with; the redirect URI must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
+    /// The loopback host in that redirect URI: "127.0.0.1" or "localhost".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_host: Option<String>,
     /// The `resource` indicator (RFC 8707) the token was issued for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,

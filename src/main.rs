@@ -124,6 +124,10 @@ enum Cmd {
         /// Use a pre-registered client id instead of dynamic registration
         #[arg(long)]
         client_id: Option<String>,
+        /// Loopback host in the redirect URI: 127.0.0.1 (default, with a localhost
+        /// fallback if the server refuses it) or localhost
+        #[arg(long, value_name = "HOST", value_parser = ["127.0.0.1", "localhost"])]
+        redirect_host: Option<String>,
         /// Print the URL but do not try to open a browser
         #[arg(long)]
         no_browser: bool,
@@ -437,6 +441,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
             scope,
             port,
             client_id,
+            redirect_host,
             no_browser,
         } => {
             let r = client::resolve(&store, &target)?;
@@ -451,6 +456,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 scope,
                 port,
                 client_id,
+                redirect_host,
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
             };

@@ -266,26 +266,12 @@ fn saved_servers_and_status_listing() {
     assert!(!o.stdout.contains("dead"));
 }
 
-#[test]
-fn oauth_login_saves_a_token_and_refreshes_it() {
-    let s = start(Mode::Auth { tokens: vec![] });
-    let home = temp_home("oauth");
-    assert_eq!(
-        run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code,
-        0
-    );
-
-    let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"x"}"#]));
-    assert_eq!(o.code, 1);
-    assert!(
-        o.stderr.contains("HTTP 401") && o.stderr.contains("mcpdial login"),
-        "{}",
-        o.stderr
-    );
-
-    // Run login with no browser, scrape the auth URL, and play the browser ourselves.
-    let mut child = mcpdial(&home)
-        .args(["login", "work", "--no-browser"])
+/// Run `login` with no browser, scrape the auth URL from stderr, and play the browser
+/// ourselves: the fake authorization server 302s straight back to the loopback callback.
+fn drive_login(home: &std::path::Path, target: &str, extra: &[&str]) -> String {
+    let mut child = mcpdial(home)
+        .args(["login", target, "--no-browser"])
+        .args(extra)
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -306,9 +292,16 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
         }
         all
     });
-    let auth_url = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("login printed an authorization URL");
+    let auth_url = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(u) => u,
+        Err(_) => {
+            let _ = child.kill();
+            panic!(
+                "login printed no authorization URL:\n{}",
+                drain.join().unwrap()
+            );
+        }
+    };
     assert!(auth_url.contains("code_challenge_method=S256"));
     assert!(
         auth_url.contains("scope=mcp"),
@@ -325,6 +318,99 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
     let status = child.wait().unwrap();
     let log = drain.join().unwrap();
     assert!(status.success(), "login exited {status}:\n{log}");
+    log
+}
+
+#[test]
+fn redirects_are_refused_not_followed() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("redirect");
+    let moved = format!("{}/moved", s.base);
+    let o = run(mcpdial(&home).args(["info", &moved]));
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("redirected (301) to"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains(&s.url),
+        "names the final URL: {}",
+        o.stderr
+    );
+    assert_eq!(s.requests.lock().unwrap().len(), 1, "did not follow");
+
+    let o = run(mcpdial(&home).args(["login", &moved, "--no-browser"]));
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("redirected (301) to"), "{}", o.stderr);
+}
+
+#[test]
+fn login_falls_back_to_localhost_when_127_is_refused() {
+    let s = start(Mode::AuthLocalhostOnly);
+    let home = temp_home("localhost");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code,
+        0
+    );
+
+    let log = drive_login(&home, "work", &[]);
+    assert!(log.contains("refused http://127.0.0.1"), "{log}");
+    assert!(log.contains("retrying with http://localhost"), "{log}");
+    assert!(log.contains("registered client client-abc"), "{log}");
+    let creds = std::fs::read_to_string(home.join("credentials.json")).unwrap();
+    assert!(
+        creds.contains("\"redirect_host\": \"localhost\""),
+        "{creds}"
+    );
+    let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"ok"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+
+    // The saved client id is reused on a second login, with the host it was registered for.
+    let log = drive_login(&home, "work", &[]);
+    assert!(
+        !log.contains("registered client"),
+        "should reuse the client id:\n{log}"
+    );
+    assert!(!log.contains("refused"), "{log}");
+
+    // Forcing 127.0.0.1 gets the server-side hint instead of a silent retry.
+    let o = run(mcpdial(&home).args(["logout", "work"]));
+    assert_eq!(o.code, 0);
+    let o = run(mcpdial(&home).args([
+        "login",
+        "work",
+        "--no-browser",
+        "--redirect-host",
+        "127.0.0.1",
+    ]));
+    assert_eq!(o.code, 1);
+    assert!(
+        o.stderr.contains("refused the loopback redirect URI"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("force_ssl_in_redirect_uri"),
+        "{}",
+        o.stderr
+    );
+}
+
+#[test]
+fn oauth_login_saves_a_token_and_refreshes_it() {
+    let s = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("oauth");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "work", "--http", &s.url])).code,
+        0
+    );
+
+    let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"x"}"#]));
+    assert_eq!(o.code, 1);
+    assert!(
+        o.stderr.contains("HTTP 401") && o.stderr.contains("mcpdial login"),
+        "{}",
+        o.stderr
+    );
+
+    let log = drive_login(&home, "work", &[]);
     assert!(log.contains("registered client client-abc"), "{log}");
     assert!(log.contains("saved token for work (expires in"), "{log}");
 

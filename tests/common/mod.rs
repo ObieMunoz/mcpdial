@@ -23,6 +23,9 @@ pub enum Mode {
     Stateless,
     /// 401 with a challenge unless a valid bearer token is presented.
     Auth { tokens: Vec<String> },
+    /// Like `Auth`, but registration refuses http://127.0.0.1 (Doorkeeper's default
+    /// allowlist admits only `localhost` once it is opened up at all).
+    AuthLocalhostOnly,
     /// 403 with no challenge, like a WAF.
     Blocked,
 }
@@ -165,8 +168,21 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 "scopes_supported": ["mcp"],
             }),
         ),
+        "/moved" => with_headers(
+            Response::from_string("").with_status_code(301),
+            &[("Location", &format!("{base}/mcp"))],
+        ),
         "/register" => {
             let body = rec.json();
+            let redirect = body["redirect_uris"][0].as_str().unwrap_or("");
+            if matches!(mode, Mode::AuthLocalhostOnly) && !redirect.starts_with("http://localhost:")
+            {
+                return json_resp(
+                    400,
+                    &json!({"error": "invalid_client_metadata",
+                    "error_description": "Redirect URI must be an HTTPS/SSL URI."}),
+                );
+            }
             assert_eq!(
                 body["token_endpoint_auth_method"], "none",
                 "must register as a public client"
@@ -263,7 +279,7 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if let Mode::Blocked = mode {
         return Response::from_string("error code: 1010").with_status_code(403);
     }
-    if let Mode::Auth { .. } = mode {
+    if matches!(mode, Mode::Auth { .. } | Mode::AuthLocalhostOnly) {
         let bearer = rec
             .header("authorization")
             .and_then(|a| a.strip_prefix("Bearer "))
