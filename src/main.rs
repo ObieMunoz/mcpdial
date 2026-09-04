@@ -93,6 +93,8 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Keep one session open and run commands from stdin (state persists between calls)
+    Shell { target: String },
     /// Forget a server and any credential saved for it
     Rm { name: String },
     /// List saved servers with their live connection status
@@ -315,6 +317,117 @@ fn run(cli: Cli) -> Result<u8, Error> {
             }
             eprintln!("imported {added} server(s)");
             Ok(0)
+        }
+
+        Cmd::Shell { target } => {
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let si = &conn.server_info["serverInfo"];
+            let interactive = std::io::stdin().is_terminal();
+            if interactive {
+                eprintln!(
+                    "connected to {} {}. Commands: tools, call TOOL [json], raw METHOD [json], info, quit",
+                    si["name"].as_str().unwrap_or("?"),
+                    si["version"].as_str().unwrap_or("")
+                );
+            }
+            let stdin = std::io::stdin();
+            let mut line = String::new();
+            let mut failures = 0u32;
+            loop {
+                if interactive {
+                    eprint!("{}> ", r.name);
+                    std::io::stderr().flush().ok();
+                }
+                line.clear();
+                let n = stdin
+                    .read_line(&mut line)
+                    .map_err(|e| Error::usage(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                let text = line.trim();
+                if text.is_empty() || text.starts_with('#') {
+                    continue;
+                }
+                let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+                let rest = rest.trim();
+                let outcome: Result<(), Error> = match word {
+                    "quit" | "exit" => break,
+                    "help" => {
+                        eprintln!("tools | call TOOL [json] | raw METHOD [json] | info | quit");
+                        Ok(())
+                    }
+                    "info" => {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&conn.server_info).unwrap()
+                        );
+                        Ok(())
+                    }
+                    "tools" => conn.session.list_tools().map(|tools| {
+                        if cli.json {
+                            println!("{}", json!({ "tools": tools }));
+                        } else {
+                            println!("{} tool(s):", tools.len());
+                            print_tools(&tools, rest == "--long" || rest == "-l");
+                        }
+                    }),
+                    "call" => {
+                        let (tool, args) =
+                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+                        if tool.is_empty() {
+                            Err(Error::usage("call needs a tool name"))
+                        } else {
+                            parse_object(args.trim(), "arguments")
+                                .and_then(|a| conn.session.call_tool(tool, a))
+                                .map(|result| {
+                                    if cli.json {
+                                        println!("{result}");
+                                    } else {
+                                        let out = mcpdial::render_content(&result);
+                                        if !out.is_empty() {
+                                            println!("{out}");
+                                        }
+                                        if result["isError"].as_bool().unwrap_or(false) {
+                                            eprintln!("(tool reported an error)");
+                                        }
+                                    }
+                                })
+                        }
+                    }
+                    "raw" => {
+                        let (method, params) =
+                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+                        if method.is_empty() {
+                            Err(Error::usage("raw needs a method"))
+                        } else {
+                            parse_object(params.trim(), "params")
+                                .and_then(|p| conn.session.request(method, Some(p)))
+                                .map(|result| {
+                                    println!(
+                                        "{}",
+                                        if cli.json {
+                                            result.to_string()
+                                        } else {
+                                            serde_json::to_string_pretty(&result).unwrap()
+                                        }
+                                    )
+                                })
+                        }
+                    }
+                    other => Err(Error::usage(format!("unknown command {other:?}; try help"))),
+                };
+                if let Err(e) = outcome {
+                    failures += 1;
+                    eprintln!("error: {e}");
+                }
+            }
+            Ok(if failures > 0 && !interactive {
+                EXIT_ERROR
+            } else {
+                0
+            })
         }
 
         Cmd::Rm { name } => {

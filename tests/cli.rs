@@ -160,6 +160,9 @@ fn stdio_adhoc_call_and_timeout() {
         o.stderr
     );
 
+    let o = run(mcpdial(&home).args(["--json", "--timeout", "3", "ls"]));
+    let _ = o; // ls is covered elsewhere; this just proves nothing hangs after a dead server
+
     let o = run(mcpdial(&home).args(["info", "stdio:/definitely/not/a/program"]));
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("could not start"), "{}", o.stderr);
@@ -257,7 +260,7 @@ fn saved_servers_and_status_listing() {
         "{}",
         o.stdout
     );
-    assert!(o.stdout.contains("## local  echo-server 0.0.1  (2 tools)"));
+    assert!(o.stdout.contains("## local  echo-server 0.0.1  (3 tools)"));
     assert!(o.stdout.contains("## locked  auth required"));
     assert!(o.stdout.contains("## dead  unreachable:"));
 
@@ -623,6 +626,76 @@ fn stdio_env_and_cwd_are_passed_to_the_process() {
     let o = run(mcpdial(&home).args(["add", "bad", "--http", "http://x/mcp", "--env", "A=1"]));
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("only apply to --stdio"));
+}
+
+#[test]
+fn shell_keeps_one_session_alive() {
+    let home = temp_home("shell");
+    let target = format!("stdio:{}", echo_server().display());
+
+    // Separate invocations are separate processes: the counter never gets past 1.
+    for _ in 0..2 {
+        let o = run(mcpdial(&home).args(["call", &target, "count"]));
+        assert_eq!(o.stdout.trim(), "count=1");
+    }
+
+    let script = "# a comment\ncall count\ncall count {}\ntools\ncall nope\nraw tools/list\ncall count\nquit\ncall count\n";
+    let mut child = mcpdial(&home)
+        .args(["shell", &target])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.contains("count=1\n"), "{stdout}");
+    assert!(stdout.contains("count=2\n"), "{stdout}");
+    assert!(
+        stdout.contains("count=3\n"),
+        "same process throughout: {stdout}"
+    );
+    assert!(!stdout.contains("count=4"), "quit stops reading: {stdout}");
+    assert!(stdout.contains("3 tool(s):"), "{stdout}");
+    assert!(
+        stdout.contains("\"name\": \"count\""),
+        "raw output: {stdout}"
+    );
+    assert!(
+        stderr.contains("MCP error -32602"),
+        "errors go to stderr and do not end the session: {stderr}"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "a failed command in a script is reported in the exit code"
+    );
+
+    let mut child = mcpdial(&home)
+        .args(["--json", "shell", &target])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"call count\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(v["content"][0]["text"], "count=1");
 }
 
 #[test]
