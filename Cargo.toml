@@ -1,0 +1,32 @@
+[package]
+name = "mcpdial"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Dial any MCP server from the shell: named servers, saved OAuth tokens, connection status, and tool listing. No SDK, no host app, no connector."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/obiemunoz/mcpdial"
+keywords = ["mcp", "model-context-protocol", "json-rpc", "cli", "oauth"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tiny_http = "0.12"
+
+[[bin]]
+name = "mcpdial"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
