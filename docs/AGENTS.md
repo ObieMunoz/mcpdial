@@ -92,6 +92,8 @@ object; errors print `{"error":{...}}`. The process exits 1 at the end if any co
 failed and stdin was not a terminal.
 
 A bare tool name is not a command; `call` it. Nothing else in the line is guessed at.
+Line editing, history and Tab completion apply only when stdin and stdout are both a
+terminal; piped input is read one line at a time with no editing and no history.
 
 ## Authentication
 

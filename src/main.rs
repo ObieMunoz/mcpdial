@@ -441,7 +441,10 @@ const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
   raw METHOD {"json": ...}   send any JSON-RPC method
   info                       the initialize result
-  quit                       close the session"#;
+  quit                       close the session
+
+At a terminal: Up and Down walk the history, Tab completes commands and tool
+names, and ^C abandons the line being typed."#;
 
 /// The answer to a tool name this server does not have.
 fn no_such_tool(tools: &[Value], name: &str) -> Failure {
@@ -459,6 +462,171 @@ fn shell_call_hint(
     tool: &str,
 ) -> Option<String> {
     call_hint(shell_tools(cache, conn), tool, "call", "", "`tools`")
+}
+
+/// Tab completion for the shell: command names in the first word, tool names
+/// after the three commands whose one argument is a tool.
+#[derive(Default)]
+struct ShellHelper {
+    tools: Vec<String>,
+}
+
+impl rustyline::completion::Completer for ShellHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        let head = line.get(..pos).unwrap_or(line);
+        let start = head
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace())
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let (before, word) = head.split_at(start);
+        let pool: Vec<String> = match before.split_whitespace().collect::<Vec<_>>()[..] {
+            [] => SHELL_COMMANDS.iter().map(|c| c.to_string()).collect(),
+            ["call" | "schema" | "help"] => self.tools.clone(),
+            _ => Vec::new(),
+        };
+        Ok((
+            start,
+            pool.into_iter().filter(|c| c.starts_with(word)).collect(),
+        ))
+    }
+}
+
+impl rustyline::highlight::Highlighter for ShellHelper {}
+impl rustyline::validate::Validator for ShellHelper {}
+impl rustyline::hint::Hinter for ShellHelper {
+    type Hint = String;
+}
+impl rustyline::Helper for ShellHelper {}
+
+/// Where shell input comes from. A terminal gets line editing, history and
+/// completion; anything else is read a line at a time exactly as before, which
+/// is what scripts and pipes depend on.
+enum Input {
+    Tty {
+        editor: Box<rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory>>,
+        history: std::path::PathBuf,
+        prompt: String,
+        interrupts: u8,
+    },
+    Pipe {
+        stdin: std::io::Stdin,
+        /// Printed before each line when a human is typing into a redirected stdout.
+        prompt: Option<String>,
+    },
+}
+
+impl Input {
+    /// A terminal reader when stdin and stdout are both a tty, so that a
+    /// redirected stdout keeps today's behaviour: prompts on stderr, nothing else.
+    fn open(
+        store: &Store,
+        r: &client::Resolved,
+        label: &str,
+        interactive: bool,
+    ) -> Result<Self, Error> {
+        let prompt = format!("{label}> ");
+        if !interactive || !std::io::stdout().is_terminal() {
+            return Ok(Input::Pipe {
+                stdin: std::io::stdin(),
+                prompt: interactive.then_some(prompt),
+            });
+        }
+        let config = rustyline::Config::builder()
+            .completion_type(rustyline::CompletionType::List)
+            .auto_add_history(false)
+            .build();
+        let mut editor = rustyline::Editor::with_config(config)
+            .map_err(|e| Error::usage(format!("cannot start line editing: {e}")))?;
+        editor.set_helper(Some(ShellHelper::default()));
+        let history = store.history_path(r.saved.then_some(r.name.as_str()));
+        editor.load_history(&history).ok();
+        Ok(Input::Tty {
+            editor: Box::new(editor),
+            history,
+            prompt,
+            interrupts: 0,
+        })
+    }
+
+    /// The next line, or `None` when the session should end.
+    fn next(&mut self) -> Result<Option<String>, Error> {
+        match self {
+            Input::Pipe { stdin, prompt } => {
+                if let Some(p) = prompt {
+                    eprint!("{p}");
+                    std::io::stderr().flush().ok();
+                }
+                let mut line = String::new();
+                match stdin
+                    .read_line(&mut line)
+                    .map_err(|e| Error::usage(e.to_string()))?
+                {
+                    0 => Ok(None),
+                    _ => Ok(Some(line)),
+                }
+            }
+            Input::Tty {
+                editor,
+                prompt,
+                interrupts,
+                ..
+            } => loop {
+                match editor.readline(prompt) {
+                    Ok(line) => {
+                        *interrupts = 0;
+                        if !line.trim().is_empty() {
+                            editor.add_history_entry(line.as_str()).ok();
+                        }
+                        return Ok(Some(line));
+                    }
+                    // One ^C abandons the line being typed; a second one leaves,
+                    // which is what ^C did before there was a line to abandon.
+                    Err(rustyline::error::ReadlineError::Interrupted) => {
+                        *interrupts += 1;
+                        if *interrupts > 1 {
+                            return Ok(None);
+                        }
+                        eprintln!("(^C again, or `quit`, to exit)");
+                    }
+                    Err(rustyline::error::ReadlineError::Eof) => return Ok(None),
+                    Err(e) => return Err(Error::usage(e.to_string())),
+                }
+            },
+        }
+    }
+
+    /// Offer these tool names to Tab completion.
+    fn set_tools(&mut self, tools: &[Value]) {
+        if let Input::Tty { editor, .. } = self {
+            if let Some(helper) = editor.helper_mut() {
+                helper.tools = tools
+                    .iter()
+                    .filter_map(|t| t["name"].as_str())
+                    .map(String::from)
+                    .collect();
+            }
+        }
+    }
+
+    fn save_history(&mut self) {
+        if let Input::Tty {
+            editor, history, ..
+        } = self
+        {
+            if let Some(dir) = history.parent() {
+                std::fs::create_dir_all(dir).ok();
+            }
+            editor.save_history(history).ok();
+        }
+    }
 }
 
 /// The tool list, kept for explaining mistakes: fetched at most once per session,
@@ -598,25 +766,30 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 );
                 eprintln!("{SHELL_SUMMARY}");
             }
-            let stdin = std::io::stdin();
-            let mut line = String::new();
+            // A saved server is prompted by its own name. An ad-hoc target is a
+            // whole URL or command line, which makes a prompt that wraps the
+            // terminal, so use what the server calls itself instead.
+            let label = if r.saved {
+                r.name.clone()
+            } else {
+                si["name"]
+                    .as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| truncate_at(&r.name, 24))
+            };
+            let mut input = Input::open(&store, &r, &label, interactive)?;
             let mut failures = 0u32;
             // tools/list, fetched at most once, so a mistake can be answered with
             // the shape the server actually wants.
             let mut cache: Option<Vec<Value>> = None;
-            loop {
-                if interactive {
-                    eprint!("{}> ", r.name);
-                    std::io::stderr().flush().ok();
-                }
-                line.clear();
-                let n = stdin
-                    .read_line(&mut line)
-                    .map_err(|e| Error::usage(e.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                let text = line.trim();
+            if matches!(input, Input::Tty { .. }) {
+                // One eager fetch: it gives Tab something to complete and warms
+                // the same cache the hints read.
+                let tools = shell_tools(&mut cache, &mut conn).to_vec();
+                input.set_tools(&tools);
+            }
+            while let Some(raw) = input.next()? {
+                let text = raw.trim();
                 if text.is_empty() || text.starts_with('#') {
                     continue;
                 }
@@ -757,6 +930,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 })
                         }
                     }
+                    // Only reachable when line editing is off, since a terminal
+                    // reader consumes these itself.
+                    other if other.starts_with('\u{1b}') => Err(Failure::hinted(
+                        Error::usage("that was an escape sequence, not a command"),
+                        "arrow keys and line editing need a terminal on both stdin and stdout",
+                    )),
                     other => {
                         let tools = shell_tools(&mut cache, &mut conn);
                         let unknown = || Error::usage(format!("unknown command {other:?}"));
@@ -785,6 +964,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         })
                     }
                 };
+                if word == "tools" {
+                    input.set_tools(cache.as_deref().unwrap_or_default());
+                }
                 if let Err(f) = outcome {
                     failures += 1;
                     if cli.json {
@@ -797,6 +979,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     }
                 }
             }
+            input.save_history();
             Ok(if failures > 0 && !interactive {
                 EXIT_ERROR
             } else {
@@ -1346,6 +1529,38 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustyline::completion::Completer;
+    use rustyline::history::DefaultHistory;
+
+    fn complete(helper: &ShellHelper, line: &str) -> (usize, Vec<String>) {
+        let history = DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        helper.complete(line, line.len(), &ctx).unwrap()
+    }
+
+    #[test]
+    fn completes_commands_then_tool_names() {
+        let helper = ShellHelper {
+            tools: ["list_pages", "list_console_messages", "new_page"]
+                .map(String::from)
+                .to_vec(),
+        };
+        // The first word is a command.
+        let (at, found) = complete(&helper, "sch");
+        assert_eq!((at, found), (0, vec!["schema".to_string()]));
+        // The argument to these three is a tool, and completion starts at it.
+        let (at, found) = complete(&helper, "call list_");
+        assert_eq!(at, 5);
+        assert_eq!(found, ["list_pages", "list_console_messages"]);
+        assert_eq!(complete(&helper, "schema new").1, ["new_page"]);
+        assert_eq!(complete(&helper, "help li").1.len(), 2);
+        // Nothing to say about a tool's arguments, or about other commands.
+        assert!(complete(&helper, "call new_page {\"ur").1.is_empty());
+        assert!(complete(&helper, "raw tools/").1.is_empty());
+        // A server that lists no tools simply offers nothing.
+        assert!(complete(&ShellHelper::default(), "call li").1.is_empty());
+    }
+
     #[test]
     fn suggestions_stay_close_and_quoting_survives_a_shell() {
         assert_eq!(

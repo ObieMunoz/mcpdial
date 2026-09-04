@@ -165,6 +165,16 @@ impl Store {
     pub fn credentials_path(&self) -> PathBuf {
         self.dir.join("credentials.json")
     }
+    /// Where the interactive shell keeps its line history. A saved server gets
+    /// its own file, since the tool names recalled there are its own; ad-hoc
+    /// targets share one. `name` has been through [`validate_name`], so it is a
+    /// single safe path segment.
+    pub fn history_path(&self, name: Option<&str>) -> PathBuf {
+        match name {
+            Some(name) => self.dir.join(format!("history-{name}")),
+            None => self.dir.join("history"),
+        }
+    }
 
     // -- servers -------------------------------------------------------------
 

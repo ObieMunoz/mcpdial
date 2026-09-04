@@ -129,6 +129,11 @@ answers a rejected call the same way, with a line you can paste back into the te
 Under `--json` the same text arrives as `error.hint`. Some servers report a schema
 violation as a failed result rather than a JSON-RPC error; both get the same answer.
 
+At a terminal the prompt is a real line editor: Up and Down walk the history, Tab
+completes command names and tool names, and `^C` abandons the line being typed (twice
+leaves). History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped
+input is read plainly, exactly as before, so scripts are unaffected.
+
 ### Importing from a host you already configured
 
 `mcpdial import` reads the `mcpServers` shape that Claude Code, Claude Desktop, Cursor,
