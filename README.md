@@ -53,8 +53,9 @@ mcpdial rm NAME
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
-mcpdial call TARGET TOOL ['{"json":"args"}']
-mcpdial raw TARGET METHOD ['{"json":"params"}']
+mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | -]
+mcpdial schema TARGET TOOL       one tool's input schema
+mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
 
 mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--redirect-host H] [--no-browser]
@@ -62,6 +63,7 @@ mcpdial logout TARGET
 mcpdial token set NAME [--env VAR]   token from stdin or an env var, never an argument
 mcpdial token show NAME              metadata only; the secret is never printed
 mcpdial token rm NAME
+mcpdial guide                    the usage guide for programs and agents
 ```
 
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
@@ -194,6 +196,21 @@ $ mcpdial call wiki nope; echo "exit=$?"
 error: MCP error -32602: Tool nope not found
 exit=1
 ```
+
+## Calling it from a program or an agent
+
+Pass `--json` on every command. Results go to stdout; errors go to stderr as a single
+object with a `kind` to branch on (`rpc`, `http`, `transport`, `auth`, `config`,
+`usage`) and the status or code behind it. `schema TARGET TOOL` returns one tool's
+input schema. Arguments can come from a file (`@args.json`) or stdin (`-`), so quoting
+is never a problem. `shell --json` gives one JSON line per command, errors included, in
+order.
+
+The full reference for programs is [docs/AGENTS.md](docs/AGENTS.md), and it is embedded
+in the binary: `mcpdial guide` prints it, so an agent can load it into context without
+finding the file. A Claude Code skill that teaches the same thing lives in
+[skills/mcpdial/SKILL.md](skills/mcpdial/SKILL.md); copy that directory to
+`~/.claude/skills/mcpdial/` to enable it.
 
 ## As a library
 
