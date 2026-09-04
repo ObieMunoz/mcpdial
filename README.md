@@ -55,7 +55,7 @@ mcpdial info TARGET              server name, version, capabilities, instruction
 mcpdial call TARGET TOOL ['{"json":"args"}']
 mcpdial raw TARGET METHOD ['{"json":"params"}']
 
-mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--no-browser]
+mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--redirect-host H] [--no-browser]
 mcpdial logout TARGET
 mcpdial token set NAME [--env VAR]   token from stdin or an env var, never an argument
 mcpdial token show NAME              metadata only; the secret is never printed
@@ -105,6 +105,16 @@ open the browser for the authorization-code grant with PKCE, catch the redirect 
 loopback port, exchange the code, and save the result. The browser step happens once.
 Afterwards the access token is refreshed automatically when it expires, and once more on
 an unexpected 401, so a saved server keeps working indefinitely.
+
+The redirect URI is `http://127.0.0.1:PORT/callback`, and if the server refuses that,
+`http://localhost:PORT/callback` is tried next, because some servers allowlist only the
+name. If both are refused, the server is not following RFC 8252 and the error says what
+to change; for a Doorkeeper server that is one line in `config/initializers/doorkeeper.rb`.
+Use `--redirect-host` to skip the guessing.
+
+Servers must be addressed at their final URL. A redirect (say, `www.` to the bare host)
+would turn the POST into a GET, so `mcpdial` refuses to follow it and names the URL to
+use instead.
 
 **`mcpdial token set NAME`** saves a token you obtained some other way, read from stdin or
 from `--env VAR`. It is never accepted as a command-line argument, so it cannot land in
