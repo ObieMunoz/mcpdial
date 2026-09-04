@@ -63,13 +63,32 @@ fn main() {
                      "inputSchema": {"type": "object", "properties": {}}},
                     {"name": "count", "description": "How many times this process has been asked.",
                      "inputSchema": {"type": "object", "properties": {}}},
+                    {"name": "strict", "description": "Rejects bad arguments in a failed result.",
+                     "inputSchema": {"type": "object", "properties": {"pageId": {"type": "number"}}, "required": ["pageId"]}},
                 ]}),
             ),
             "tools/call" => match params["name"].as_str().unwrap_or("") {
+                // Real servers validate against the schema before running anything.
+                "echo" if params["arguments"]["message"].as_str().is_none() => err(
+                    id,
+                    -32602,
+                    "Invalid arguments for tool echo: Required at message",
+                ),
                 "echo" => ok(
                     id,
                     json!({"content": [{"type": "text",
                         "text": format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}),
+                ),
+                // The other half of the world reports a schema violation as a failed
+                // result carrying the -32602 text, rather than as a JSON-RPC error.
+                "strict" if params["arguments"]["pageId"].as_f64().is_none() => ok(
+                    id,
+                    json!({"isError": true, "content": [{"type": "text", "text":
+                        "MCP error -32602: Invalid arguments for tool strict: Required at pageId"}]}),
+                ),
+                "strict" => ok(
+                    id,
+                    json!({"content": [{"type": "text", "text": "strict ok"}]}),
                 ),
                 "fail" => ok(
                     id,

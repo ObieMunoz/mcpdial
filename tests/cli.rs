@@ -260,7 +260,7 @@ fn saved_servers_and_status_listing() {
         "{}",
         o.stdout
     );
-    assert!(o.stdout.contains("## local  echo-server 0.0.1  (3 tools)"));
+    assert!(o.stdout.contains("## local  echo-server 0.0.1  (4 tools)"));
     assert!(o.stdout.contains("## locked  auth required"));
     assert!(o.stdout.contains("## dead  unreachable:"));
 
@@ -664,7 +664,7 @@ fn shell_keeps_one_session_alive() {
         "same process throughout: {stdout}"
     );
     assert!(!stdout.contains("count=4"), "quit stops reading: {stdout}");
-    assert!(stdout.contains("3 tool(s):"), "{stdout}");
+    assert!(stdout.contains("4 tool(s):"), "{stdout}");
     assert!(
         stdout.contains("\"name\": \"count\""),
         "raw output: {stdout}"
@@ -696,6 +696,120 @@ fn shell_keeps_one_session_alive() {
     assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(v["content"][0]["text"], "count=1");
+}
+
+/// Every way a line can be wrong should answer with the shape that was wanted.
+#[test]
+fn shell_explains_the_shape_it_expected() {
+    let home = temp_home("shell-hints");
+    let target = format!("stdio:{}", echo_server().display());
+    let script = concat!(
+        "echo\n",                            // a tool name typed as if it were a command
+        "call echo\n",                       // a required argument left out
+        "call echo [www.x.com](http://x)\n", // arguments that are not JSON at all
+        "call ech {\"message\":\"x\"}\n",    // a tool name with a typo
+        "tolls\n",                           // a command with a typo
+        "schema echo\n",
+        "help echo\n",
+        "quit\n",
+    );
+    let (stdout, stderr, code) = shell(&home, &target, false, script);
+
+    // A bare tool name is the commonest mistake, and it names the fix.
+    assert!(stderr.contains("echo is a tool, not a command"), "{stderr}");
+    // Every failed call answers with a line that would have worked.
+    assert_eq!(
+        stderr
+            .matches(r#"usage: call echo {"message": "<string>"}"#)
+            .count(),
+        4,
+        "bare name, missing argument, unparseable argument and `help echo`: {stderr}"
+    );
+    assert!(
+        stderr.contains("message: string (required)"),
+        "and the parameter list: {stderr}"
+    );
+    // Unparseable arguments quote what actually arrived.
+    assert!(
+        stderr.contains(r#""[www.x.com](http://x)" is not JSON"#),
+        "{stderr}"
+    );
+    // Near misses are named, for tools and for commands.
+    assert!(stderr.contains("did you mean echo?"), "{stderr}");
+    assert!(stderr.contains("did you mean tools?"), "{stderr}");
+    // schema prints the tool's own schema; help prints the readable form.
+    assert!(
+        stdout.contains(r#""required": ["#) && stdout.contains(r#""message""#),
+        "{stdout}"
+    );
+    assert_eq!(code, Some(1), "a script with failures still exits 1");
+
+    // A schema complaint that arrives as a failed *result* rather than a JSON-RPC
+    // error is the same mistake, and gets the same answer.
+    let (stdout, stderr, _) = shell(&home, &target, false, "call strict {}\n");
+    assert!(stdout.contains("Required at pageId"), "{stdout}");
+    assert!(
+        stderr.contains(r#"usage: call strict {"pageId": <number>}"#),
+        "a failed result still explains itself: {stderr}"
+    );
+    // A tool that just failed does not get a schema dumped under it.
+    let (_, stderr, _) = shell(&home, &target, false, "call fail {}\n");
+    assert!(!stderr.contains("usage:"), "{stderr}");
+
+    // In --json the hint rides along on the error object, one line per command.
+    let (stdout, _, _) = shell(&home, &target, true, "call echo\ncall nope {}\n");
+    let lines: Vec<Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    assert!(
+        lines[0]["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with(r#"usage: call echo {"message": "<string>"}"#),
+        "{stdout}"
+    );
+    assert!(
+        lines[1]["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("lists all 4"),
+        "{stdout}"
+    );
+}
+
+/// Pipe `script` into `mcpdial shell` and collect everything it said.
+fn shell(
+    home: &std::path::Path,
+    target: &str,
+    json: bool,
+    script: &str,
+) -> (String, String, Option<i32>) {
+    let mut cmd = mcpdial(home);
+    if json {
+        cmd.arg("--json");
+    }
+    let mut child = cmd
+        .args(["shell", target])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code(),
+    )
 }
 
 #[test]

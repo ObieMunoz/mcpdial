@@ -58,6 +58,20 @@ With `--json`, errors are one JSON object on **stderr**:
 mode the same object is printed on **stdout** in sequence with results, so ordering is
 preserved.
 
+When the arguments were the mistake, either unparseable or rejected by the server with
+`-32602`, the error carries a `hint` string holding the tool's usage line and one line
+per parameter, so a retry needs no extra `schema` call:
+
+```
+{"error":{"kind":"rpc","code":-32602,"message":"... Required at url",
+          "hint":"usage: call new_page {\"url\": \"<string>\"}\n  url: string (required) - ..."}}
+```
+
+If the tool name itself is unknown, `hint` names the nearest one instead. Some servers
+report a schema violation as a *result* with `isError` and the `-32602` text in its
+content rather than as a JSON-RPC error; that case prints the same usage block on
+**stderr**, leaving the result object on stdout untouched.
+
 ## Shell protocol
 
 Input, one command per line:
@@ -65,15 +79,19 @@ Input, one command per line:
 ```
 call TOOL {"json":"args"}     # args optional, default {}
 tools                         # list tools
+schema TOOL                   # one tool's inputSchema
 raw METHOD {"json":"params"}  # any JSON-RPC method
 info                          # the initialize result
+help [TOOL]                   # commands, or one tool's parameters
 quit
 ```
 
 Lines starting with `#` are ignored. Output with `--json`: one line per command. `call`
-prints the result object; `tools` prints `{"tools":[...]}`; errors print
-`{"error":{...}}`. The process exits 1 at the end if any command failed and stdin was
-not a terminal.
+prints the result object; `tools` prints `{"tools":[...]}`; `schema` prints the tool
+object; errors print `{"error":{...}}`. The process exits 1 at the end if any command
+failed and stdin was not a terminal.
+
+A bare tool name is not a command; `call` it. Nothing else in the line is guessed at.
 
 ## Authentication
 

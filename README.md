@@ -104,9 +104,30 @@ chrome> call list_pages
 chrome> quit
 ```
 
-It reads a script from a pipe just as well. Commands are `call`, `tools`, `raw`, `info`,
-and `quit`; a `#` starts a comment. With `--json` each result is one line of JSON. In a
-script, any failed command makes the exit code 1 after the script finishes.
+It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
+`raw`, `info`, `help`, and `quit`; a `#` starts a comment. With `--json` each result is
+one line of JSON. In a script, any failed command makes the exit code 1 after the script
+finishes.
+
+Arguments are one JSON object. When a line does not work, the answer says what the tool
+actually takes rather than leaving you to go read the schema:
+
+```
+chrome> list_pages
+error: list_pages is a tool, not a command
+usage: call list_pages {}
+chrome> call new_page
+error: MCP error -32602: Invalid arguments for tool new_page: Required at url
+usage: call new_page {"url": "<string>"}
+  url: string (required) - URL to load in the new page
+  timeout: number - Maximum wait time in milliseconds
+```
+
+A tool name with a typo gets the nearest real one. `schema TOOL` prints a tool's full
+input schema, `help TOOL` just its parameters, and `mcpdial call` outside the shell
+answers a rejected call the same way, with a line you can paste back into the terminal.
+Under `--json` the same text arrives as `error.hint`. Some servers report a schema
+violation as a failed result rather than a JSON-RPC error; both get the same answer.
 
 ### Importing from a host you already configured
 

@@ -26,7 +26,8 @@ Rules:
 
 - Always pass `--json`. Results go to stdout; errors go to stderr as `{"error":{...}}`.
 - Exit 0 success, 1 the server refused or the tool set `isError`, 2 bad usage.
-- Read `tools --json` or `schema` before calling a tool you have not called before.
+- Read `tools --json` or `schema` before calling a tool you have not called before. A
+  rejected call answers with `error.hint`: the tool's usage line and its parameters.
 - Use `shell` for servers whose state matters across calls, such as a browser: each
   plain `call` is a fresh process.
 - Never run `login` without `--no-browser`; relay the printed URL to the user. Never

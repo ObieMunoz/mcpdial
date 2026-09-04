@@ -9,7 +9,7 @@ use crate::transport::http::{HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
 use crate::transport::{Logger, Transport};
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 /// Per-invocation knobs that apply to any server.
@@ -366,8 +366,12 @@ pub fn describe_params(tool: &Value) -> Vec<String> {
     let Some(props) = schema["properties"].as_object() else {
         return Vec::new();
     };
-    props
-        .iter()
+    // Required parameters first: they are what a caller has to get right. The sort
+    // is stable, so everything else keeps the order the schema listed it in.
+    let mut ordered: Vec<(&String, &Value)> = props.iter().collect();
+    ordered.sort_by_key(|(name, _)| !required.contains(&name.as_str()));
+    ordered
+        .into_iter()
         .map(|(name, spec)| {
             let ty = match &spec["type"] {
                 Value::String(s) => s.clone(),
@@ -392,6 +396,45 @@ pub fn describe_params(tool: &Value) -> Vec<String> {
             line
         })
         .collect()
+}
+
+/// A skeleton arguments object for a tool: every required property with a
+/// placeholder for its type. Tools that require nothing get `{}`.
+pub fn example_arguments(tool: &Value) -> String {
+    let schema = &tool["inputSchema"];
+    let props = schema["properties"].as_object();
+    let fields: Vec<String> = schema["required"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(Value::as_str)
+        .map(|name| {
+            let spec = props.and_then(|p| p.get(name)).unwrap_or(&Value::Null);
+            format!("{}: {}", json!(name), placeholder(spec))
+        })
+        .collect();
+    format!("{{{}}}", fields.join(", "))
+}
+
+/// What stands in for one value in [`example_arguments`].
+fn placeholder(spec: &Value) -> String {
+    if let Some(values) = spec["enum"].as_array().filter(|v| !v.is_empty()) {
+        return values
+            .iter()
+            .take(4)
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("|");
+    }
+    match spec["type"].as_str() {
+        Some("string") => "\"<string>\"".into(),
+        Some("number") | Some("integer") => "<number>".into(),
+        Some("boolean") => "true|false".into(),
+        Some("array") => "[...]".into(),
+        Some("object") => "{...}".into(),
+        _ => "<value>".into(),
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +495,34 @@ mod tests {
         assert_eq!(lines[0], "a: number (required) - First");
         assert_eq!(lines[1], "b: number|null");
         assert_eq!(lines[2], "mode: enum");
+        // Required first, whatever the order the schema listed them in.
+        let reordered = json!({"inputSchema":{"properties":{
+            "a":{"type":"string"}, "z":{"type":"string"}
+        },"required":["z"]}});
+        assert_eq!(
+            describe_params(&reordered),
+            ["z: string (required)", "a: string"]
+        );
         assert!(describe_params(&json!({"name":"x"})).is_empty());
+    }
+
+    #[test]
+    fn examples_show_the_required_arguments() {
+        let tool = json!({"name":"new_page","inputSchema":{"type":"object","properties":{
+            "url":{"type":"string"},
+            "timeout":{"type":"number"},
+            "mode":{"enum":["fast","slow"]},
+            "flag":{"type":"boolean"}
+        },"required":["url","mode","flag"]}});
+        assert_eq!(
+            example_arguments(&tool),
+            r#"{"url": "<string>", "mode": "fast"|"slow", "flag": true|false}"#
+        );
+        // Nothing required means the empty object is already a complete call.
+        assert_eq!(
+            example_arguments(&json!({"name":"count","inputSchema":{"properties":{}}})),
+            "{}"
+        );
+        assert_eq!(example_arguments(&json!({"name":"x"})), "{}");
     }
 }

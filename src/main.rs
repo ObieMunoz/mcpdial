@@ -180,17 +180,51 @@ fn main() -> ExitCode {
     let json = cli.json;
     match run(cli) {
         Ok(code) => ExitCode::from(code),
-        Err(e) => {
+        Err(f) => {
             if json {
-                eprintln!("{}", error_json(&e));
+                eprintln!("{}", f.to_json());
             } else {
-                eprintln!("error: {e}");
+                eprintln!("error: {}", f.error);
+                if let Some(hint) = &f.hint {
+                    eprintln!("{hint}");
+                }
             }
-            ExitCode::from(match e {
+            ExitCode::from(match f.error {
                 Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
                 _ => EXIT_ERROR,
             })
         }
+    }
+}
+
+/// A command that failed, plus an optional hint that spells out what was
+/// expected instead. The hint is a second block of prose for a human and an
+/// `error.hint` string under `--json`, so neither has to guess a tool's shape.
+struct Failure {
+    error: Error,
+    hint: Option<String>,
+}
+
+impl Failure {
+    fn hinted(error: Error, hint: impl Into<String>) -> Self {
+        Self {
+            error,
+            hint: Some(hint.into()),
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut v = error_json(&self.error);
+        if let Some(hint) = &self.hint {
+            v["error"]["hint"] = json!(hint);
+        }
+        v
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Self {
+        Self { error, hint: None }
     }
 }
 
@@ -244,13 +278,141 @@ fn read_json_arg(text: &str, what: &str) -> Result<Value, Error> {
     parse_object(text, what)
 }
 
+/// A JSON object, or a usage error that quotes what arrived instead. Anything
+/// unquoted from a shell (a URL, a bare word, a pasted markdown link) lands here.
 fn parse_object(text: &str, what: &str) -> Result<Value, Error> {
-    let v: Value = serde_json::from_str(text)
-        .map_err(|e| Error::usage(format!("{what} were not valid JSON: {e}")))?;
-    if !v.is_object() {
-        return Err(Error::usage(format!("{what} must be a JSON object")));
+    match serde_json::from_str::<Value>(text) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(v) => Err(Error::usage(format!(
+            "{what} must be a JSON object like {{\"key\": \"value\"}}, not {}",
+            json_kind(&v)
+        ))),
+        Err(e) => Err(Error::usage(format!(
+            "{what} must be a JSON object like {{\"key\": \"value\"}}; {:?} is not JSON ({e})",
+            truncate_at(text, 60)
+        ))),
     }
-    Ok(v)
+}
+
+/// What a JSON value is, for an error message.
+fn json_kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Levenshtein distance, for "did you mean" suggestions.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            cur[j + 1] = (prev[j] + usize::from(ca != *cb))
+                .min(prev[j + 1] + 1)
+                .min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The nearest candidate to `word`, when one is close enough to be worth naming.
+fn closest<'a>(word: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let word = word.to_lowercase();
+    let limit = if word.chars().count() <= 4 { 1 } else { 2 };
+    candidates
+        .map(|c| (edit_distance(&word, &c.to_lowercase()), c))
+        .filter(|(d, _)| *d <= limit)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, c)| c)
+}
+
+fn find_tool<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
+    tools.iter().find(|t| t["name"] == name)
+}
+
+/// The shape a tool expects: a call that would be well-formed, then one line per
+/// parameter. `prefix` is whatever comes before the tool name in that call, and
+/// `quote` wraps the argument object, which a shell needs quoted and the REPL does not.
+fn tool_usage(tool: &Value, prefix: &str, quote: &str) -> String {
+    let mut out = format!(
+        "usage: {prefix} {} {quote}{}{quote}",
+        tool["name"].as_str().unwrap_or("?"),
+        client::example_arguments(tool)
+    );
+    for p in describe_params(tool) {
+        out.push_str("\n  ");
+        out.push_str(&p);
+    }
+    out
+}
+
+/// A target written so it survives a copy-paste into a shell.
+fn shell_word(s: &str) -> String {
+    if s.contains(|c: char| c.is_whitespace() || "\"'$`\\*?~<>|&;()[]{}#!".contains(c)) {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    } else {
+        s.to_string()
+    }
+}
+
+/// What to say about a tool name this server does not have.
+fn suggest_tool(tools: &[Value], name: &str, tools_cmd: &str) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let names = tools.iter().filter_map(|t| t["name"].as_str());
+    Some(match closest(name, names) {
+        Some(near) => format!(
+            "did you mean {near}? {tools_cmd} lists all {}.",
+            tools.len()
+        ),
+        None => format!(
+            "{tools_cmd} lists all {} tools on this server.",
+            tools.len()
+        ),
+    })
+}
+
+/// The hint that answers "what shape did you want?" after a call went wrong:
+/// the tool's own usage when the tool exists, a near miss when it does not.
+fn call_hint(
+    tools: &[Value],
+    name: &str,
+    prefix: &str,
+    quote: &str,
+    tools_cmd: &str,
+) -> Option<String> {
+    match find_tool(tools, name) {
+        Some(t) => Some(tool_usage(t, prefix, quote)),
+        None => suggest_tool(tools, name, tools_cmd),
+    }
+}
+
+/// A server error that the tool's schema would have prevented. Any other error
+/// is the tool's own failure, and printing a schema under it is just noise.
+fn is_argument_error(e: &Error) -> bool {
+    match e {
+        Error::Rpc { code: -32602, .. } => true,
+        Error::Rpc { message, .. } => reads_as_argument_error(message),
+        _ => false,
+    }
+}
+
+/// The same complaint, arriving as text. Not every server raises a JSON-RPC
+/// error for a schema violation: chrome-devtools, and anything else built on the
+/// TypeScript SDK's tool wrapper, hands back a failed *result* whose content is
+/// the `-32602` message. To whoever typed the line it is the same mistake.
+fn reads_as_argument_error(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("-32602") || t.contains("invalid arguments") || t.contains("validation error")
 }
 
 fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
@@ -267,7 +429,50 @@ fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
         .collect()
 }
 
-fn run(cli: Cli) -> Result<u8, Error> {
+const SHELL_COMMANDS: &[&str] = &["tools", "schema", "call", "raw", "info", "help", "quit"];
+
+const SHELL_SUMMARY: &str =
+    "commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, raw METHOD, info, help, quit";
+
+const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
+  tools [--long]             every tool this server offers
+  schema TOOL                one tool's full JSON input schema
+  help [TOOL]                this list, or one tool's parameters
+  call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
+  raw METHOD {"json": ...}   send any JSON-RPC method
+  info                       the initialize result
+  quit                       close the session"#;
+
+/// The answer to a tool name this server does not have.
+fn no_such_tool(tools: &[Value], name: &str) -> Failure {
+    Failure {
+        error: Error::usage(format!("no tool named {name:?}")),
+        hint: suggest_tool(tools, name, "`tools`"),
+    }
+}
+
+/// [`call_hint`] for a `call` line typed at the shell, where the arguments are
+/// written bare and the tool list comes from the session already open.
+fn shell_call_hint(
+    cache: &mut Option<Vec<Value>>,
+    conn: &mut client::Connection,
+    tool: &str,
+) -> Option<String> {
+    call_hint(shell_tools(cache, conn), tool, "call", "", "`tools`")
+}
+
+/// The tool list, kept for explaining mistakes: fetched at most once per session,
+/// and best effort, so a server that will not list its tools just gets no hint.
+fn shell_tools<'a>(
+    cache: &'a mut Option<Vec<Value>>,
+    conn: &mut client::Connection,
+) -> &'a [Value] {
+    cache
+        .get_or_insert_with(|| conn.session.list_tools().unwrap_or_default())
+        .as_slice()
+}
+
+fn run(cli: Cli) -> Result<u8, Failure> {
     let store = Store::from_env()?;
     let opts = Options {
         timeout: Duration::from_secs_f64(cli.timeout.max(0.0)),
@@ -289,20 +494,18 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 (Some(url), None) => ServerConfig::http(url),
                 (None, Some(cmd)) => ServerConfig::stdio(cmd),
                 _ => {
-                    return Err(Error::usage(
-                        "pass exactly one of --http URL or --stdio CMD",
-                    ))
+                    return Err(
+                        Error::usage("pass exactly one of --http URL or --stdio CMD").into(),
+                    )
                 }
             };
             if cfg.stdio.is_some() && (!opts.extra_headers.is_empty() || opts.token_env.is_some()) {
-                return Err(Error::usage(
-                    "--header and --token-env only apply to --http servers",
-                ));
+                return Err(
+                    Error::usage("--header and --token-env only apply to --http servers").into(),
+                );
             }
             if cfg.http.is_some() && (!env.is_empty() || cwd.is_some()) {
-                return Err(Error::usage(
-                    "--env and --cwd only apply to --stdio servers",
-                ));
+                return Err(Error::usage("--env and --cwd only apply to --stdio servers").into());
             }
             for item in &env {
                 match item.split_once('=') {
@@ -312,7 +515,8 @@ fn run(cli: Cli) -> Result<u8, Error> {
                     _ => {
                         return Err(Error::usage(format!(
                             "--env must look like KEY=VALUE, got {item:?}"
-                        )))
+                        ))
+                        .into())
                     }
                 }
             }
@@ -335,7 +539,8 @@ fn run(cli: Cli) -> Result<u8, Error> {
             if files.is_empty() {
                 return Err(Error::usage(
                     "no config files found; pass a path to a JSON file with an mcpServers object",
-                ));
+                )
+                .into());
             }
             let existing = store.servers()?;
             let mut added = 0;
@@ -387,14 +592,18 @@ fn run(cli: Cli) -> Result<u8, Error> {
             let interactive = std::io::stdin().is_terminal();
             if interactive {
                 eprintln!(
-                    "connected to {} {}. Commands: tools, call TOOL [json], raw METHOD [json], info, quit",
+                    "connected to {} {}",
                     si["name"].as_str().unwrap_or("?"),
                     si["version"].as_str().unwrap_or("")
                 );
+                eprintln!("{SHELL_SUMMARY}");
             }
             let stdin = std::io::stdin();
             let mut line = String::new();
             let mut failures = 0u32;
+            // tools/list, fetched at most once, so a mistake can be answered with
+            // the shape the server actually wants.
+            let mut cache: Option<Vec<Value>> = None;
             loop {
                 if interactive {
                     eprint!("{}> ", r.name);
@@ -413,11 +622,42 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 }
                 let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
                 let rest = rest.trim();
-                let outcome: Result<(), Error> = match word {
+                let outcome: Result<(), Failure> = match word {
                     "quit" | "exit" => break,
-                    "help" => {
-                        eprintln!("tools | call TOOL [json] | raw METHOD [json] | info | quit");
+                    "help" if rest.is_empty() => {
+                        eprintln!("{SHELL_HELP}");
                         Ok(())
+                    }
+                    "help" => {
+                        let tools = shell_tools(&mut cache, &mut conn);
+                        match find_tool(tools, rest) {
+                            Some(t) => {
+                                eprintln!("{}", tool_usage(t, "call", ""));
+                                Ok(())
+                            }
+                            None => Err(no_such_tool(tools, rest)),
+                        }
+                    }
+                    "schema" if rest.is_empty() => Err(Failure::hinted(
+                        Error::usage("schema needs a tool name"),
+                        "usage: schema TOOL   (`tools` lists what this server offers)",
+                    )),
+                    "schema" => {
+                        let tools = shell_tools(&mut cache, &mut conn);
+                        match find_tool(tools, rest) {
+                            Some(t) => {
+                                println!(
+                                    "{}",
+                                    if cli.json {
+                                        t.to_string()
+                                    } else {
+                                        serde_json::to_string_pretty(t).unwrap()
+                                    }
+                                );
+                                Ok(())
+                            }
+                            None => Err(no_such_tool(tools, rest)),
+                        }
                     }
                     "info" => {
                         println!(
@@ -426,45 +666,85 @@ fn run(cli: Cli) -> Result<u8, Error> {
                         );
                         Ok(())
                     }
-                    "tools" => conn.session.list_tools().map(|tools| {
-                        if cli.json {
-                            println!("{}", json!({ "tools": tools }));
-                        } else {
-                            println!("{} tool(s):", tools.len());
-                            print_tools(&tools, rest == "--long" || rest == "-l");
-                        }
-                    }),
+                    "tools" => conn
+                        .session
+                        .list_tools()
+                        .map_err(Failure::from)
+                        .map(|tools| {
+                            if cli.json {
+                                println!("{}", json!({ "tools": tools }));
+                            } else {
+                                println!("{} tool(s):", tools.len());
+                                print_tools(&tools, rest == "--long" || rest == "-l");
+                            }
+                            cache = Some(tools);
+                        }),
                     "call" => {
                         let (tool, args) =
                             rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+                        let args = match args.trim() {
+                            "" => "{}",
+                            a => a,
+                        };
                         if tool.is_empty() {
-                            Err(Error::usage("call needs a tool name"))
+                            Err(Failure::hinted(
+                                Error::usage("call needs a tool name"),
+                                "usage: call TOOL {\"arg\": \"value\"}   (`tools` lists what this server offers)",
+                            ))
                         } else {
-                            parse_object(args.trim(), "arguments")
-                                .and_then(|a| conn.session.call_tool(tool, a))
-                                .map(|result| {
-                                    if cli.json {
-                                        println!("{result}");
-                                    } else {
+                            // Arguments that do not parse and arguments the server
+                            // rejects mean the same thing to whoever typed the line:
+                            // show them what this tool takes.
+                            match parse_object(args, "arguments") {
+                                Err(e) => Err(Failure {
+                                    error: e,
+                                    hint: shell_call_hint(&mut cache, &mut conn, tool),
+                                }),
+                                Ok(a) => match conn.session.call_tool(tool, a) {
+                                    Ok(result) => {
                                         let out = mcpdial::render_content(&result);
-                                        if !out.is_empty() {
-                                            println!("{out}");
+                                        let failed = result["isError"].as_bool().unwrap_or(false);
+                                        if cli.json {
+                                            println!("{result}");
+                                        } else {
+                                            if !out.is_empty() {
+                                                println!("{out}");
+                                            }
+                                            if failed {
+                                                eprintln!("(tool reported an error)");
+                                            }
                                         }
-                                        if result["isError"].as_bool().unwrap_or(false) {
-                                            eprintln!("(tool reported an error)");
+                                        if failed && reads_as_argument_error(&out) {
+                                            if let Some(hint) =
+                                                shell_call_hint(&mut cache, &mut conn, tool)
+                                            {
+                                                eprintln!("{hint}");
+                                            }
                                         }
+                                        Ok(())
                                     }
-                                })
+                                    Err(e) => {
+                                        let hint = is_argument_error(&e)
+                                            .then(|| shell_call_hint(&mut cache, &mut conn, tool))
+                                            .flatten();
+                                        Err(Failure { error: e, hint })
+                                    }
+                                },
+                            }
                         }
                     }
                     "raw" => {
                         let (method, params) =
                             rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
                         if method.is_empty() {
-                            Err(Error::usage("raw needs a method"))
+                            Err(Failure::hinted(
+                                Error::usage("raw needs a method"),
+                                "usage: raw METHOD {\"json\": \"params\"}   e.g. raw tools/list",
+                            ))
                         } else {
                             parse_object(params.trim(), "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
+                                .map_err(Failure::from)
                                 .map(|result| {
                                     println!(
                                         "{}",
@@ -477,14 +757,43 @@ fn run(cli: Cli) -> Result<u8, Error> {
                                 })
                         }
                     }
-                    other => Err(Error::usage(format!("unknown command {other:?}; try help"))),
+                    other => {
+                        let tools = shell_tools(&mut cache, &mut conn);
+                        let unknown = || Error::usage(format!("unknown command {other:?}"));
+                        let near_tool =
+                            closest(other, tools.iter().filter_map(|t| t["name"].as_str()))
+                                .and_then(|near| find_tool(tools, near));
+                        Err(if let Some(t) = find_tool(tools, other) {
+                            // The commonest mistake: typing a tool name on its own.
+                            Failure::hinted(
+                                Error::usage(format!("{other} is a tool, not a command")),
+                                tool_usage(t, "call", ""),
+                            )
+                        } else if let Some(near) = closest(other, SHELL_COMMANDS.iter().copied()) {
+                            Failure::hinted(unknown(), format!("did you mean {near}?"))
+                        } else if let Some(t) = near_tool {
+                            Failure::hinted(
+                                unknown(),
+                                format!(
+                                    "did you mean the tool {}?\n{}",
+                                    t["name"].as_str().unwrap_or("?"),
+                                    tool_usage(t, "call", "")
+                                ),
+                            )
+                        } else {
+                            Failure::hinted(unknown(), SHELL_SUMMARY)
+                        })
+                    }
                 };
-                if let Err(e) = outcome {
+                if let Err(f) = outcome {
                     failures += 1;
                     if cli.json {
-                        println!("{}", error_json(&e));
+                        println!("{}", f.to_json());
                     } else {
-                        eprintln!("error: {e}");
+                        eprintln!("error: {}", f.error);
+                        if let Some(hint) = &f.hint {
+                            eprintln!("{hint}");
+                        }
                     }
                 }
             }
@@ -499,12 +808,16 @@ fn run(cli: Cli) -> Result<u8, Error> {
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let tools = conn.session.list_tools()?;
-            let Some(t) = tools.iter().find(|t| t["name"] == tool) else {
+            let Some(t) = find_tool(&tools, &tool) else {
                 let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-                return Err(Error::Rpc {
-                    code: -32602,
-                    message: format!("Tool {tool} not found; available: {}", names.join(", ")),
-                    data: None,
+                return Err(Failure {
+                    error: Error::Rpc {
+                        code: -32602,
+                        message: format!("Tool {tool} not found; available: {}", names.join(", ")),
+                        data: None,
+                    },
+                    hint: closest(&tool, names.iter().copied())
+                        .map(|near| format!("did you mean {near}?")),
                 });
             };
             println!("{}", serde_json::to_string_pretty(t).unwrap());
@@ -521,7 +834,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
                 eprintln!("removed {name}");
                 Ok(0)
             } else {
-                Err(Error::usage(format!("no server named {name:?}")))
+                Err(Error::usage(format!("no server named {name:?}")).into())
             }
         }
 
@@ -700,17 +1013,54 @@ fn run(cli: Cli) -> Result<u8, Error> {
             tool,
             arguments,
         } => {
-            let arguments = read_json_arg(&arguments, "arguments")?;
+            let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
+                Failure::hinted(
+                    e,
+                    format!(
+                        "`mcpdial schema {} {tool}` shows what {tool} takes",
+                        shell_word(&target)
+                    ),
+                )
+            })?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
-            let result = conn.session.call_tool(&tool, arguments)?;
+            let result = match conn.session.call_tool(&tool, arguments) {
+                Ok(result) => result,
+                // The server rejected the arguments; say what it wanted instead.
+                Err(e) => {
+                    let hint = is_argument_error(&e)
+                        .then(|| conn.session.list_tools().unwrap_or_default())
+                        .and_then(|tools| {
+                            call_hint(
+                                &tools,
+                                &tool,
+                                &format!("mcpdial call {}", shell_word(&target)),
+                                "'",
+                                &format!("`mcpdial tools {}`", shell_word(&target)),
+                            )
+                        });
+                    return Err(Failure { error: e, hint });
+                }
+            };
             let is_error = result["isError"].as_bool().unwrap_or(false);
+            let text = mcpdial::render_content(&result);
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
-            } else {
-                let text = mcpdial::render_content(&result);
-                if !text.is_empty() {
-                    println!("{text}");
+            } else if !text.is_empty() {
+                println!("{text}");
+            }
+            // A failed result that is really a schema complaint gets the same
+            // answer as the JSON-RPC error other servers would have sent.
+            if is_error && reads_as_argument_error(&text) {
+                let tools = conn.session.list_tools().unwrap_or_default();
+                if let Some(hint) = call_hint(
+                    &tools,
+                    &tool,
+                    &format!("mcpdial call {}", shell_word(&target)),
+                    "'",
+                    &format!("`mcpdial tools {}`", shell_word(&target)),
+                ) {
+                    eprintln!("{hint}");
                 }
             }
             Ok(if is_error { EXIT_ERROR } else { 0 })
@@ -741,7 +1091,8 @@ fn run(cli: Cli) -> Result<u8, Error> {
             let Some(url) = r.config.http.clone() else {
                 return Err(Error::usage(
                     "login only applies to HTTP servers; stdio servers need no token",
-                ));
+                )
+                .into());
             };
             let existing = store.credential(&r.name)?;
             let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
@@ -803,7 +1154,7 @@ fn run(cli: Cli) -> Result<u8, Error> {
                         .map_err(|e| Error::usage(e.to_string()))?;
                     let t = buf.trim().to_string();
                     if t.is_empty() {
-                        return Err(Error::usage("no token on stdin"));
+                        return Err(Error::usage("no token on stdin").into());
                     }
                     t
                 }
@@ -989,5 +1340,46 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     println!("{}", line(headers.to_vec()));
     for row in rows {
         println!("{}", line(row.iter().map(String::as_str).collect()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn suggestions_stay_close_and_quoting_survives_a_shell() {
+        assert_eq!(
+            closest("tolls", SHELL_COMMANDS.iter().copied()),
+            Some("tools")
+        );
+        assert_eq!(
+            closest("Tools", SHELL_COMMANDS.iter().copied()),
+            Some("tools")
+        );
+        // Far enough away that a guess would be noise.
+        assert_eq!(closest("profile", SHELL_COMMANDS.iter().copied()), None);
+        assert_eq!(closest("xyz", ["ab"].into_iter()), None);
+
+        assert_eq!(shell_word("chrome"), "chrome");
+        assert_eq!(shell_word("https://x/mcp"), "https://x/mcp");
+        assert_eq!(shell_word("stdio:npx -y thing"), "'stdio:npx -y thing'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn argument_errors_are_recognised_in_both_shapes() {
+        assert!(is_argument_error(&Error::Rpc {
+            code: -32602,
+            message: "bad".into(),
+            data: None
+        }));
+        // The same complaint arriving as the text of a failed result.
+        assert!(reads_as_argument_error(
+            "MCP error -32602: Invalid arguments for tool press_key: Required at pageId"
+        ));
+        assert!(reads_as_argument_error("Input validation error: nope"));
+        // A tool that simply failed does not get a schema dumped under it.
+        assert!(!reads_as_argument_error("Navigation timed out after 30s"));
+        assert!(!is_argument_error(&Error::usage("no")));
     }
 }
