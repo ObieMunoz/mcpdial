@@ -1,6 +1,8 @@
+pub mod config;
 pub mod protocol;
 pub mod session;
 pub mod transport;
+pub use config::{Credential, ServerConfig, Store};
 pub use protocol::{decode_body, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
 pub use session::{render_content, Session};
 pub use transport::http::{HttpTransport, USER_AGENT};
