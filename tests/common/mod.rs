@@ -361,7 +361,15 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     };
 
     if stateful {
-        let sse = format!("event: message\ndata: {reply}\n\n");
+        let server_noise_before_the_answer = if method == "tools/call" {
+            ": keep-alive\n\n\
+             event: message\n\
+             data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\
+             \"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n"
+        } else {
+            ""
+        };
+        let sse = format!("{server_noise_before_the_answer}event: message\ndata: {reply}\n\n");
         let mut r = with_headers(
             Response::from_string(sse),
             &[("Content-Type", "text/event-stream")],

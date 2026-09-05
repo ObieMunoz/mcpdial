@@ -143,19 +143,65 @@ pub fn decode_body(body: &str, content_type: &str) -> Result<Option<Value>> {
         || body.starts_with("data:");
 
     if looks_like_sse {
-        // One message may be split across several consecutive data: lines.
-        let payload: String = body
-            .lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim)
-            .collect();
-        if payload.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(serde_json::from_str(&payload)?));
+        return decode_sse(body);
     }
 
     Ok(Some(serde_json::from_str(body)?))
+}
+
+/// Return the first response carried in an SSE body.
+///
+/// A server may put a log notification or a `ping` of its own on the response
+/// stream ahead of the answer, so each event is parsed alone: joining the whole
+/// body concatenates two JSON objects and blames the server for a reply that was
+/// well formed.
+fn decode_sse(body: &str) -> Result<Option<Value>> {
+    let mut unparseable = None;
+
+    for event in sse_events(body) {
+        match serde_json::from_str::<Value>(&event) {
+            Ok(msg) if answers_a_request(&msg) => return Ok(Some(msg)),
+            Ok(_the_server_talking_to_us) => continue,
+            Err(e) => unparseable = unparseable.or(Some(e)),
+        }
+    }
+
+    match unparseable {
+        Some(e) => Err(e.into()),
+        None => Ok(None),
+    }
+}
+
+/// Split an SSE body into the joined `data:` payload of each event.
+fn sse_events(body: &str) -> Vec<String> {
+    let end_of_the_last_event = std::iter::once("");
+    let mut events = Vec::new();
+    let mut data = String::new();
+
+    for line in body.lines().chain(end_of_the_last_event) {
+        let blank_line_ends_the_event = line.trim().is_empty();
+        if blank_line_ends_the_event {
+            if !data.is_empty() {
+                events.push(std::mem::take(&mut data));
+            }
+        } else if let Some(value) = line.strip_prefix("data:") {
+            if !data.is_empty() {
+                data.push('\n');
+            }
+            data.push_str(value.trim());
+        }
+    }
+
+    events
+}
+
+/// True for an answer to something we sent, the rule [`StdioTransport`] applies
+/// to stdout. `error` stands in for `id` when the server could not read the id.
+///
+/// [`StdioTransport`]: crate::StdioTransport
+fn answers_a_request(msg: &Value) -> bool {
+    let the_server_is_asking_us_something = msg.get("method").is_some();
+    !the_server_is_asking_us_something && (msg.get("id").is_some() || msg.get("error").is_some())
 }
 
 /// Raise a JSON-RPC `error` member as [`Error::Rpc`], otherwise pass the message on.
@@ -225,6 +271,77 @@ mod tests {
         let body = "data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":4,\"result\":{}}";
         let v = decode_body(body, "text/event-stream").unwrap().unwrap();
         assert_eq!(v["id"], 4);
+    }
+
+    #[test]
+    fn notification_before_the_result_is_skipped() {
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{\"level\":\"info\"}}\n\n\
+                    event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"ok\"}]}}\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["content"][0]["text"], "ok");
+    }
+
+    #[test]
+    fn notification_after_the_result_is_skipped() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["result"]["ok"], true);
+    }
+
+    #[test]
+    fn server_ping_is_not_mistaken_for_the_result() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"ok\":true}}\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["id"], 5);
+    }
+
+    #[test]
+    fn an_error_response_is_a_response() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":6,\"error\":{\"code\":-32602,\"message\":\"nope\"}}\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn comments_and_other_fields_are_ignored() {
+        let body = ": keep-alive\n\nevent: message\nid: 42\nretry: 3000\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":8,\"result\":{}}\n\n: keep-alive\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["id"], 8);
+    }
+
+    #[test]
+    fn multiline_data_survives_a_neighbouring_event() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":4,\"result\":{}}\n\n";
+        let v = decode_body(body, "text/event-stream").unwrap().unwrap();
+        assert_eq!(v["id"], 4);
+    }
+
+    #[test]
+    fn a_body_of_only_notifications_is_none() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        assert!(decode_body(body, "text/event-stream").unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_events_only_fail_when_nothing_else_answers() {
+        let body =
+            "data: <html>nope</html>\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        assert_eq!(
+            decode_body(body, "text/event-stream").unwrap().unwrap()["id"],
+            1
+        );
+        assert!(matches!(
+            decode_body("data: <html>nope</html>\n\n", "text/event-stream"),
+            Err(Error::Transport(_))
+        ));
     }
 
     #[test]
