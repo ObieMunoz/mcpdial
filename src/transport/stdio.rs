@@ -5,7 +5,7 @@
 //! a local program, and you run local programs.
 
 use super::{silent, Logger, Transport};
-use crate::protocol::{Error, Result};
+use crate::protocol::{answer, classify, Error, Incoming, Result};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -128,6 +128,17 @@ impl StdioTransport {
 }
 
 impl StdioTransport {
+    /// Put one JSON-RPC message on the child's stdin, newline-framed.
+    fn write_line(&mut self, body: &str) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| Error::transport("stdin already closed"))?;
+        writeln!(stdin, "{body}")
+            .and_then(|_| stdin.flush())
+            .map_err(|_| Error::transport("server closed stdin before accepting the message"))
+    }
+
     /// The server went away before answering. Say how it exited and what it said.
     fn post_mortem(&mut self) -> Error {
         // Give the stderr reader a moment to drain what the process wrote on its way out.
@@ -177,20 +188,15 @@ impl Transport for StdioTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
         let body = payload.to_string();
         (self.log)(&format!("-> stdin\n   {body}"));
-
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::transport("stdin already closed"))?;
-        writeln!(stdin, "{body}")
-            .and_then(|_| stdin.flush())
-            .map_err(|_| Error::transport("server closed stdin before accepting the request"))?;
+        self.write_line(&body)?;
 
         let Some(id) = payload.get("id") else {
             return Ok(None); // notification: nothing comes back
         };
 
-        // Skip log lines and unrelated notifications until our id lands.
+        // Skip log lines and unrelated notifications until our id lands - but
+        // answer anything the server asks on the way. It may well be blocked on
+        // that answer, in which case waiting quietly deadlocks both ends.
         loop {
             let line = match self.lines.recv_timeout(self.timeout) {
                 Ok(l) => l,
@@ -206,13 +212,24 @@ impl Transport for StdioTransport {
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Value>(line) {
-                Ok(msg) if msg.get("id") == Some(id) => {
+            let Ok(msg) = serde_json::from_str::<Value>(line) else {
+                (self.log)(&format!("<- stdout (ignored, not JSON)\n   {line}"));
+                continue;
+            };
+            match classify(&msg, Some(id)) {
+                Incoming::Response => {
                     (self.log)(&format!("<- stdout\n   {line}"));
                     return Ok(Some(msg));
                 }
-                Ok(_) => (self.log)(&format!("<- stdout (other message)\n   {line}")),
-                Err(_) => (self.log)(&format!("<- stdout (ignored, not JSON)\n   {line}")),
+                Incoming::ServerRequest { id: theirs, method } => {
+                    (self.log)(&format!("<- stdout (server request)\n   {line}"));
+                    let reply = answer(theirs, method).to_string();
+                    (self.log)(&format!("-> stdin\n   {reply}"));
+                    self.write_line(&reply)?;
+                }
+                Incoming::Notification { .. } | Incoming::Foreign => {
+                    (self.log)(&format!("<- stdout (other message)\n   {line}"))
+                }
             }
         }
     }

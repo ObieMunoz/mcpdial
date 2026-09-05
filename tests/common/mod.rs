@@ -30,10 +30,15 @@ pub enum Mode {
     AuthLocalhostOnly,
     /// 403 with no challenge, like a WAF.
     Blocked,
+    /// Hands back the same `nextCursor` on every `tools/list`.
+    StuckCursor,
+    /// Stateful, but answers `405` to the session-terminating `DELETE`.
+    StatefulNoDelete,
 }
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
@@ -57,6 +62,7 @@ struct State {
     valid_tokens: Vec<String>,
     code_challenge: Option<String>,
     issued: u32,
+    stuck_cursor_pages_served: u32,
 }
 
 pub struct FakeServer {
@@ -104,6 +110,7 @@ pub fn start(mode: Mode) -> FakeServer {
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
                 let rec = Recorded {
+                    method: req.method().as_str().to_string(),
                     path: req.url().to_string(),
                     headers: req
                         .headers()
@@ -303,6 +310,22 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
+    let stateful = matches!(mode, Mode::Stateful | Mode::StatefulNoDelete);
+
+    if rec.method == "DELETE" {
+        if matches!(mode, Mode::StatefulNoDelete) {
+            return Response::from_string("").with_status_code(405);
+        }
+        if stateful && rec.header("mcp-session-id") != Some("sess-1") {
+            return json_resp(
+                400,
+                &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}),
+            );
+        }
+        state.lock().unwrap().initialized = false;
+        return Response::from_string("").with_status_code(204);
+    }
+
     let msg = rec.json();
     let Some(id) = msg.get("id").cloned() else {
         // A notification. Remember that the client finished the handshake.
@@ -312,7 +335,6 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("").with_status_code(202);
     };
     let method = msg["method"].as_str().unwrap_or("");
-    let stateful = matches!(mode, Mode::Stateful);
 
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
@@ -338,12 +360,8 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
             "protocolVersion":agreed_version,"capabilities":{"tools":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
-        "tools/list" => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[
-            {"name":"echo","description":"Echo a message back.\nSecond line.",
-             "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}},
-            {"name":"add","description":"Add two numbers.",
-             "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}}
-        ]}}),
+        "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
+        "tools/list" => tools_list(&id, params["cursor"].as_str()),
         "tools/call" => match params["name"].as_str().unwrap_or("") {
             "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
                 "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
@@ -387,6 +405,36 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     } else {
         json_resp(200, &reply)
     }
+}
+
+/// One tool per page. An unrecognised cursor is an error rather than an empty
+/// page, so a client that mangles the cursor fails loudly.
+fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
+    let echo = json!({"name":"echo","description":"Echo a message back.\nSecond line.",
+        "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}});
+    let add = json!({"name":"add","description":"Add two numbers.",
+        "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}});
+    match cursor {
+        None => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[echo],"nextCursor":"page-2"}}),
+        Some("page-2") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[add]}}),
+        Some(other) => json!({"jsonrpc":"2.0","id":id,
+            "error":{"code":-32602,"message":format!("Invalid cursor: {other}")}}),
+    }
+}
+
+/// Errors after a few pages so a client that never stops fails the test rather
+/// than hanging it.
+fn stuck_page(id: &Value, state: &Mutex<State>) -> Value {
+    let mut st = state.lock().unwrap();
+    st.stuck_cursor_pages_served += 1;
+    if st.stuck_cursor_pages_served > 5 {
+        return json!({"jsonrpc":"2.0","id":id,"error":{"code":-32000,
+            "message":format!("cursor loop: {} pages asked for", st.stuck_cursor_pages_served)}});
+    }
+    json!({"jsonrpc":"2.0","id":id,"result":{
+        "tools":[{"name":"loop","description":"Served on every page.",
+                  "inputSchema":{"type":"object"}}],
+        "nextCursor":"stuck"}})
 }
 
 fn form(s: &str) -> Vec<(String, String)> {
