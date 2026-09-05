@@ -31,6 +31,14 @@ carries its section from here as its release notes.
 - Under `--json`, every command that changes what is saved prints one receipt object
   on stdout: `saved`, `removed`, `imported`/`skipped`, `login`, `saved_credential`
   and `removed_credential`.
+- `login` identifies itself with a client ID metadata document when the authorization
+  server advertises `client_id_metadata_document_supported`: the client id is the URL
+  of `docs/client-metadata.json`, published at
+  https://obiemunoz.github.io/mcpdial/client-metadata.json, and nothing is registered
+  per machine. Dynamic registration remains the fallback. `--client-metadata-url URL`
+  presents a document of your own; `--no-client-metadata` registers dynamically
+  regardless. `login` says which method it used, and `token show` reports it as
+  `registration`.
 
 ### Fixed
 

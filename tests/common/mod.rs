@@ -30,6 +30,10 @@ pub enum Mode {
     /// Like `Auth`, but registration refuses http://127.0.0.1 (Doorkeeper's default
     /// allowlist admits only `localhost` once it is opened up at all).
     AuthLocalhostOnly,
+    /// Like `Auth`, and the authorization server advertises client ID metadata
+    /// documents: `authorize` expects this URL as the client id, unless the client
+    /// registered dynamically after all.
+    AuthClientMetadata { client_id: String },
     /// 403 with no challenge, like a WAF.
     Blocked,
     /// Hands back the same `nextCursor` on every `tools/list`.
@@ -75,6 +79,7 @@ struct State {
     initialized: bool,
     valid_tokens: Vec<String>,
     code_challenge: Option<String>,
+    registered: bool,
     issued: u32,
     stuck_cursor_pages_served: u32,
 }
@@ -195,6 +200,9 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                     .unwrap()
                     .remove("registration_endpoint");
             }
+            if let Mode::AuthClientMetadata { .. } = mode {
+                meta["client_id_metadata_document_supported"] = json!(true);
+            }
             json_resp(200, &meta)
         }
         "/moved" => with_headers(
@@ -217,6 +225,7 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 "must register as a public client"
             );
             let redirect = body["redirect_uris"][0].as_str().unwrap_or("").to_string();
+            state.lock().unwrap().registered = true;
             json_resp(
                 201,
                 &json!({"client_id": "client-abc", "redirect_uris": [redirect]}),
@@ -231,7 +240,8 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                     .unwrap_or_default()
             };
             assert_eq!(get("response_type"), "code");
-            assert_eq!(get("client_id"), registered_client_id(mode));
+            let registered = state.lock().unwrap().registered;
+            assert_eq!(get("client_id"), expected_client_id(mode, registered));
             assert_eq!(get("code_challenge_method"), "S256");
             assert_eq!(
                 get("resource"),
@@ -409,7 +419,10 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     }
     if matches!(
         mode,
-        Mode::Auth { .. } | Mode::AuthLocalhostOnly | Mode::Confidential { .. }
+        Mode::Auth { .. }
+            | Mode::AuthLocalhostOnly
+            | Mode::AuthClientMetadata { .. }
+            | Mode::Confidential { .. }
     ) {
         let bearer = rec
             .header("authorization")
@@ -664,10 +677,13 @@ fn stuck_page(id: &Value, state: &Mutex<State>) -> Value {
         "nextCursor":"stuck"}})
 }
 
-fn registered_client_id(mode: &Mode) -> &'static str {
+/// The client id `authorize` insists on: the administrator's, the metadata URL, or
+/// the one `/register` handed out.
+fn expected_client_id(mode: &Mode, registered: bool) -> String {
     match mode {
-        Mode::Confidential { .. } => CONFIDENTIAL_ID,
-        _ => "client-abc",
+        Mode::Confidential { .. } => CONFIDENTIAL_ID.to_string(),
+        Mode::AuthClientMetadata { client_id } if !registered => client_id.clone(),
+        _ => "client-abc".to_string(),
     }
 }
 

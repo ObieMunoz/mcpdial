@@ -224,9 +224,13 @@ pub struct Credential {
     /// Where the token came from, kept so it can be refreshed without rediscovery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_endpoint: Option<String>,
-    /// Dynamically registered client id, reused on the next login to the same issuer.
+    /// The client id, reused on the next login to the same issuer. A URL when it
+    /// names a client ID metadata document the server fetches for itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// How that id came to be: "pre-registered", "dynamic" or "client_metadata_document".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<String>,
     /// Secret of a confidential client registered out of band. Kept so a refresh can
     /// authenticate on its own; the file it lives in is mode 0600.
     #[serde(default, skip_serializing_if = "Option::is_none")]

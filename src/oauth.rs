@@ -2,9 +2,12 @@
 //!
 //! * Discovery: RFC 9728 protected-resource metadata, then RFC 8414 authorization
 //!   server metadata (with the OpenID Connect document as a fallback).
-//! * Registration: RFC 7591 dynamic client registration, public client, no secret.
-//!   A client registered by hand instead can be confidential, in which case its
-//!   secret is supplied to `login` and presented at the token endpoint.
+//! * Registration: a client ID metadata document when the server accepts one (the
+//!   `client_id` is the URL of a document this repository publishes, which the
+//!   server fetches for itself), otherwise RFC 7591 dynamic client registration.
+//!   Both make a public client, no secret. A client registered by hand instead can
+//!   be confidential, in which case its secret is supplied to `login` and presented
+//!   at the token endpoint.
 //! * Grant: authorization code + PKCE (S256) on a loopback redirect, with the RFC 8707
 //!   `resource` indicator so the token is bound to this MCP server.
 //! * Refresh: `refresh_token` grant, transparently, whenever a saved token has expired.
@@ -33,6 +36,8 @@ pub struct Metadata {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
+    /// The server fetches a client ID metadata document, so a URL can be the client id.
+    pub client_id_metadata_document_supported: bool,
     pub scopes_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
     /// The MCP endpoint, sent as the `resource` indicator.
@@ -266,6 +271,9 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         authorization_endpoint: field("authorization_endpoint", format!("{issuer}/authorize")),
         token_endpoint: field("token_endpoint", format!("{issuer}/token")),
         registration_endpoint: meta["registration_endpoint"].as_str().map(str::to_string),
+        client_id_metadata_document_supported: meta["client_id_metadata_document_supported"]
+            .as_bool()
+            .unwrap_or(false),
         issuer,
         scopes_supported: scopes,
         token_endpoint_auth_methods_supported: string_list(
@@ -374,6 +382,129 @@ pub fn register(http: &Http, meta: &Metadata, redirect_uri: &str) -> Result<Stri
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| Error::auth(format!("registration response had no client_id:\n{text}")))
+}
+
+// -- client id metadata documents ---------------------------------------------------
+
+/// Where `docs/client-metadata.json` is published; see `.github/workflows/pages.yml`.
+/// Presented as the `client_id` to a server that fetches such documents, so that no
+/// registration is stored per install.
+pub const CLIENT_METADATA_URL: &str = "https://obiemunoz.github.io/mcpdial/client-metadata.json";
+
+/// Whether `login` may identify itself with a client ID metadata document.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClientMetadata {
+    /// The document this repository publishes, when the server says it accepts one.
+    #[default]
+    IfAdvertised,
+    /// A document of the caller's own, whether or not the server advertises support.
+    Url(String),
+    /// Register dynamically instead, for a server whose document support is broken.
+    Never,
+}
+
+/// How the client id presented to the authorization server came to be. Saved with
+/// the credential so `token show` can say, and so a later login knows what it may reuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Registration {
+    /// `--client-id`: a client an administrator registered out of band.
+    PreRegistered,
+    /// RFC 7591 dynamic registration.
+    Dynamic,
+    /// The client id is the URL of a metadata document the server fetches itself.
+    ClientMetadataDocument,
+}
+
+impl Registration {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PreRegistered => "pre-registered",
+            Self::Dynamic => "dynamic",
+            Self::ClientMetadataDocument => "client_metadata_document",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            Self::PreRegistered,
+            Self::Dynamic,
+            Self::ClientMetadataDocument,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == s)
+    }
+
+    /// Completes "registered ...", for `login` and `token show`.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::PreRegistered => "out of band (--client-id)",
+            Self::Dynamic => "dynamically",
+            Self::ClientMetadataDocument => "via client metadata document",
+        }
+    }
+}
+
+/// The spec's two rules for a metadata URL: https, and a path, so that an origin
+/// alone cannot be a client id.
+pub fn check_client_metadata_url(url: &str) -> Result<()> {
+    let path = url
+        .strip_prefix("https://")
+        .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+        .unwrap_or("");
+    if path.trim_start_matches('/').is_empty() {
+        return Err(Error::usage(format!(
+            "client metadata URL must be https with a path, like https://example.com/client.json: {url}"
+        )));
+    }
+    Ok(())
+}
+
+/// What the client id will be, before anything is sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientId {
+    PreRegistered(String),
+    MetadataDocument(String),
+    /// Registered dynamically on an earlier login, for the same redirect URI.
+    Registered(String),
+    Register,
+}
+
+/// How a credential saved before the method was recorded came by its client id:
+/// only a client registered out of band has a secret.
+fn saved_registration(c: &Credential) -> Registration {
+    c.registration
+        .as_deref()
+        .and_then(Registration::parse)
+        .unwrap_or(if c.client_secret.is_some() {
+            Registration::PreRegistered
+        } else {
+            Registration::Dynamic
+        })
+}
+
+/// The order the spec asks for: a client registered out of band (given now, or on
+/// an earlier login), then a metadata document when the server accepts one or the
+/// caller insists on one, then dynamic registration. `saved` is a credential whose
+/// client id was registered for the redirect URI about to be used; a metadata
+/// document lists port-less loopback URIs, so it is never worth reusing.
+fn choose_client_id(opts: &LoginOptions, saved: Option<&Credential>, advertised: bool) -> ClientId {
+    if let Some(id) = &opts.client_id {
+        return ClientId::PreRegistered(id.clone());
+    }
+    let saved = saved.and_then(|c| Some((c.client_id.clone()?, saved_registration(c))));
+    if let Some((id, Registration::PreRegistered)) = &saved {
+        return ClientId::PreRegistered(id.clone());
+    }
+    match &opts.client_metadata {
+        ClientMetadata::Url(url) => ClientId::MetadataDocument(url.clone()),
+        ClientMetadata::IfAdvertised if advertised => {
+            ClientId::MetadataDocument(CLIENT_METADATA_URL.to_string())
+        }
+        ClientMetadata::IfAdvertised | ClientMetadata::Never => match saved {
+            Some((id, Registration::Dynamic)) => ClientId::Registered(id),
+            _ => ClientId::Register,
+        },
+    }
 }
 
 // -- pkce -----------------------------------------------------------------------
@@ -549,6 +680,7 @@ pub struct LoginOptions {
     pub client_id: Option<String>,
     /// Secret of a confidential client, for a `client_id` registered out of band.
     pub client_secret: Option<String>,
+    pub client_metadata: ClientMetadata,
     /// Loopback host for the redirect URI. `None` tries 127.0.0.1 first and falls
     /// back to localhost if the server refuses it (Doorkeeper's common allowlist).
     pub redirect_host: Option<String>,
@@ -563,6 +695,7 @@ impl Default for LoginOptions {
             port: None,
             client_id: None,
             client_secret: None,
+            client_metadata: ClientMetadata::default(),
             redirect_host: None,
             open_browser: true,
             timeout: Duration::from_secs(300),
@@ -595,6 +728,9 @@ pub fn login(
     opts: &LoginOptions,
     mut notify: impl FnMut(&str),
 ) -> Result<Credential> {
+    if let ClientMetadata::Url(url) = &opts.client_metadata {
+        check_client_metadata_url(url)?;
+    }
     let chal = challenge(http, mcp_url)?;
     if chal.is_none() {
         notify("note: the server accepted an anonymous initialize; a token may not be required");
@@ -603,7 +739,8 @@ pub fn login(
     notify(&format!("authorization server: {}", meta.issuer));
 
     // A saved client id is only reusable with the exact redirect URI it was
-    // registered for, which means the same port and the same loopback host.
+    // registered for, which means the same port and the same loopback host. The
+    // port is still worth asking for first when the id turns out not to matter.
     let saved = existing.filter(|c| c.client_id.is_some());
     let saved_port = saved.and_then(|c| c.redirect_port);
     let want_port = opts.port.or(saved_port).unwrap_or(0);
@@ -624,15 +761,18 @@ pub fn login(
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let redirect_for = |h: &str| format!("http://{h}:{port}/callback");
 
-    let client_id = match (&opts.client_id, saved) {
-        (Some(id), _) => id.clone(),
-        (None, Some(c))
-            if c.redirect_port == Some(port)
-                && c.redirect_host.as_deref() == Some(host.as_str()) =>
-        {
-            c.client_id.clone().unwrap()
-        }
-        _ => {
+    let reusable = saved.filter(|c| {
+        c.redirect_port == Some(port) && c.redirect_host.as_deref() == Some(host.as_str())
+    });
+    let (client_id, registration) = match choose_client_id(
+        opts,
+        reusable,
+        meta.client_id_metadata_document_supported,
+    ) {
+        ClientId::PreRegistered(id) => (id, Registration::PreRegistered),
+        ClientId::MetadataDocument(url) => (url, Registration::ClientMetadataDocument),
+        ClientId::Registered(id) => (id, Registration::Dynamic),
+        ClientId::Register => {
             let mut registered = register(http, &meta, &redirect_for(&host));
             let may_fall_back = opts.redirect_host.is_none() && host == "127.0.0.1";
             if may_fall_back && registered.as_ref().is_err_and(is_redirect_refused) {
@@ -640,18 +780,27 @@ pub fn login(
                 host = "localhost".to_string();
                 registered = register(http, &meta, &redirect_for(&host));
             }
-            registered.map_err(|e| {
+            let id = registered.map_err(|e| {
                 if is_redirect_refused(&e) {
                     Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer)))
                 } else {
                     e
                 }
-            })?
+            })?;
+            (id, Registration::Dynamic)
         }
     };
     let redirect_uri = redirect_for(&host);
-    if saved.is_none_or(|c| c.client_id.as_deref() != Some(client_id.as_str())) {
-        notify(&format!("registered client {client_id}"));
+    match registration {
+        Registration::Dynamic => {
+            if saved.is_none_or(|c| c.client_id.as_deref() != Some(client_id.as_str())) {
+                notify(&format!("registered client {client_id}"));
+            }
+        }
+        other => notify(&format!(
+            "client {client_id}, registered {}",
+            other.describe()
+        )),
     }
 
     let client_secret = opts.client_secret.clone().or_else(|| {
@@ -733,6 +882,7 @@ pub fn login(
     cred.token_endpoint_auth_method = client_secret.is_some().then(|| auth_method.to_string());
     cred.client_secret = client_secret;
     cred.client_id = Some(client_id);
+    cred.registration = Some(registration.as_str().to_string());
     cred.redirect_port = Some(port);
     cred.redirect_host = Some(host);
     cred.resource = Some(meta.resource.clone());
@@ -905,6 +1055,143 @@ mod tests {
             authenticate_client(&mut params, Some(CLIENT_SECRET_BASIC), Some("id"), None).is_none()
         );
         assert_eq!(params, grant(), "a public client sends no secret");
+    }
+
+    #[test]
+    fn the_published_document_is_the_one_the_constant_names() {
+        let doc: Value =
+            serde_json::from_str(include_str!("../docs/client-metadata.json")).unwrap();
+        assert_eq!(doc["client_id"], CLIENT_METADATA_URL);
+        assert!(check_client_metadata_url(CLIENT_METADATA_URL).is_ok());
+        assert_eq!(doc["client_name"], CLIENT_NAME);
+        assert_eq!(
+            string_list(&doc["redirect_uris"]),
+            ["http://127.0.0.1/callback", "http://localhost/callback"],
+            "port-less loopback URIs, since the port is chosen at login"
+        );
+        assert_eq!(
+            string_list(&doc["grant_types"]),
+            ["authorization_code", "refresh_token"]
+        );
+        assert_eq!(string_list(&doc["response_types"]), ["code"]);
+        assert_eq!(doc["token_endpoint_auth_method"], "none");
+    }
+
+    #[test]
+    fn a_metadata_url_is_https_with_a_path() {
+        for ok in ["https://example.com/client.json", "https://a.b/x/y?v=1"] {
+            assert!(check_client_metadata_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://example.com/client.json",
+            "https://example.com",
+            "https://example.com/",
+            "example.com/client.json",
+        ] {
+            assert!(
+                matches!(check_client_metadata_url(bad), Err(Error::Usage(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn registration_names_round_trip() {
+        for r in [
+            Registration::PreRegistered,
+            Registration::Dynamic,
+            Registration::ClientMetadataDocument,
+        ] {
+            assert_eq!(Registration::parse(r.as_str()), Some(r));
+        }
+        assert_eq!(Registration::parse("manual"), None);
+    }
+
+    #[test]
+    fn the_client_id_is_chosen_in_the_order_the_spec_asks_for() {
+        let opts = |client_id: Option<&str>, client_metadata: ClientMetadata| LoginOptions {
+            client_id: client_id.map(str::to_string),
+            client_metadata,
+            ..Default::default()
+        };
+        let saved = |id: &str, registration: Option<&str>, secret: Option<&str>| Credential {
+            client_id: Some(id.into()),
+            registration: registration.map(str::to_string),
+            client_secret: secret.map(str::to_string),
+            ..Default::default()
+        };
+        let custom = || ClientMetadata::Url("https://x/y".into());
+        let pre = |id: &str| ClientId::PreRegistered(id.into());
+        let document = |url: &str| ClientId::MetadataDocument(url.into());
+
+        // --client-id beats everything, including what was saved.
+        assert_eq!(
+            choose_client_id(
+                &opts(Some("mine"), custom()),
+                Some(&saved("old", Some("pre-registered"), None)),
+                true
+            ),
+            pre("mine")
+        );
+        // A client registered out of band on an earlier login is kept, and a saved
+        // secret is what marks one from before the method was recorded.
+        let advertised = ClientMetadata::IfAdvertised;
+        assert_eq!(
+            choose_client_id(
+                &opts(None, advertised.clone()),
+                Some(&saved("conf", Some("pre-registered"), None)),
+                true
+            ),
+            pre("conf")
+        );
+        assert_eq!(
+            choose_client_id(
+                &opts(None, advertised.clone()),
+                Some(&saved("conf", None, Some("s"))),
+                true
+            ),
+            pre("conf")
+        );
+        // The document when the server accepts one, over a saved dynamic registration.
+        assert_eq!(
+            choose_client_id(
+                &opts(None, advertised.clone()),
+                Some(&saved("client-abc", Some("dynamic"), None)),
+                true
+            ),
+            document(CLIENT_METADATA_URL)
+        );
+        // A document of the caller's own, whether or not the server advertises.
+        assert_eq!(
+            choose_client_id(&opts(None, custom()), None, false),
+            document("https://x/y")
+        );
+        // Otherwise the saved dynamic registration, else a new one.
+        assert_eq!(
+            choose_client_id(
+                &opts(None, advertised.clone()),
+                Some(&saved("client-abc", None, None)),
+                false
+            ),
+            ClientId::Registered("client-abc".into())
+        );
+        assert_eq!(
+            choose_client_id(&opts(None, advertised), None, false),
+            ClientId::Register
+        );
+        // --no-client-metadata: never the document, and a saved document id is no use.
+        assert_eq!(
+            choose_client_id(
+                &opts(None, ClientMetadata::Never),
+                Some(&saved(
+                    CLIENT_METADATA_URL,
+                    Some("client_metadata_document"),
+                    None
+                )),
+                true
+            ),
+            ClientId::Register
+        );
     }
 
     #[test]

@@ -135,7 +135,8 @@ mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | -]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
 
-mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--redirect-host H] [--no-browser]
+mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--client-metadata-url URL]
+                     [--no-client-metadata] [--redirect-host H] [--no-browser]
 mcpdial logout TARGET
 mcpdial token set NAME [--env VAR]   token from stdin or an env var, never an argument
 mcpdial token show NAME              metadata only; the secret is never printed
@@ -318,11 +319,25 @@ nobody asked for a token, and telling you to check your scopes would waste your 
 The only hard part of talking to a remote MCP server is the credential. Three ways in:
 
 **`mcpdial login NAME`** runs OAuth 2.1 the way the MCP spec describes it: discover the
-authorization server from the resource metadata, register a public client dynamically,
-open the browser for the authorization-code grant with PKCE, catch the redirect on a
-loopback port, exchange the code, and save the result. The browser step happens once.
-Afterwards the access token is refreshed automatically when it expires, and once more on
-an unexpected 401, so a saved server keeps working indefinitely.
+authorization server from the resource metadata, identify the client, open the browser
+for the authorization-code grant with PKCE, catch the redirect on a loopback port,
+exchange the code, and save the result. The browser step happens once. Afterwards the
+access token is refreshed automatically when it expires, and once more on an unexpected
+401, so a saved server keeps working indefinitely.
+
+The client is identified in the order the spec asks for. `--client-id` names one
+registered out of band (with `--client-secret` or `--client-secret-env` if it is
+confidential). Otherwise, when the server's metadata says
+`client_id_metadata_document_supported`, the client id is the URL of a client ID
+metadata document that the server fetches for itself, so nothing is registered per
+machine: [`docs/client-metadata.json`](docs/client-metadata.json), published by
+[`.github/workflows/pages.yml`](.github/workflows/pages.yml) at
+<https://obiemunoz.github.io/mcpdial/client-metadata.json> whenever it changes (the
+repository's Pages source is GitHub Actions). `--client-metadata-url URL` presents a
+document of your own instead, whether or not the server advertises support. Failing
+both, a public client is registered dynamically (RFC 7591); `--no-client-metadata`
+goes straight to that, for a server whose document support is broken. `login` says
+which method it used, and so does `token show`.
 
 The redirect URI is `http://127.0.0.1:PORT/callback`, and if the server refuses that,
 `http://localhost:PORT/callback` is tried next, because some servers allowlist only the
