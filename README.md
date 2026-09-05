@@ -24,11 +24,44 @@ listing of every tool on every server.
 
 ## Install
 
+Every [release](https://github.com/ObieMunoz/mcpdial/releases) ships one static binary
+per platform, with no runtime dependencies. Download the archive for yours and put
+`mcpdial` on your `PATH`:
+
+```bash
+curl -fsSL https://github.com/ObieMunoz/mcpdial/releases/latest/download/mcpdial-aarch64-apple-darwin.tar.gz | tar xz
+sudo install mcpdial-aarch64-apple-darwin/mcpdial /usr/local/bin/
+```
+
+| Platform | Archive |
+|---|---|
+| macOS, Apple silicon | `mcpdial-aarch64-apple-darwin.tar.gz` |
+| macOS, Intel | `mcpdial-x86_64-apple-darwin.tar.gz` |
+| Linux, x86-64 | `mcpdial-x86_64-unknown-linux-musl.tar.gz` |
+| Linux, ARM64 | `mcpdial-aarch64-unknown-linux-musl.tar.gz` |
+| Windows, x86-64 | `mcpdial-x86_64-pc-windows-msvc.zip` |
+
+The Linux binaries are linked against musl, so they run on any distribution. Each
+release also carries a `SHA256SUMS` file; `sha256sum -c --ignore-missing SHA256SUMS`
+(`shasum -a 256 -c --ignore-missing` on macOS) checks a download against it. A binary
+that a browser downloaded on macOS is quarantined until
+`xattr -d com.apple.quarantine mcpdial`; `curl` does not set that flag.
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) the same archive is
+fetched and installed in one step:
+
+```bash
+cargo binstall --git https://github.com/ObieMunoz/mcpdial mcpdial
+```
+
+Or build from source with a Rust toolchain:
+
 ```bash
 cargo install --git https://github.com/ObieMunoz/mcpdial
 ```
 
-Or from a checkout: `cargo install --path .`. One static binary, no runtime dependencies.
+Or from a checkout: `cargo install --path .`. What changed in each version is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ### Shell completions
 
@@ -341,6 +374,22 @@ cargo test            # unit tests plus end-to-end tests against a fake MCP + OA
 cargo clippy --all-targets
 cargo run --example echo_server   # the smallest real stdio MCP server, used by the tests
 ```
+
+### Cutting a release
+
+1. Set `version` in `Cargo.toml`, and move the `[Unreleased]` entries in
+   `CHANGELOG.md` under a `## [X.Y.Z] - YYYY-MM-DD` heading. `cargo test` fails until
+   the version has a section with at least one entry. Merge that to `main`.
+2. Tag the merge commit and push the tag:
+
+   ```bash
+   git tag vX.Y.Z && git push origin vX.Y.Z
+   ```
+
+The release workflow refuses a tag that does not match `Cargo.toml`, builds every
+target in the table above, checks that each binary reports the tagged version, and
+publishes a GitHub Release whose notes are that changelog section, with the archives
+and their `SHA256SUMS` attached. Nothing is published to crates.io.
 
 ## License
 
