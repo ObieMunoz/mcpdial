@@ -109,7 +109,6 @@ impl HttpTransport {
     }
 }
 
-/// One response header as text, or `None` when it is absent or not text.
 pub(crate) fn header<B>(resp: &ureq::http::Response<B>, name: &str) -> Option<String> {
     resp.headers()
         .get(name)

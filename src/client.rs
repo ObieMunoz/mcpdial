@@ -108,7 +108,6 @@ pub enum AuthUsed {
     Saved,
 }
 
-/// Trade the refresh token for a new access token and remember the result.
 fn refresh_and_save(
     store: &Store,
     name: &str,
@@ -160,7 +159,6 @@ fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTr
     b.build()
 }
 
-/// Run the `initialize` handshake over `transport` and keep what it said.
 fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,

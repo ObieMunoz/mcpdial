@@ -170,7 +170,6 @@ impl StdioTransport {
     }
 }
 
-/// Poll for the child's exit for up to `dur`; `None` if it is still running.
 fn wait_up_to(child: &mut Child, dur: Duration) -> Option<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + dur;
     loop {

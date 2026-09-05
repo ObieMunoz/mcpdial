@@ -254,7 +254,6 @@ impl Failure {
         }
     }
 
-    /// The human form: the error, then the hint on lines of its own.
     fn eprint(&self) {
         eprintln!("error: {}", self.error);
         if let Some(hint) = &self.hint {
@@ -277,7 +276,6 @@ impl From<Error> for Failure {
     }
 }
 
-/// Pretty-printed JSON on stdout.
 fn print_json(v: &impl serde::Serialize) {
     println!(
         "{}",
@@ -285,7 +283,6 @@ fn print_json(v: &impl serde::Serialize) {
     );
 }
 
-/// One JSON value on stdout: a single line under `--json`, pretty otherwise.
 fn print_value(v: &Value, compact: bool) {
     if compact {
         println!("{v}");
@@ -294,26 +291,21 @@ fn print_value(v: &Value, compact: bool) {
     }
 }
 
-/// Resolve `target` and complete the handshake with it.
 fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connection, Failure> {
     let r = client::resolve(store, target)?;
     Ok(client::connect(store, &r, opts)?)
 }
 
-/// Where a server's `initialize` result can be read again, for a capability hint.
 fn info_hint(target: &str) -> String {
     format!("`mcpdial info {}`", shell_word(target))
 }
 
-/// The name a credential is filed under: the saved server's, or the target itself.
 fn credential_key(store: &Store, target: String) -> String {
     client::resolve(store, &target)
         .map(|r| r.name)
         .unwrap_or(target)
 }
 
-/// A shell line's argument, split into the name it starts with and the JSON
-/// object after it, which is `{}` when nothing follows.
 fn name_and_args(rest: &str) -> (&str, &str) {
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
     match args.trim() {
@@ -1573,7 +1565,6 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 )
             })?;
             let mut conn = dial(&store, &opts, &target)?;
-            // What this tool takes, fetched only once a call has gone wrong.
             let usage = |conn: &mut client::Connection| {
                 let tools = conn.session.list_tools().unwrap_or_default();
                 call_hint(
@@ -1811,7 +1802,6 @@ fn expiry_label(cred: &Credential) -> String {
     }
 }
 
-/// The first line of `s`, cut to table width.
 fn truncate(s: &str) -> String {
     truncate_at(s.lines().next().unwrap_or(""), 60)
 }
