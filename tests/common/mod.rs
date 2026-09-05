@@ -34,10 +34,19 @@ pub enum Mode {
     StuckCursor,
     /// Stateful, but answers `405` to the session-terminating `DELETE`.
     StatefulNoDelete,
+    /// No dynamic registration, and a confidential client an administrator issued by
+    /// hand: the token endpoint refuses any request that does not prove the secret,
+    /// in the one placement named here.
+    Confidential { auth_method: String },
     /// Protocol 2024-11-05: the URL serves `GET` alone, streaming an `endpoint` event
     /// that names where requests are POSTed.
     LegacySse,
 }
+
+/// The client the administrator registered out of band. The secret carries the
+/// characters that have to survive form encoding in either placement.
+pub const CONFIDENTIAL_ID: &str = "conf-client";
+pub const CONFIDENTIAL_SECRET: &str = "c0nf&s3cr3t=/:x";
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
@@ -168,9 +177,8 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 }),
             )
         }
-        "/.well-known/oauth-authorization-server" => json_resp(
-            200,
-            &json!({
+        "/.well-known/oauth-authorization-server" => {
+            let mut meta = json!({
                 "issuer": base,
                 "authorization_endpoint": format!("{base}/authorize"),
                 "token_endpoint": format!("{base}/token"),
@@ -178,8 +186,15 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
                 "scopes_supported": ["mcp"],
-            }),
-        ),
+            });
+            if let Mode::Confidential { auth_method } = mode {
+                meta["token_endpoint_auth_methods_supported"] = json!([auth_method]);
+                meta.as_object_mut()
+                    .unwrap()
+                    .remove("registration_endpoint");
+            }
+            json_resp(200, &meta)
+        }
         "/moved" => with_headers(
             Response::from_string("").with_status_code(301),
             &[("Location", &format!("{base}/mcp"))],
@@ -214,7 +229,7 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                     .unwrap_or_default()
             };
             assert_eq!(get("response_type"), "code");
-            assert_eq!(get("client_id"), "client-abc");
+            assert_eq!(get("client_id"), registered_client_id(mode));
             assert_eq!(get("code_challenge_method"), "S256");
             assert_eq!(
                 get("resource"),
@@ -240,6 +255,18 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                     .map(|(_, v)| v.clone())
                     .unwrap_or_default()
             };
+            if let Mode::Confidential { auth_method } = mode {
+                let presented = if auth_method == "client_secret_basic" {
+                    assert_eq!(get("client_secret"), "", "basic auth, not both");
+                    basic_secret(rec.header("authorization").unwrap_or_default())
+                } else {
+                    assert_eq!(rec.header("authorization"), None, "post auth, not both");
+                    get("client_secret")
+                };
+                if presented != CONFIDENTIAL_SECRET {
+                    return json_resp(401, &json!({"error": "invalid_client"}));
+                }
+            }
             let mut st = state.lock().unwrap();
             match get("grant_type").as_str() {
                 "authorization_code" => {
@@ -294,7 +321,10 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if let Mode::LegacySse = mode {
         return legacy_sse(base, rec);
     }
-    if matches!(mode, Mode::Auth { .. } | Mode::AuthLocalhostOnly) {
+    if matches!(
+        mode,
+        Mode::Auth { .. } | Mode::AuthLocalhostOnly | Mode::Confidential { .. }
+    ) {
         let bearer = rec
             .header("authorization")
             .and_then(|a| a.strip_prefix("Bearer "))
@@ -546,6 +576,23 @@ fn stuck_page(id: &Value, state: &Mutex<State>) -> Value {
         "tools":[{"name":"loop","description":"Served on every page.",
                   "inputSchema":{"type":"object"}}],
         "nextCursor":"stuck"}})
+}
+
+fn registered_client_id(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Confidential { .. } => CONFIDENTIAL_ID,
+        _ => "client-abc",
+    }
+}
+
+/// The other half of RFC 6749 section 2.3.1: both halves are form-encoded before
+/// they are base64'd, so the separating colon is the only unescaped one.
+fn basic_secret(header: &str) -> String {
+    let raw = header.strip_prefix("Basic ").expect("Basic credentials");
+    let decoded = String::from_utf8(STANDARD.decode(raw).expect("base64")).expect("utf-8");
+    let (id, secret) = decoded.split_once(':').expect("id:secret");
+    assert_eq!(percent_decode(id), CONFIDENTIAL_ID);
+    percent_decode(secret)
 }
 
 fn form(s: &str) -> Vec<(String, String)> {

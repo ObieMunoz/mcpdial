@@ -3,6 +3,8 @@
 //! * Discovery: RFC 9728 protected-resource metadata, then RFC 8414 authorization
 //!   server metadata (with the OpenID Connect document as a fallback).
 //! * Registration: RFC 7591 dynamic client registration, public client, no secret.
+//!   A client registered by hand instead can be confidential, in which case its
+//!   secret is supplied to `login` and presented at the token endpoint.
 //! * Grant: authorization code + PKCE (S256) on a loopback redirect, with the RFC 8707
 //!   `resource` indicator so the token is bound to this MCP server.
 //! * Refresh: `refresh_token` grant, transparently, whenever a saved token has expired.
@@ -14,7 +16,7 @@
 use crate::config::{now, Credential};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
 use crate::transport::http::{redirect_error, USER_AGENT};
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -32,6 +34,7 @@ pub struct Metadata {
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
     pub scopes_supported: Vec<String>,
+    pub token_endpoint_auth_methods_supported: Vec<String>,
     /// The MCP endpoint, sent as the `resource` indicator.
     pub resource: String,
 }
@@ -75,13 +78,23 @@ impl Http {
         Ok(serde_json::from_str(&text).ok())
     }
 
-    fn post(&self, url: &str, content_type: &str, body: String) -> Result<(u16, Value, String)> {
-        let mut resp = self
+    fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        body: String,
+        basic: Option<&str>,
+    ) -> Result<(u16, Value, String)> {
+        let mut req = self
             .agent
             .post(url)
             .header("Content-Type", content_type)
             .header("Accept", "application/json")
-            .header("User-Agent", &self.user_agent)
+            .header("User-Agent", &self.user_agent);
+        if let Some(credentials) = basic {
+            req = req.header("Authorization", &format!("Basic {credentials}"));
+        }
+        let mut resp = req
             .send(&body)
             .map_err(|e| Error::auth(format!("POST {url}: {e}")))?;
         let status = resp.status().as_u16();
@@ -94,16 +107,21 @@ impl Http {
     }
 
     fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value, String)> {
-        self.post(url, "application/json", body.to_string())
+        self.post(url, "application/json", body.to_string(), None)
     }
 
-    fn post_form(&self, url: &str, params: &[(&str, &str)]) -> Result<(u16, Value, String)> {
+    fn post_form(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        basic: Option<&str>,
+    ) -> Result<(u16, Value, String)> {
         let body = params
             .iter()
             .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        self.post(url, "application/x-www-form-urlencoded", body)
+        self.post(url, "application/x-www-form-urlencoded", body, basic)
     }
 }
 
@@ -258,6 +276,9 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         registration_endpoint: meta["registration_endpoint"].as_str().map(str::to_string),
         issuer,
         scopes_supported: scopes,
+        token_endpoint_auth_methods_supported: string_list(
+            &meta["token_endpoint_auth_methods_supported"],
+        ),
         resource: mcp_url.to_string(),
     })
 }
@@ -271,6 +292,43 @@ fn string_list(v: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// -- client authentication -------------------------------------------------------
+
+pub const CLIENT_SECRET_POST: &str = "client_secret_post";
+pub const CLIENT_SECRET_BASIC: &str = "client_secret_basic";
+
+/// Which of the two ways to present a client secret this server wants. RFC 8414
+/// leaves the list optional and the field defaults to `client_secret_basic` on
+/// paper, but post is what every server accepts in practice, so basic is only
+/// chosen when the server advertises it and not post.
+pub fn client_auth_method(supported: &[String]) -> &'static str {
+    let has = |m: &str| supported.iter().any(|s| s == m);
+    if has(CLIENT_SECRET_BASIC) && !has(CLIENT_SECRET_POST) {
+        CLIENT_SECRET_BASIC
+    } else {
+        CLIENT_SECRET_POST
+    }
+}
+
+/// Present the client secret on a token request, either as a form field or as the
+/// `Authorization: Basic` value returned here. RFC 6749 section 2.3.1 forbids using
+/// both at once, which is why one call decides between them.
+fn authenticate_client<'a>(
+    params: &mut Vec<(&'a str, &'a str)>,
+    method: Option<&str>,
+    client_id: Option<&'a str>,
+    client_secret: Option<&'a str>,
+) -> Option<String> {
+    let (id, secret) = (client_id?, client_secret?);
+    if method == Some(CLIENT_SECRET_BASIC) {
+        // Both halves are form-encoded before base64, so a secret containing a
+        // colon or an ampersand survives the round trip.
+        return Some(STANDARD.encode(format!("{}:{}", urlencode(id), urlencode(secret))));
+    }
+    params.push(("client_secret", secret));
+    None
 }
 
 // -- registration ---------------------------------------------------------------
@@ -497,6 +555,8 @@ pub struct LoginOptions {
     pub scope: Option<String>,
     pub port: Option<u16>,
     pub client_id: Option<String>,
+    /// Secret of a confidential client, for a `client_id` registered out of band.
+    pub client_secret: Option<String>,
     /// Loopback host for the redirect URI. `None` tries 127.0.0.1 first and falls
     /// back to localhost if the server refuses it (Doorkeeper's common allowlist).
     pub redirect_host: Option<String>,
@@ -510,6 +570,7 @@ impl Default for LoginOptions {
             scope: None,
             port: None,
             client_id: None,
+            client_secret: None,
             redirect_host: None,
             open_browser: true,
             timeout: Duration::from_secs(300),
@@ -607,6 +668,13 @@ pub fn login(
         notify(&format!("registered client {client_id}"));
     }
 
+    let client_secret = opts.client_secret.clone().or_else(|| {
+        saved
+            .filter(|c| c.client_id.as_deref() == Some(client_id.as_str()))
+            .and_then(|c| c.client_secret.clone())
+    });
+    let auth_method = client_auth_method(&meta.token_endpoint_auth_methods_supported);
+
     let (verifier, code_challenge) = pkce()?;
     let state = random_urlsafe(16)?;
     let scope = opts
@@ -653,17 +721,21 @@ pub fn login(
 
     let code = wait_for_code(listeners, &state, opts.timeout)?;
 
-    let (status, value, text) = http.post_form(
-        &meta.token_endpoint,
-        &[
-            ("grant_type", "authorization_code"),
-            ("code", &code),
-            ("redirect_uri", &redirect_uri),
-            ("client_id", &client_id),
-            ("code_verifier", &verifier),
-            ("resource", &meta.resource),
-        ],
-    )?;
+    let mut params = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("client_id", client_id.as_str()),
+        ("code_verifier", verifier.as_str()),
+        ("resource", meta.resource.as_str()),
+    ];
+    let basic = authenticate_client(
+        &mut params,
+        Some(auth_method),
+        Some(&client_id),
+        client_secret.as_deref(),
+    );
+    let (status, value, text) = http.post_form(&meta.token_endpoint, &params, basic.as_deref())?;
     if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
             "token exchange failed: HTTP {status}\n{text}"
@@ -672,6 +744,8 @@ pub fn login(
 
     let mut cred = credential_from_token_response(&value, Credential::default())?;
     cred.token_endpoint = Some(meta.token_endpoint.clone());
+    cred.token_endpoint_auth_method = client_secret.is_some().then(|| auth_method.to_string());
+    cred.client_secret = client_secret;
     cred.client_id = Some(client_id);
     cred.redirect_port = Some(port);
     cred.redirect_host = Some(host);
@@ -700,7 +774,13 @@ pub fn refresh(http: &Http, cred: &Credential) -> Result<Credential> {
     if let Some(r) = cred.resource.as_deref() {
         params.push(("resource", r));
     }
-    let (status, value, text) = http.post_form(endpoint, &params)?;
+    let basic = authenticate_client(
+        &mut params,
+        cred.token_endpoint_auth_method.as_deref(),
+        cred.client_id.as_deref(),
+        cred.client_secret.as_deref(),
+    );
+    let (status, value, text) = http.post_form(endpoint, &params, basic.as_deref())?;
     if !(200..300).contains(&status) {
         return Err(Error::auth(format!(
             "token refresh failed: HTTP {status}\n{text}\nRun `mcpdial login` again."
@@ -790,6 +870,56 @@ mod tests {
                 ("state".into(), "x y".into())
             ]
         );
+    }
+
+    #[test]
+    fn client_auth_defaults_to_post_and_picks_basic_only_when_post_is_not_offered() {
+        let offered = |ms: &[&str]| ms.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(client_auth_method(&[]), CLIENT_SECRET_POST);
+        assert_eq!(client_auth_method(&offered(&["none"])), CLIENT_SECRET_POST);
+        assert_eq!(
+            client_auth_method(&offered(&["client_secret_basic"])),
+            CLIENT_SECRET_BASIC
+        );
+        assert_eq!(
+            client_auth_method(&offered(&["client_secret_basic", "client_secret_post"])),
+            CLIENT_SECRET_POST
+        );
+    }
+
+    #[test]
+    fn a_secret_goes_in_the_form_or_the_basic_header_but_never_both() {
+        let grant = || vec![("grant_type", "refresh_token")];
+
+        let mut params = grant();
+        let basic = authenticate_client(
+            &mut params,
+            Some(CLIENT_SECRET_POST),
+            Some("id"),
+            Some("p&:w"),
+        );
+        assert!(basic.is_none());
+        assert_eq!(params.last(), Some(&("client_secret", "p&:w")));
+
+        let mut params = grant();
+        let basic = authenticate_client(
+            &mut params,
+            Some(CLIENT_SECRET_BASIC),
+            Some("id"),
+            Some("p&:w"),
+        )
+        .unwrap();
+        assert_eq!(params, grant());
+        assert_eq!(
+            String::from_utf8(STANDARD.decode(basic).unwrap()).unwrap(),
+            "id:p%26%3Aw"
+        );
+
+        let mut params = grant();
+        assert!(
+            authenticate_client(&mut params, Some(CLIENT_SECRET_BASIC), Some("id"), None).is_none()
+        );
+        assert_eq!(params, grant(), "a public client sends no secret");
     }
 
     #[test]

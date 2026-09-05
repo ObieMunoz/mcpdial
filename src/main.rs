@@ -179,6 +179,17 @@ enum Cmd {
         /// Use a pre-registered client id instead of dynamic registration
         #[arg(long)]
         client_id: Option<String>,
+        /// Read that client's secret from stdin. Never from an argument.
+        #[arg(long, requires = "client_id")]
+        client_secret: bool,
+        /// Read that client's secret from $VAR instead of stdin
+        #[arg(
+            long,
+            value_name = "VAR",
+            requires = "client_id",
+            conflicts_with = "client_secret"
+        )]
+        client_secret_env: Option<String>,
         /// Loopback host in the redirect URI: 127.0.0.1 (default, with a localhost
         /// fallback if the server refuses it) or localhost
         #[arg(long, value_name = "HOST", value_parser = ["127.0.0.1", "localhost"])]
@@ -289,6 +300,31 @@ fn error_json(e: &Error) -> Value {
         Error::Usage(_) => v["kind"] = json!("usage"),
     }
     json!({ "error": v })
+}
+
+/// A secret from `$VAR`, or from stdin. Never from an argument, where `ps` and the
+/// shell history would both keep a copy.
+fn read_secret(env: Option<&str>, what: &str) -> Result<String, Error> {
+    if let Some(var) = env {
+        return std::env::var(var)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::usage(format!("${var} is unset or empty")));
+    }
+    let mut stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprint!("paste the {what} and press enter: ");
+        std::io::stderr().flush().ok();
+    }
+    let mut buf = String::new();
+    stdin
+        .read_to_string(&mut buf)
+        .map_err(|e| Error::usage(e.to_string()))?;
+    let secret = buf.trim().to_string();
+    if secret.is_empty() {
+        return Err(Error::usage(format!("no {what} on stdin")));
+    }
+    Ok(secret)
 }
 
 /// A JSON object given inline, as `@path` to read a file, or `-` to read stdin.
@@ -1569,6 +1605,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             scope,
             port,
             client_id,
+            client_secret,
+            client_secret_env,
             redirect_host,
             no_browser,
         } => {
@@ -1579,12 +1617,16 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 )
                 .into());
             };
+            let client_secret = (client_secret || client_secret_env.is_some())
+                .then(|| read_secret(client_secret_env.as_deref(), "client secret"))
+                .transpose()?;
             let existing = store.credential(&r.name)?;
             let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
             let login_opts = oauth::LoginOptions {
                 scope,
                 port,
                 client_id,
+                client_secret,
                 redirect_host,
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
@@ -1622,28 +1664,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let key = client::resolve(&store, &name)
                 .map(|r| r.name)
                 .unwrap_or(name);
-            let token = match env {
-                Some(var) => std::env::var(&var)
-                    .ok()
-                    .filter(|t| !t.is_empty())
-                    .ok_or_else(|| Error::usage(format!("${var} is unset or empty")))?,
-                None => {
-                    let mut stdin = std::io::stdin();
-                    if stdin.is_terminal() {
-                        eprint!("paste the token and press enter: ");
-                        std::io::stderr().flush().ok();
-                    }
-                    let mut buf = String::new();
-                    stdin
-                        .read_to_string(&mut buf)
-                        .map_err(|e| Error::usage(e.to_string()))?;
-                    let t = buf.trim().to_string();
-                    if t.is_empty() {
-                        return Err(Error::usage("no token on stdin").into());
-                    }
-                    t
-                }
-            };
+            let token = read_secret(env.as_deref(), "token")?;
             let mut cred = store.credential(&key)?.unwrap_or_default();
             cred.access_token = Some(token);
             cred.expires_at = None;
@@ -1674,6 +1695,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         "scope": cred.scope,
                         "source": cred.source,
                         "client_id": cred.client_id,
+                        "has_client_secret": cred.client_secret.is_some(),
                         "token_endpoint": cred.token_endpoint,
                     }))
                     .unwrap()
@@ -1699,6 +1721,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
                 if let Some(c) = &cred.client_id {
                     println!("  client id:     {c}");
+                }
+                if cred.client_secret.is_some() {
+                    println!(
+                        "  client secret: present ({})",
+                        cred.token_endpoint_auth_method
+                            .as_deref()
+                            .unwrap_or(oauth::CLIENT_SECRET_POST)
+                    );
                 }
                 if let Some(t) = &cred.token_endpoint {
                     println!("  token url:     {t}");
