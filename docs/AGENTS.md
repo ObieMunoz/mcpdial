@@ -26,9 +26,12 @@
    set is followed by `(tool reported an error)` on stderr.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
    and prints one JSON line per command. Send `quit` or close stdin to finish.
-5. **Add what is missing.** `mcpdial add NAME --registry <registry name>` saves an
-   entry of the MCP registry without running it; the registry name is the entry's
-   own `name`, like `io.github.owner/server`, and must be known already. A required
+5. **Add what is missing.** `mcpdial catalog --json` lists a reviewed set of servers,
+   each with an `id`, a `category`, a `transport` and an `auth` (`none`, `oauth`,
+   `api-key`, `env`); `mcpdial add NAME --catalog ID` saves one. Beyond the catalog,
+   `mcpdial add NAME --registry <registry name>` saves an entry of the MCP registry
+   without running it; the registry name is the entry's own `name`, like
+   `io.github.owner/server`, and must be known already. A required
    value the entry leaves to the user is exit 2 with a `hint` naming it, and
    `--arg VALUE` supplies it. Required environment variables are saved as `${VAR}`
    placeholders and named on stderr, or under `saved.notes` with `--json`; they must be

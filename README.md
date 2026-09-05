@@ -119,9 +119,11 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 ```
 mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V] [--force] [--no-probe]
 mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--force] [--no-probe]
+mcpdial add NAME --catalog ID    one entry of the reviewed catalog; `mcpdial catalog` lists them
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
 mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
 mcpdial rm NAME
+mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long]  tools on one server, or on every server
@@ -228,9 +230,41 @@ saves each server under its existing name. With no file argument it scans the us
 locations. `command` plus `args` become one stdio command line, `env` and `cwd` are
 kept, and `url` plus `headers` become an HTTP server. Nothing else in those files is read.
 
+### Adding from the catalog
+
+`mcpdial catalog` prints a reviewed list of servers, grouped by category: source
+control, browsers, docs and search, databases, productivity, cloud and infra, AI and
+data, and local files. Each line carries the id to add it by, its transport, and what
+it will ask for: `none`, an `oauth` login in the browser, an `api-key`, or `env` for
+other environment such as a connection string.
+
+```
+$ mcpdial catalog
+Docs and search
+  context7   Context7   http   none   Up-to-date library documentation and code examples
+  deepwiki   DeepWiki   http   none   Ask questions about any public GitHub repository
+  ...
+$ mcpdial add docs --catalog context7
+saved docs (http https://mcp.context7.com/mcp)
+```
+
+`add NAME --catalog ID` saves one entry. Most entries point at the MCP registry and
+are converted exactly as `--registry` converts them, below, so a required environment
+variable arrives as a `${VAR}` placeholder with a note; the rest carry their
+configuration in the catalog itself. `--json` prints the entries as objects, so a
+program gets a short, trustworthy list instead of guessing package names.
+
+The list ships inside the binary and is refreshed from this repository's `main`
+branch at most once a day, cached under `MCPDIAL_HOME/catalog.json`. `--offline`, or
+a refresh that fails, uses the built-in copy without comment. `MCPDIAL_CATALOG=URL`
+or `MCPDIAL_CATALOG=PATH` reads the list from somewhere else, such as a checkout of
+this repository. To add a server, open a pull request against
+[catalog.json](catalog.json): CI checks the file's shape and that every registry
+name still resolves.
+
 ### Adding by registry name
 
-When a server is not in a host config you already have, the
+When a server is not in the catalog or in a host config you already have, the
 [official registry](https://registry.modelcontextprotocol.io) may list it, with what
 it runs as and what it needs. `mcpdial add NAME --registry <registry name>` saves
 such an entry without running anything. The registry name is the entry's own `name`,
@@ -376,11 +410,13 @@ host config, and `add --registry` writes them for what an entry marks as require
 ```
 ~/.config/mcpdial/servers.json       what you configured (safe to share)
 ~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (owner only)
+~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
 ```
 
 Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
 `rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry
-`add --registry` consults, when it is not the official one.
+`add --registry` consults, when it is not the official one, and `MCPDIAL_CATALOG` a
+URL or file to read the catalog from.
 
 "Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
 that ran `login`, applied as the file is created rather than after, so the tokens are

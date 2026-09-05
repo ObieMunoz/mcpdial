@@ -37,3 +37,17 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo build --locked --all-targets
+
+  # The shape of catalog.json is checked by the unit tests in the test job. This
+  # asks the live registry whether every entry that points at it still resolves
+  # and converts to the transport it promises, which is the review gate for a
+  # catalog change; it needs the network, so it runs on its own.
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - run: cargo test --test catalog -- --ignored live_registry

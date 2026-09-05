@@ -1,0 +1,615 @@
+[
+  {
+    "id": "github",
+    "name": "GitHub",
+    "category": "Source control",
+    "summary": "Issues, pull requests, code search, actions",
+    "registry": "io.github.github/github-mcp-server",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "gitlab",
+    "name": "GitLab",
+    "category": "Source control",
+    "summary": "Projects, merge requests, issues and pipelines on gitlab.com",
+    "registry": "com.gitlab/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "git",
+    "name": "Git",
+    "category": "Source control",
+    "summary": "Log, diff, status and search in local repositories",
+    "config": {
+      "stdio": "uvx mcp-server-git"
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "circleci",
+    "name": "CircleCI",
+    "category": "Source control",
+    "summary": "Pipelines, workflows, job logs and flaky tests",
+    "registry": "com.circleci/mcp",
+    "transport": "http",
+    "auth": "api-key"
+  },
+  {
+    "id": "sonarqube",
+    "name": "SonarQube",
+    "category": "Source control",
+    "summary": "Code quality and security findings from SonarQube Cloud or Server",
+    "registry": "io.github.SonarSource/sonarqube-mcp-server",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "snyk",
+    "name": "Snyk",
+    "category": "Source control",
+    "summary": "Scan dependencies, code and containers for vulnerabilities",
+    "registry": "io.snyk/mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "playwright",
+    "name": "Playwright",
+    "category": "Browsers",
+    "summary": "Drive a real browser: navigate, click, fill forms, screenshots",
+    "registry": "io.github.microsoft/playwright-mcp",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "chrome-devtools",
+    "name": "Chrome DevTools",
+    "category": "Browsers",
+    "summary": "Chrome with DevTools attached: pages, console, network, performance",
+    "registry": "io.github.ChromeDevTools/chrome-devtools-mcp",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "browser-use",
+    "name": "Browser Use",
+    "category": "Browsers",
+    "summary": "Agentic automation of a local Chrome",
+    "registry": "com.browser-use/browser-use",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "browserbase",
+    "name": "Browserbase",
+    "category": "Browsers",
+    "summary": "Cloud browsers with Stagehand automation",
+    "registry": "io.github.browserbase/mcp-server-browserbase",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "firecrawl",
+    "name": "Firecrawl",
+    "category": "Browsers",
+    "summary": "Scrape, crawl and search the web as clean markdown",
+    "registry": "io.github.firecrawl/firecrawl-mcp-server",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "apify",
+    "name": "Apify",
+    "category": "Browsers",
+    "summary": "Thousands of scrapers and crawlers from the Apify Store",
+    "registry": "com.apify/apify-mcp-server",
+    "transport": "http",
+    "auth": "api-key"
+  },
+  {
+    "id": "context7",
+    "name": "Context7",
+    "category": "Docs and search",
+    "summary": "Up-to-date library documentation and code examples",
+    "registry": "io.github.upstash/context7",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "deepwiki",
+    "name": "DeepWiki",
+    "category": "Docs and search",
+    "summary": "Ask questions about any public GitHub repository",
+    "config": {
+      "http": "https://mcp.deepwiki.com/mcp"
+    },
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "microsoft-learn",
+    "name": "Microsoft Learn",
+    "category": "Docs and search",
+    "summary": "Microsoft and Azure documentation and code samples",
+    "registry": "com.microsoft/microsoft-learn-mcp",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "cloudflare-docs",
+    "name": "Cloudflare docs",
+    "category": "Docs and search",
+    "summary": "Cloudflare developer documentation",
+    "registry": "com.cloudflare.mcp/mcp",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "google-developer-docs",
+    "name": "Google developer docs",
+    "category": "Docs and search",
+    "summary": "Google's public developer documentation",
+    "registry": "com.googleapis.developerknowledge/mcp",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "fetch",
+    "name": "Fetch",
+    "category": "Docs and search",
+    "summary": "Fetch a URL and read it as markdown",
+    "config": {
+      "stdio": "uvx mcp-server-fetch"
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "brave-search",
+    "name": "Brave Search",
+    "category": "Docs and search",
+    "summary": "Web, image, video and news search from Brave",
+    "registry": "io.github.brave/brave-search-mcp-server",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "tavily",
+    "name": "Tavily",
+    "category": "Docs and search",
+    "summary": "Web search and page extraction built for agents",
+    "registry": "io.github.tavily-ai/tavily-mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "exa",
+    "name": "Exa",
+    "category": "Docs and search",
+    "summary": "Neural web search and crawling",
+    "registry": "ai.exa/exa",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "perplexity",
+    "name": "Perplexity",
+    "category": "Docs and search",
+    "summary": "Web search with reasoning and research through Sonar",
+    "registry": "ai.perplexity/mcp-server",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "postgres",
+    "name": "Postgres",
+    "category": "Databases",
+    "summary": "Query, explain and tune a PostgreSQL database named by DATABASE_URI",
+    "config": {
+      "stdio": "uvx postgres-mcp --access-mode=restricted",
+      "env": {
+        "DATABASE_URI": "${DATABASE_URI}"
+      }
+    },
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "supabase",
+    "name": "Supabase",
+    "category": "Databases",
+    "summary": "Supabase projects: SQL, migrations, tables, logs",
+    "registry": "com.supabase/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "prisma",
+    "name": "Prisma Postgres",
+    "category": "Databases",
+    "summary": "Create and manage Prisma Postgres databases",
+    "registry": "io.prisma/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "mongodb",
+    "name": "MongoDB",
+    "category": "Databases",
+    "summary": "Collections, queries and aggregations on MongoDB or Atlas",
+    "registry": "io.github.mongodb-js/mongodb-mcp-server",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "redis",
+    "name": "Redis",
+    "category": "Databases",
+    "summary": "Keys, hashes, streams and search on a Redis server",
+    "registry": "io.github.redis/mcp-redis",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "upstash-redis",
+    "name": "Upstash Redis",
+    "category": "Databases",
+    "summary": "Redis commands against an Upstash database",
+    "registry": "io.github.upstash/redis-mcp",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "clickhouse",
+    "name": "ClickHouse",
+    "category": "Databases",
+    "summary": "Query and explore ClickHouse clusters",
+    "registry": "io.github.ClickHouse/mcp-clickhouse",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "neo4j",
+    "name": "Neo4j",
+    "category": "Databases",
+    "summary": "Cypher queries against a Neo4j graph",
+    "registry": "io.github.neo4j-contrib/mcp-neo4j-cypher",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "motherduck",
+    "name": "MotherDuck",
+    "category": "Databases",
+    "summary": "SQL analytics on MotherDuck and local DuckDB files",
+    "registry": "io.github.motherduckdb/mcp-server-motherduck",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "firestore",
+    "name": "Cloud Firestore",
+    "category": "Databases",
+    "summary": "Documents and collections in Google Cloud Firestore",
+    "registry": "com.googleapis.firestore/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "notion",
+    "name": "Notion",
+    "category": "Productivity",
+    "summary": "Pages, databases and comments in a Notion workspace",
+    "registry": "com.notion/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "linear",
+    "name": "Linear",
+    "category": "Productivity",
+    "summary": "Issues, projects and cycles",
+    "registry": "app.linear/linear",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "atlassian",
+    "name": "Atlassian",
+    "category": "Productivity",
+    "summary": "Jira issues, Confluence pages and Compass components",
+    "registry": "com.atlassian/atlassian-mcp-server",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "slack",
+    "name": "Slack (PulseMCP)",
+    "category": "Productivity",
+    "summary": "Read and post messages, threads and reactions with a bot token",
+    "registry": "com.pulsemcp/slack",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "todoist",
+    "name": "Todoist",
+    "category": "Productivity",
+    "summary": "Tasks, projects and labels",
+    "registry": "net.todoist/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "airtable",
+    "name": "Airtable",
+    "category": "Productivity",
+    "summary": "Bases, tables and records",
+    "registry": "com.airtable/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "figma",
+    "name": "Figma",
+    "category": "Productivity",
+    "summary": "Design context from Figma files for building UI",
+    "registry": "com.figma.mcp/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "miro",
+    "name": "Miro",
+    "category": "Productivity",
+    "summary": "Boards, diagrams and docs",
+    "registry": "io.github.miroapp/mcp-server",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "monday",
+    "name": "monday.com",
+    "category": "Productivity",
+    "summary": "Boards, items and updates",
+    "registry": "com.monday/monday.com",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "stripe",
+    "name": "Stripe",
+    "category": "Productivity",
+    "summary": "Customers, products, payments and subscriptions",
+    "registry": "com.stripe/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "paypal",
+    "name": "PayPal",
+    "category": "Productivity",
+    "summary": "Orders, invoices, subscriptions and payouts",
+    "registry": "com.paypal.mcp/mcp",
+    "transport": "http",
+    "auth": "api-key"
+  },
+  {
+    "id": "webflow",
+    "name": "Webflow",
+    "category": "Productivity",
+    "summary": "Sites, pages, CMS collections and components",
+    "registry": "com.webflow/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "sanity",
+    "name": "Sanity",
+    "category": "Productivity",
+    "summary": "Content, datasets, releases and schemas in Sanity projects",
+    "registry": "io.sanity.www/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "sentry",
+    "name": "Sentry",
+    "category": "Cloud and infra",
+    "summary": "Errors, issues, releases and traces",
+    "registry": "io.github.getsentry/sentry-mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "grafana",
+    "name": "Grafana Cloud",
+    "category": "Cloud and infra",
+    "summary": "Dashboards, datasources, alerts and incidents",
+    "registry": "io.github.grafana/mcp-grafana",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "pagerduty",
+    "name": "PagerDuty",
+    "category": "Cloud and infra",
+    "summary": "Incidents, on-call schedules and escalation policies",
+    "registry": "io.github.PagerDuty/pagerduty-mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "terraform",
+    "name": "Terraform",
+    "category": "Cloud and infra",
+    "summary": "Provider and module docs from the Terraform registry, HCP Terraform workflows",
+    "registry": "io.github.hashicorp/terraform-mcp-server",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "kubernetes",
+    "name": "Kubernetes",
+    "category": "Cloud and infra",
+    "summary": "Pods, deployments, logs and events through your kubeconfig",
+    "registry": "io.github.containers/kubernetes-mcp-server",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "azure",
+    "name": "Azure",
+    "category": "Cloud and infra",
+    "summary": "Azure resources through your Azure CLI login",
+    "registry": "com.microsoft/azure",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "aws",
+    "name": "AWS",
+    "category": "Cloud and infra",
+    "summary": "AWS docs, API calls and workflows through your AWS credentials",
+    "registry": "io.github.aws/aws-mcp",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "cloud-run",
+    "name": "Google Cloud Run",
+    "category": "Cloud and infra",
+    "summary": "Deploy and manage Cloud Run services",
+    "registry": "com.googleapis.run/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "gke",
+    "name": "Google Kubernetes Engine",
+    "category": "Cloud and infra",
+    "summary": "Read access to GKE clusters and Kubernetes resources",
+    "registry": "com.googleapis.container/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "vercel",
+    "name": "Vercel",
+    "category": "Cloud and infra",
+    "summary": "Projects, deployments and logs",
+    "registry": "com.vercel/vercel-mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "railway",
+    "name": "Railway",
+    "category": "Cloud and infra",
+    "summary": "Projects, services and deployments",
+    "registry": "com.railway/mcp",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "hugging-face",
+    "name": "Hugging Face",
+    "category": "AI and data",
+    "summary": "Models, datasets, papers and Spaces on the Hub",
+    "registry": "co.huggingface/hf-mcp-server",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "sequential-thinking",
+    "name": "Sequential Thinking",
+    "category": "AI and data",
+    "summary": "Step-by-step reasoning with revisions and branches",
+    "config": {
+      "stdio": "npx -y @modelcontextprotocol/server-sequential-thinking"
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "memory",
+    "name": "Memory",
+    "category": "AI and data",
+    "summary": "A local knowledge graph that persists between sessions",
+    "config": {
+      "stdio": "npx -y @modelcontextprotocol/server-memory"
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "algolia",
+    "name": "Algolia",
+    "category": "AI and data",
+    "summary": "Search and manage your Algolia indices",
+    "registry": "io.github.algolia/algolia-productivity",
+    "transport": "http",
+    "auth": "oauth"
+  },
+  {
+    "id": "letta",
+    "name": "Letta",
+    "category": "AI and data",
+    "summary": "Long-term memory for agents on Letta Cloud",
+    "registry": "com.letta/memory-mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "opik",
+    "name": "Opik",
+    "category": "AI and data",
+    "summary": "Prompts, traces, datasets and metrics from Comet Opik",
+    "registry": "io.github.comet-ml/opik-mcp",
+    "transport": "stdio",
+    "auth": "api-key"
+  },
+  {
+    "id": "filesystem",
+    "name": "Filesystem",
+    "category": "Local files",
+    "summary": "Read, write and search files under the directory mcpdial runs in",
+    "config": {
+      "stdio": "npx -y @modelcontextprotocol/server-filesystem ."
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "markitdown",
+    "name": "MarkItDown",
+    "category": "Local files",
+    "summary": "Convert PDF, Office and other files to markdown",
+    "config": {
+      "stdio": "uvx markitdown-mcp"
+    },
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "basic-memory",
+    "name": "Basic Memory",
+    "category": "Local files",
+    "summary": "Markdown notes as a local knowledge base",
+    "registry": "io.github.basicmachines-co/basic-memory",
+    "transport": "stdio",
+    "auth": "none"
+  },
+  {
+    "id": "obsidian",
+    "name": "Obsidian",
+    "category": "Local files",
+    "summary": "Notes, tags and frontmatter in a vault through its Local REST API plugin",
+    "registry": "io.github.cyanheads/obsidian-mcp-server",
+    "transport": "stdio",
+    "auth": "api-key"
+  }
+]

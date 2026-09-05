@@ -1,9 +1,10 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
 use mcpdial::protocol::METHOD_NOT_FOUND;
-use mcpdial::registry::{Pick, Registry};
+use mcpdial::registry::{Pick, Registry, Resolved};
 use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
 use mcpdial::{oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
@@ -26,6 +27,8 @@ const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 examples:
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
   mcpdial add fs --stdio \"npx -y @modelcontextprotocol/server-filesystem /tmp\"
+  mcpdial catalog                 # a reviewed list of servers, by category
+  mcpdial add ctx7 --catalog context7                      # one of them
   mcpdial add ctx7 --registry io.github.upstash/context7   # from the MCP registry
   mcpdial ls                      # every saved server with its status and its age
   mcpdial tools                   # every tool on every server
@@ -84,10 +87,13 @@ enum Cmd {
         #[arg(
             long,
             value_name = "URL",
-            conflicts_with_all = ["stdio", "registry"],
-            required_unless_present_any = ["stdio", "registry"]
+            conflicts_with_all = ["stdio", "registry", "catalog"],
+            required_unless_present_any = ["stdio", "registry", "catalog"]
         )]
         http: Option<String>,
+        /// An entry of the curated catalog, by its id (`mcpdial catalog` lists them)
+        #[arg(long, value_name = "ID", conflicts_with_all = ["stdio", "registry"])]
+        catalog: Option<String>,
         /// Command that speaks MCP on stdio
         #[arg(long, value_name = "CMD", conflicts_with = "registry")]
         stdio: Option<String>,
@@ -129,6 +135,12 @@ enum Cmd {
         /// Overwrite servers that already exist under the same name
         #[arg(long)]
         force: bool,
+    },
+    /// List the curated catalog of servers, grouped by category
+    Catalog {
+        /// Use the copy built into the binary instead of refreshing it
+        #[arg(long)]
+        offline: bool,
     },
     /// Keep one session open and run commands from stdin (state persists between calls)
     Shell { target: String },
@@ -383,7 +395,7 @@ fn from_registry(
     entry: &str,
     pick: &Pick,
     args: &[String],
-) -> Result<mcpdial::registry::Resolved, Failure> {
+) -> Result<Resolved, Failure> {
     const NAME_HINT: &str =
         "a registry name is the entry's own `name`, like io.github.owner/server";
     if !entry.contains('/') {
@@ -413,6 +425,75 @@ fn from_registry(
         ));
     }
     Ok(resolved)
+}
+
+/// The config a catalog entry describes, from the freshest catalog at hand. A
+/// registry entry goes through the registry exactly as `--registry` would.
+fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Failure> {
+    let loaded = catalog::load(
+        store,
+        &catalog::Source::from_env(),
+        false,
+        opts.timeout,
+        &opts.user_agent,
+    )?;
+    if opts.verbose {
+        eprintln!("catalog: {}", loaded.origin);
+    }
+    let Some(entry) = catalog::find(&loaded.entries, id) else {
+        let ids = loaded.entries.iter().map(|e| e.id.as_str());
+        return Err(Failure::hinted(
+            Error::usage(format!("no catalog entry named {id:?}")),
+            match closest(id, ids) {
+                Some(near) => format!("did you mean {near}? `mcpdial catalog` lists them all."),
+                None => "`mcpdial catalog` lists every entry with its id.".to_string(),
+            },
+        ));
+    };
+    let registry = Registry::from_env(opts.timeout, &opts.user_agent);
+    let resolved = catalog::resolve(entry, &registry)?;
+    if !resolved.missing.is_empty() {
+        return Err(Failure::hinted(
+            Error::config(format!(
+                "{id} needs {} value(s) the catalog does not carry",
+                resolved.missing.len()
+            )),
+            format!(
+                "add it from the registry instead, passing each with --arg VALUE in this order:\n  mcpdial add NAME --registry {} --arg ...\n  {}",
+                entry.registry.as_deref().unwrap_or("?"),
+                resolved.missing.join("\n  ")
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The catalog as a person reads it: one block per category, one line per entry.
+fn print_catalog(entries: &[catalog::Entry]) {
+    let width = |pick: fn(&catalog::Entry) -> &str| {
+        entries
+            .iter()
+            .map(|e| pick(e).chars().count())
+            .max()
+            .unwrap_or(0)
+    };
+    let (id_w, name_w) = (width(|e| &e.id), width(|e| &e.name));
+    for (i, (category, group)) in catalog::grouped(entries).iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("{category}");
+        for e in group {
+            println!(
+                "  {:<id_w$}  {:<name_w$}  {:<5}  {:<7}  {}",
+                e.id,
+                e.name,
+                e.transport.as_str(),
+                e.auth.as_str(),
+                e.summary
+            );
+        }
+    }
 }
 
 /// A note on stderr: `note:` before the first line, the rest indented under it.
@@ -1077,6 +1158,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         Cmd::Add {
             name,
             http,
+            catalog,
             stdio,
             registry,
             package,
@@ -1092,6 +1174,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let dial = !no_probe && registry.is_none();
             let mut notes = Vec::new();
             let mut cfg = match (http, stdio, registry) {
+                (None, None, None) if catalog.is_some() => {
+                    let resolved = from_catalog(&store, &opts, catalog.as_deref().unwrap_or(""))?;
+                    notes = resolved.notes;
+                    resolved.config
+                }
                 (Some(url), None, None) => ServerConfig::http(url),
                 (None, Some(cmd), None) => ServerConfig::stdio(cmd),
                 (None, None, Some(entry)) => {
@@ -1652,6 +1739,26 @@ fn run(cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Guide => {
             print!("{}", include_str!("../docs/AGENTS.md"));
+            Ok(0)
+        }
+
+        Cmd::Catalog { offline } => {
+            let loaded = catalog::load(
+                &store,
+                &catalog::Source::from_env(),
+                offline,
+                opts.timeout,
+                &opts.user_agent,
+            )?;
+            if opts.verbose {
+                eprintln!("catalog: {}", loaded.origin);
+            }
+            if cli.json {
+                print_json(&loaded.entries);
+            } else {
+                print_catalog(&loaded.entries);
+                eprintln!("\nadd one with: mcpdial add NAME --catalog ID");
+            }
             Ok(0)
         }
 
