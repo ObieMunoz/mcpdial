@@ -176,10 +176,21 @@ fn handshake(
 
 /// Open a session and complete the `initialize` handshake.
 ///
-/// For HTTP servers with a saved OAuth credential, a 401 triggers one refresh and
+/// A `${VAR}` in the config's headers, env, cwd, URL or command line is read from
+/// the environment first; one that is unset is a config error before anything is
+/// sent. For HTTP servers with a saved OAuth credential, a 401 triggers one refresh and
 /// retry before giving up, so an expired token that the clock did not predict still
 /// works without a visible hiccup.
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
+    // The `${VAR}` placeholders are filled in here and nowhere earlier, so what
+    // was resolved, listed or saved still names the variable rather than holding
+    // its value.
+    let dialed = Resolved {
+        name: r.name.clone(),
+        config: r.config.expanded(|var| std::env::var(var).ok())?,
+        saved: r.saved,
+    };
+    let r = &dialed;
     if let Some(cmd) = &r.config.stdio {
         let argv = crate::transport::stdio::split_command(cmd)?;
         let env: Vec<(String, String)> = r

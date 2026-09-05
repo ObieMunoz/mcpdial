@@ -68,6 +68,98 @@ impl ServerConfig {
     pub fn location(&self) -> &str {
         self.http.as_deref().or(self.stdio.as_deref()).unwrap_or("")
     }
+
+    /// This server with every `${VAR}` placeholder filled in, as [`expand`] does
+    /// it: what gets dialed, never what gets saved, so the file keeps naming the
+    /// variable instead of holding its value. `token_env` names a variable rather
+    /// than containing one and is left alone.
+    pub fn expanded(&self, lookup: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let fill = |what: &str, text: &str| {
+            substitute(text, &lookup)
+                .map_err(|var| Error::config(format!("{what} refers to ${var}, which is not set")))
+        };
+        let mut headers = BTreeMap::new();
+        for (name, value) in &self.headers {
+            headers.insert(name.clone(), fill(&format!("header {name}"), value)?);
+        }
+        let mut env = BTreeMap::new();
+        for (name, value) in &self.env {
+            env.insert(name.clone(), fill(&format!("env {name}"), value)?);
+        }
+        Ok(Self {
+            http: self
+                .http
+                .as_deref()
+                .map(|u| fill("http URL", u))
+                .transpose()?,
+            stdio: self
+                .stdio
+                .as_deref()
+                .map(|c| fill("stdio command", c))
+                .transpose()?,
+            headers,
+            token_env: self.token_env.clone(),
+            env,
+            cwd: self.cwd.as_deref().map(|d| fill("cwd", d)).transpose()?,
+        })
+    }
+}
+
+/// `text` with each `${VAR}` replaced by what `lookup` gives for `VAR`, and each
+/// `${VAR:-default}` by `default` when it gives nothing. `$$` is a literal `$`; any
+/// other `$` is left as it is. An empty value counts as unset, as it does for `:-`
+/// in a shell. A `${VAR}` with no default and no value is an error naming it.
+pub fn expand(text: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String> {
+    substitute(text, &lookup).map_err(|var| Error::config(format!("${var} is not set")))
+}
+
+/// [`expand`], handing back the unset variable's name so the caller can say
+/// where it was found.
+fn substitute(
+    text: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> std::result::Result<String, String> {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        if let Some(after) = rest.strip_prefix("$$") {
+            out.push('$');
+            rest = after;
+            continue;
+        }
+        let Some((inner, after)) = rest
+            .strip_prefix("${")
+            .and_then(|after| after.split_once('}'))
+        else {
+            // A `$` that opens no placeholder is text.
+            out.push('$');
+            rest = &rest[1..];
+            continue;
+        };
+        let (name, default) = match inner.split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (inner, None),
+        };
+        if name.is_empty() {
+            // `${}` is nobody's variable.
+            out.push('$');
+            rest = &rest[1..];
+            continue;
+        }
+        match lookup(name)
+            .filter(|v| !v.is_empty())
+            .as_deref()
+            .or(default)
+        {
+            Some(value) => out.push_str(value),
+            None => return Err(name.to_string()),
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -922,5 +1014,77 @@ mod tests {
         };
         assert!(!c.is_expired());
         assert!(!Credential::default().is_expired());
+    }
+
+    fn vars<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[test]
+    fn expands_placeholders_from_the_lookup() {
+        let env = vars(&[("A", "apple"), ("EMPTY", "")]);
+        assert_eq!(expand("plain text", &env).unwrap(), "plain text");
+        assert_eq!(expand("", &env).unwrap(), "");
+        assert_eq!(expand("Bearer ${A}", &env).unwrap(), "Bearer apple");
+        assert_eq!(expand("${A}${A}", &env).unwrap(), "appleapple");
+        assert_eq!(expand("${B:-x}", &env).unwrap(), "x");
+        assert_eq!(expand("${A:-x}", &env).unwrap(), "apple");
+        assert_eq!(expand("${B:-}", &env).unwrap(), "");
+        assert_eq!(expand("${B:-a:-b}", &env).unwrap(), "a:-b");
+        assert_eq!(expand("costs $$5", &env).unwrap(), "costs $5");
+        assert_eq!(expand("$${A}", &env).unwrap(), "${A}");
+        assert_eq!(expand("$A and $ alone", &env).unwrap(), "$A and $ alone");
+        assert_eq!(expand("${A", &env).unwrap(), "${A");
+        assert_eq!(expand("${}", &env).unwrap(), "${}");
+        assert_eq!(expand("$", &env).unwrap(), "$");
+    }
+
+    #[test]
+    fn an_unset_placeholder_without_a_default_names_the_variable() {
+        let env = vars(&[("EMPTY", "")]);
+        let err = expand("Bearer ${GITHUB_TOKEN}", &env).unwrap_err();
+        assert!(matches!(&err, Error::Config(m) if m == "$GITHUB_TOKEN is not set"));
+        // Empty is as good as unset, as `:-` treats it in a shell.
+        assert!(expand("${EMPTY}", &env).is_err());
+        assert_eq!(expand("${EMPTY:-fallback}", &env).unwrap(), "fallback");
+    }
+
+    #[test]
+    fn an_expanded_config_names_the_field_and_leaves_the_original_alone() {
+        let env = vars(&[("KEY", "k"), ("DIR", "/srv"), ("PORT", "8080")]);
+        let mut cfg = ServerConfig::stdio("serve ${DIR} --port ${PORT:-80}");
+        cfg.env.insert("API_KEY".into(), "${KEY}".into());
+        cfg.env.insert("FLAG".into(), "${FLAG:-off}".into());
+        cfg.cwd = Some("${DIR}/work".into());
+        let dialed = cfg.expanded(&env).unwrap();
+        assert_eq!(dialed.stdio.as_deref(), Some("serve /srv --port 8080"));
+        assert_eq!(dialed.env["API_KEY"], "k");
+        assert_eq!(dialed.env["FLAG"], "off");
+        assert_eq!(dialed.cwd.as_deref(), Some("/srv/work"));
+        assert_eq!(cfg.cwd.as_deref(), Some("${DIR}/work"), "never rewritten");
+
+        let mut http = ServerConfig::http("https://${HOST}/mcp");
+        http.token_env = Some("${NOT_A_PLACEHOLDER}".into());
+        let err = http.expanded(&env).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "http URL refers to $HOST, which is not set"
+        );
+        http.http = Some("https://x/mcp".into());
+        http.headers
+            .insert("Authorization".into(), "Bearer ${GITHUB_TOKEN}".into());
+        let err = http.expanded(&env).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "header Authorization refers to $GITHUB_TOKEN, which is not set"
+        );
+        http.headers.clear();
+        let dialed = http.expanded(&env).unwrap();
+        assert_eq!(dialed.token_env.as_deref(), Some("${NOT_A_PLACEHOLDER}"));
     }
 }

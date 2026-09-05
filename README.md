@@ -329,6 +329,21 @@ from `--env VAR`. It is never accepted as a command-line argument, so it cannot 
 **`--token-env VAR`**, on the command line or saved with `add`, reads the token from the
 environment on every call and beats any saved credential.
 
+**`${VAR}` in the config** does the same for any header, and for a stdio server's
+environment, working directory and command line, and for the URL:
+
+```
+mcpdial add gh --http https://api.githubcopilot.com/mcp/ -H 'Authorization: Bearer ${GITHUB_TOKEN}'
+```
+
+The single quotes matter: they keep the shell from expanding the placeholder before
+`mcpdial` sees it. It is saved as written and read from the environment each time
+the server is dialed, so `servers.json` names the secret without holding it, and `ls
+--no-probe` shows the name, never the value. `${VAR:-default}` supplies a fallback,
+`$$` is a literal `$`, and nothing else is interpreted. A variable that is unset with
+no default is exit 2 before anything is sent. `import` keeps such placeholders from a
+host config, and `add --registry` writes them for what an entry marks as required.
+
 ## Where things live
 
 ```

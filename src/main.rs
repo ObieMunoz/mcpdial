@@ -62,6 +62,7 @@ struct Cli {
     headers: Vec<String>,
 
     /// Env var holding a bearer token; beats any saved credential. With `add`, saved.
+    /// A `${VAR}` in any `-H` header value does the same for that header.
     #[arg(long, global = true, value_name = "VAR")]
     token_env: Option<String>,
 

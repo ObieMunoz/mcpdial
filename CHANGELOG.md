@@ -14,6 +14,10 @@ carries its section from here as its release notes.
   `docker run` line it needs, required environment variables as `${VAR}`
   placeholders, and values the entry leaves to the user from `--arg`.
   `MCPDIAL_REGISTRY` points at a private registry.
+- `${VAR}` and `${VAR:-default}` in a saved server's headers, env, cwd, URL and
+  command line are read from the environment when the server is dialed, so
+  `servers.json` can name a secret without holding it. `$$` is a literal `$`.
+  A variable that is unset, with no default, is exit 2 before anything is sent.
 
 ## [0.1.0] - 2026-09-05
 
