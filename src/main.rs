@@ -123,7 +123,7 @@ enum Cmd {
         #[arg(default_value = "{}")]
         arguments: String,
     },
-    /// Show one tool's name, description, and input schema
+    /// Show one tool's name, description, and input and output schemas
     Schema { target: String, tool: String },
     /// Send any JSON-RPC method
     Raw {
@@ -1008,6 +1008,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 });
             };
             println!("{}", serde_json::to_string_pretty(t).unwrap());
+            if t.get("outputSchema").is_some() {
+                eprintln!("this tool declares an outputSchema: results carry structuredContent");
+            }
             Ok(0)
         }
 

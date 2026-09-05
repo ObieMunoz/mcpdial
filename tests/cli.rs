@@ -30,29 +30,34 @@ fn stateful_http_handshake_session_and_call() {
 
     // What actually went over the wire for that last call.
     let reqs = s.requests.lock().unwrap();
-    let last3 = &reqs[reqs.len() - 3..];
-    assert_eq!(last3[0].json()["method"], "initialize");
+    let last4 = &reqs[reqs.len() - 4..];
+    assert_eq!(last4[0].json()["method"], "initialize");
     assert!(
-        last3[0]
+        last4[0]
             .header("user-agent")
             .unwrap()
             .starts_with("Mozilla/5.0"),
         "browser UA is mandatory"
     );
     assert_eq!(
-        last3[0].header("accept").unwrap(),
+        last4[0].header("accept").unwrap(),
         "application/json, text/event-stream"
     );
-    assert!(last3[0].header("mcp-session-id").is_none());
-    assert_eq!(last3[1].json()["method"], "notifications/initialized");
-    assert!(last3[1].json().get("id").is_none());
+    assert!(last4[0].header("mcp-session-id").is_none());
+    assert_eq!(last4[1].json()["method"], "notifications/initialized");
+    assert!(last4[1].json().get("id").is_none());
     assert_eq!(
-        last3[1].header("mcp-session-id"),
+        last4[1].header("mcp-session-id"),
         Some("sess-1"),
         "session id is echoed back"
     );
-    assert_eq!(last3[2].json()["method"], "tools/call");
-    assert_eq!(last3[2].header("mcp-protocol-version"), Some("2025-06-18"));
+    assert_eq!(last4[2].json()["method"], "tools/call");
+    assert_eq!(last4[2].header("mcp-protocol-version"), Some("2025-06-18"));
+    assert_eq!(
+        last4[3].method, "DELETE",
+        "one-shot commands end the session"
+    );
+    assert_eq!(last4[3].header("mcp-session-id"), Some("sess-1"));
 }
 
 #[test]
@@ -891,6 +896,66 @@ fn shell(
 }
 
 #[test]
+fn http_sessions_are_terminated_on_close() {
+    let s = start(Mode::Stateful);
+    let home = temp_home("session-delete");
+
+    let (_, stderr, code) = shell(&home, &s.url, false, "call add {\"a\":1,\"b\":2}\nquit\n");
+    assert_eq!(code, Some(0), "{stderr}");
+    let deletes: Vec<_> = s
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "DELETE")
+        .cloned()
+        .collect();
+    assert_eq!(deletes.len(), 1, "the shell ends its session, exactly once");
+    assert_eq!(deletes[0].path, "/mcp");
+    assert_eq!(deletes[0].header("mcp-session-id"), Some("sess-1"));
+    assert_eq!(
+        deletes[0].header("mcp-protocol-version"),
+        Some("2025-06-18")
+    );
+    assert!(
+        deletes[0]
+            .header("user-agent")
+            .unwrap()
+            .starts_with("Mozilla/5.0"),
+        "the same client that sent the POSTs"
+    );
+
+    let o = run(mcpdial(&home).args(["-v", "call", &s.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("-> DELETE"), "{}", o.stderr);
+
+    let refuses = start(Mode::StatefulNoDelete);
+    let o = run(mcpdial(&home).args(["call", &refuses.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "The sum of 1 and 1 is 2.");
+    assert_eq!(o.stderr, "", "a 405 never reaches the user");
+    assert!(refuses
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "DELETE"));
+
+    let stateless = start(Mode::Stateless);
+    let o = run(mcpdial(&home).args(["call", &stateless.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        !stateless
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "DELETE"),
+        "a stateless server never issued a session to end"
+    );
+}
+
+#[test]
 fn import_reads_host_configs() {
     let home = temp_home("import");
     let echo = echo_server().display().to_string();
@@ -1043,6 +1108,60 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
 }
 
 #[test]
+fn the_protocol_version_header_rides_every_request_after_initialize() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("protocol-version");
+
+    let o = run(mcpdial(&home).args(["tools", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", r#"{"message":"hi"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+
+    let reqs = s.requests.lock().unwrap();
+    assert!(
+        reqs.iter().all(|r| r.header("mcp-session-id").is_none()),
+        "a stateless server hands out no session id"
+    );
+    for r in reqs.iter() {
+        let msg = r.json();
+        let method = msg["method"].as_str().unwrap_or_default();
+        let sent = r.header("mcp-protocol-version");
+        if method == "initialize" {
+            assert_eq!(sent, None, "nothing is negotiated yet on initialize");
+        } else {
+            assert_eq!(sent, Some("2025-06-18"), "missing on {method}");
+        }
+    }
+    for method in ["tools/list", "tools/call"] {
+        assert!(
+            reqs.iter().any(|r| r.json()["method"] == method),
+            "{method} never reached the server"
+        );
+    }
+}
+
+#[test]
+fn the_version_on_the_wire_is_the_one_the_server_agreed_to() {
+    let s = start(Mode::OlderProtocol);
+    let home = temp_home("older-protocol");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", r#"{"message":"hi"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+
+    let reqs = s.requests.lock().unwrap();
+    let after_the_handshake = &reqs[1..];
+    assert!(!after_the_handshake.is_empty());
+    for r in after_the_handshake {
+        assert_eq!(
+            r.header("mcp-protocol-version"),
+            Some("2024-11-05"),
+            "{}",
+            r.body
+        );
+    }
+}
+
+#[test]
 fn stdio_answers_what_the_server_asks_mid_call() {
     let home = temp_home("ping");
     let target = format!("stdio:{}", echo_server().display());
@@ -1115,4 +1234,44 @@ fn completion_scripts_for_every_shell() {
     let o = run(mcpdial(&home).args(["--help"]));
     assert_eq!(o.code, 0);
     assert!(!o.stdout.contains("completions"), "{}", o.stdout);
+}
+
+#[test]
+fn a_structured_only_result_still_prints() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("structured");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "reading"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["celsius"], 20, "{}", o.stdout);
+
+    let o = run(mcpdial(&home).args(["--json", "call", &s.url, "reading"]));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["structuredContent"]["celsius"], 20);
+}
+
+#[test]
+fn content_blocks_win_over_structured_content() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("both-shapes");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "add", r#"{"a":1,"b":2}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "The sum of 1 and 2 is 3.");
+}
+
+#[test]
+fn schema_shows_an_output_schema_and_names_it() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("output-schema");
+
+    let o = run(mcpdial(&home).args(["schema", &s.url, "add"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["outputSchema"]["required"][0], "sum");
+    assert!(o.stderr.contains("structuredContent"), "{}", o.stderr);
+
+    let o = run(mcpdial(&home).args(["schema", &s.url, "echo"]));
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
 }

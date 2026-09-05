@@ -12,6 +12,10 @@ use std::time::Duration;
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                               (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
+/// Deliberately not `--timeout`: this runs from a `Drop` on the way out, where a
+/// server that will not answer promptly is not worth waiting for.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct HttpTransport {
     url: String,
     token: Option<String>,
@@ -22,6 +26,10 @@ pub struct HttpTransport {
     /// Set by stateful servers on `initialize`; echoed on every later request.
     /// Stateless servers never send one and we simply never echo one.
     pub session_id: Option<String>,
+    /// Set once `initialize` has answered. Its presence is also the handshake flag:
+    /// the spec puts `MCP-Protocol-Version` on every request after initialization
+    /// and none on `initialize` itself, which has nothing negotiated yet.
+    negotiated_version: Option<String>,
 }
 
 impl HttpTransport {
@@ -38,6 +46,23 @@ impl HttpTransport {
             extra_headers: Vec::new(),
             log: None,
         }
+    }
+
+    fn identify<A>(&self, mut req: ureq::RequestBuilder<A>) -> ureq::RequestBuilder<A> {
+        req = req.header("User-Agent", &self.user_agent);
+        if let Some(t) = &self.token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        if let Some(version) = &self.negotiated_version {
+            req = req.header("MCP-Protocol-Version", version);
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+        req
     }
 }
 
@@ -89,6 +114,7 @@ impl HttpTransportBuilder {
             agent: ureq::Agent::new_with_config(config),
             log: self.log.unwrap_or_else(silent),
             session_id: None,
+            negotiated_version: None,
         }
     }
 }
@@ -104,29 +130,28 @@ pub fn redirect_error(url: &str, status: u16, location: Option<&str>) -> Error {
     }
 }
 
+/// The version the server named in its `initialize` result, falling back to ours
+/// when it named none. A server may agree to a version other than the one we asked
+/// for, and the header has to carry what it actually replied with.
+fn agreed_version(initialize_reply: Option<&Value>) -> String {
+    initialize_reply
+        .and_then(|msg| msg["result"]["protocolVersion"].as_str())
+        .unwrap_or(PROTOCOL_VERSION)
+        .to_string()
+}
+
 impl Transport for HttpTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
         let body = payload.to_string();
         (self.log)(&format!("-> POST {}\n   {}", self.url, body));
 
-        let mut req = self
-            .agent
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            // Advertise both: the server picks the framing.
-            .header("Accept", "application/json, text/event-stream")
-            .header("User-Agent", &self.user_agent);
-        if let Some(t) = &self.token {
-            req = req.header("Authorization", &format!("Bearer {t}"));
-        }
-        if let Some(sid) = &self.session_id {
-            req = req
-                .header("Mcp-Session-Id", sid)
-                .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        }
-        for (k, v) in &self.extra_headers {
-            req = req.header(k, v);
-        }
+        let req = self.identify(
+            self.agent
+                .post(&self.url)
+                .header("Content-Type", "application/json")
+                // Advertise both: the server picks the framing.
+                .header("Accept", "application/json, text/event-stream"),
+        );
 
         let mut resp = req.send(&body).map_err(|e| match e {
             ureq::Error::Timeout(_) => {
@@ -169,6 +194,38 @@ impl Transport for HttpTransport {
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
-        decode_body(&text, &content_type)
+        let reply = decode_body(&text, &content_type)?;
+        if payload["method"] == "initialize" {
+            self.negotiated_version = Some(agreed_version(reply.as_ref()));
+        }
+        Ok(reply)
+    }
+
+    /// End the session server-side, as Streamable HTTP prescribes; without it the
+    /// server holds it until its own timeout, long after the user has gone.
+    ///
+    /// Runs from `Session::drop`, so no outcome may reach the user: a `405` is the
+    /// server declining client-side termination, which the spec allows, and any
+    /// other error is a session we cannot tidy up on the way out anyway.
+    fn close(&mut self) {
+        let Some(sid) = self.session_id.clone() else {
+            return;
+        };
+        let req = self.identify(
+            self.agent
+                .delete(&self.url)
+                .config()
+                .timeout_global(Some(CLOSE_TIMEOUT))
+                .build(),
+        );
+        // After `identify` has read it into the header, before the request goes
+        // out: a second close then finds no session and sends nothing.
+        self.session_id = None;
+
+        (self.log)(&format!("-> DELETE {} (session {sid})", self.url));
+        match req.call() {
+            Ok(resp) => (self.log)(&format!("<- HTTP {}", resp.status().as_u16())),
+            Err(e) => (self.log)(&format!("<- session {sid} not terminated: {e}")),
+        }
     }
 }

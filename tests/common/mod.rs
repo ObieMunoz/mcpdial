@@ -21,6 +21,8 @@ pub enum Mode {
     Stateful,
     /// Plain JSON replies, no session.
     Stateless,
+    /// Stateless, and the initialize result names a version other than the client's.
+    OlderProtocol,
     /// 401 with a challenge unless a valid bearer token is presented.
     Auth { tokens: Vec<String> },
     /// Like `Auth`, but registration refuses http://127.0.0.1 (Doorkeeper's default
@@ -30,10 +32,13 @@ pub enum Mode {
     Blocked,
     /// Hands back the same `nextCursor` on every `tools/list`.
     StuckCursor,
+    /// Stateful, but answers `405` to the session-terminating `DELETE`.
+    StatefulNoDelete,
 }
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
@@ -105,6 +110,7 @@ pub fn start(mode: Mode) -> FakeServer {
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
                 let rec = Recorded {
+                    method: req.method().as_str().to_string(),
                     path: req.url().to_string(),
                     headers: req
                         .headers()
@@ -304,6 +310,22 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
+    let stateful = matches!(mode, Mode::Stateful | Mode::StatefulNoDelete);
+
+    if rec.method == "DELETE" {
+        if matches!(mode, Mode::StatefulNoDelete) {
+            return Response::from_string("").with_status_code(405);
+        }
+        if stateful && rec.header("mcp-session-id") != Some("sess-1") {
+            return json_resp(
+                400,
+                &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}),
+            );
+        }
+        state.lock().unwrap().initialized = false;
+        return Response::from_string("").with_status_code(204);
+    }
+
     let msg = rec.json();
     let Some(id) = msg.get("id").cloned() else {
         // A notification. Remember that the client finished the handshake.
@@ -313,7 +335,6 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("").with_status_code(202);
     };
     let method = msg["method"].as_str().unwrap_or("");
-    let stateful = matches!(mode, Mode::Stateful);
 
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
@@ -331,9 +352,13 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     }
 
     let params = &msg["params"];
+    let agreed_version = match mode {
+        Mode::OlderProtocol => "2024-11-05",
+        _ => "2025-06-18",
+    };
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
-            "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+            "protocolVersion":agreed_version,"capabilities":{"tools":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
@@ -345,7 +370,11 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
                     params["arguments"]["a"].as_f64().unwrap_or(0.0),
                     params["arguments"]["b"].as_f64().unwrap_or(0.0),
                 );
-                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}]}})
+                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}],"structuredContent":{"sum": a + b}}})
+            }
+            // Left out of tools/list on purpose: a third tool renumbers every listing assertion.
+            "reading" => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"celsius":20},"isError":false}})
             }
             "fail" => {
                 json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}})
@@ -388,7 +417,8 @@ fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
     let echo = json!({"name":"echo","description":"Echo a message back.\nSecond line.",
         "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}});
     let add = json!({"name":"add","description":"Add two numbers.",
-        "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}});
+        "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]},
+        "outputSchema":{"type":"object","properties":{"sum":{"type":"number"}},"required":["sum"]}});
     match cursor {
         None => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[echo],"nextCursor":"page-2"}}),
         Some("page-2") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[add]}}),
