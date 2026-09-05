@@ -497,6 +497,13 @@ pub fn echo_server() -> PathBuf {
         .expect("examples/echo_server not built; run `cargo build --examples` first")
 }
 
+/// The same path as a command line for `--stdio` or a `stdio:` target. Those go
+/// through POSIX word splitting on every platform, so a Windows path spends its
+/// backslashes as escapes unless it is quoted.
+pub fn echo_command() -> String {
+    format!("'{}'", echo_server().display())
+}
+
 pub struct Out {
     pub code: i32,
     pub stdout: String,

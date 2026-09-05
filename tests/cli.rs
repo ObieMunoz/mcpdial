@@ -1,6 +1,6 @@
 mod common;
 
-use common::{echo_server, mcpdial, run, start, temp_home, Mode};
+use common::{echo_command, echo_server, mcpdial, run, start, temp_home, Mode};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
@@ -211,7 +211,7 @@ fn blocked_403_is_not_blamed_on_the_token() {
 #[test]
 fn stdio_adhoc_call_and_timeout() {
     let home = temp_home("stdio");
-    let target = format!("stdio:{}", echo_server().display());
+    let target = format!("stdio:{}", echo_command());
 
     let o = run(mcpdial(&home).args(["call", &target, "echo", r#"{"message":"over a pipe"}"#]));
     assert_eq!(o.code, 0, "{}", o.stderr);
@@ -231,10 +231,12 @@ fn stdio_adhoc_call_and_timeout() {
     assert!(o.stderr.contains("no reply after"), "{}", o.stderr);
 
     // A server that dies on startup explains itself: exit status plus its stderr.
-    let o = run(mcpdial(&home).args([
-        "info",
-        "stdio:/bin/sh -c 'echo npm error 404 Not Found >&2; exit 3'",
-    ]));
+    let dies_on_startup = if cfg!(windows) {
+        "stdio:cmd /C 'echo npm error 404 Not Found 1>&2 & exit 3'"
+    } else {
+        "stdio:/bin/sh -c 'echo npm error 404 Not Found >&2; exit 3'"
+    };
+    let o = run(mcpdial(&home).args(["info", dies_on_startup]));
     assert_eq!(o.code, 1);
     assert!(o.stderr.contains("exited with status 3"), "{}", o.stderr);
     assert!(
@@ -263,7 +265,7 @@ fn saved_servers_and_status_listing() {
     });
     let blocked = start(Mode::Blocked);
     let home = temp_home("ls");
-    let echo = echo_server().display().to_string();
+    let echo = echo_command();
 
     assert_eq!(
         run(mcpdial(&home).args(["add", "web", "--http", &http.url])).code,
@@ -688,7 +690,7 @@ fn extra_headers_are_sent_and_saved() {
 #[test]
 fn stdio_env_and_cwd_are_passed_to_the_process() {
     let home = temp_home("env");
-    let echo = echo_server().display().to_string();
+    let echo = echo_command();
     let o = run(mcpdial(&home).args([
         "add",
         "tagged",
@@ -697,7 +699,7 @@ fn stdio_env_and_cwd_are_passed_to_the_process() {
         "--env",
         "ECHO_SERVER_TAG=hello",
         "--cwd",
-        "/",
+        home.to_str().unwrap(),
     ]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let o = run(mcpdial(&home).args(["info", "tagged"]));
@@ -714,7 +716,7 @@ fn stdio_env_and_cwd_are_passed_to_the_process() {
 #[test]
 fn shell_keeps_one_session_alive() {
     let home = temp_home("shell");
-    let target = format!("stdio:{}", echo_server().display());
+    let target = format!("stdio:{}", echo_command());
 
     // Separate invocations are separate processes: the counter never gets past 1.
     for _ in 0..2 {
@@ -785,7 +787,7 @@ fn shell_keeps_one_session_alive() {
 #[test]
 fn shell_explains_the_shape_it_expected() {
     let home = temp_home("shell-hints");
-    let target = format!("stdio:{}", echo_server().display());
+    let target = format!("stdio:{}", echo_command());
     let script = concat!(
         "echo\n",                            // a tool name typed as if it were a command
         "call echo\n",                       // a required argument left out
@@ -1110,7 +1112,7 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
 #[test]
 fn stdio_answers_what_the_server_asks_mid_call() {
     let home = temp_home("ping");
-    let target = format!("stdio:{}", echo_server().display());
+    let target = format!("stdio:{}", echo_command());
 
     // In this mode the server interrupts `tools/call` with a notification, a
     // `ping`, and a request we do not serve, and finishes the call only once both
