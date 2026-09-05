@@ -1622,9 +1622,16 @@ fn a_remembered_status_shows_its_age_until_the_ttl_runs_out() {
         "an expired status was reused"
     );
 
+    // A separate process from the one that probed, so the clock may have
+    // ticked over since; on a slow runner it does.
     let o = run(mcpdial(&home).args(["--timeout", "5", "ls"]));
     let row = o.stdout.lines().find(|l| l.starts_with("web")).unwrap();
-    assert!(row.contains("now"), "{}", o.stdout);
+    let age = row.split_whitespace().nth(3).unwrap();
+    let just_taken = age == "now"
+        || age
+            .strip_suffix('s')
+            .is_some_and(|n| n.parse::<u64>().is_ok_and(|n| n < 30));
+    assert!(just_taken, "{}", o.stdout);
 
     let o = run(mcpdial(&home).args(["ls", "--refresh", "--no-probe"]));
     assert_eq!(o.code, 2, "{}", o.stdout);
