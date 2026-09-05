@@ -85,6 +85,14 @@ pub struct Credential {
     /// Dynamically registered client id, reused on the next login to the same issuer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Secret of a confidential client registered out of band. Kept so a refresh can
+    /// authenticate on its own; the file it lives in is mode 0600.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// How that secret is presented: "client_secret_post" or "client_secret_basic".
+    /// Refresh does no discovery, so the choice made at login has to survive with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
     /// The loopback port the client id was registered with; the redirect URI must match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_port: Option<u16>,
