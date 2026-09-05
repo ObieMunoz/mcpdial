@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use mcpdial::client::{self, describe_params, Options, Probe, Status};
+use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::{oauth, Credential, Error, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read, Write};
@@ -22,7 +22,7 @@ const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 examples:
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
   mcpdial add fs --stdio \"npx -y @modelcontextprotocol/server-filesystem /tmp\"
-  mcpdial ls                      # every saved server with its live status
+  mcpdial ls                      # every saved server with its status and its age
   mcpdial tools                   # every tool on every server
   mcpdial login work              # one-time browser step; the token is saved
   mcpdial call wiki read_wiki_structure '{\"repoName\":\"modelcontextprotocol/servers\"}'
@@ -100,11 +100,14 @@ enum Cmd {
     Shell { target: String },
     /// Forget a server and any credential saved for it
     Rm { name: String },
-    /// List saved servers with their live connection status
+    /// List saved servers with their connection status
     Ls {
         /// Do not connect; just show the configuration
         #[arg(long)]
         no_probe: bool,
+        /// Dial every server again instead of reusing a status from the last few minutes
+        #[arg(long, conflicts_with = "no_probe")]
+        refresh: bool,
     },
     /// Show the tools a server offers (every server when no target is given)
     Tools {
@@ -1035,7 +1038,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             }
         }
 
-        Cmd::Ls { no_probe } => {
+        Cmd::Ls { no_probe, refresh } => {
             if no_probe {
                 let servers = store.servers()?;
                 let creds = store.credentials()?;
@@ -1069,43 +1072,36 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
                 return Ok(0);
             }
-            let probes = client::probe_all(&store, &opts, true)?;
+            let freshness = if refresh {
+                client::Freshness::Live
+            } else {
+                client::Freshness::Remembered
+            };
+            let listing = client::listing(&store, &opts, freshness)?;
             if cli.json {
-                let rows: Vec<Value> = probes
-                    .iter()
-                    .map(|p| {
-                        let mut v = serde_json::to_value(p).unwrap();
-                        if let Some(t) = &p.tools {
-                            v["tools"] = json!(t.len());
-                        }
-                        v
-                    })
-                    .collect();
-                println!("{}", serde_json::to_string_pretty(&rows).unwrap());
-            } else if probes.is_empty() {
+                println!("{}", serde_json::to_string_pretty(&listing).unwrap());
+            } else if listing.is_empty() {
                 eprintln!("no servers saved yet. Try: mcpdial add wiki --http https://mcp.deepwiki.com/mcp");
             } else {
-                let rows: Vec<Vec<String>> = probes
+                let rows: Vec<Vec<String>> = listing
                     .iter()
-                    .map(|p| {
+                    .map(|l| {
                         vec![
-                            p.name.clone(),
-                            p.kind.into(),
-                            p.status.label(),
-                            auth_label(p),
-                            p.server
+                            l.name.clone(),
+                            l.kind.into(),
+                            l.status.label(),
+                            age_label(l.age_seconds),
+                            auth_label(l),
+                            l.server
                                 .clone()
-                                .or_else(|| p.status.detail().map(truncate))
+                                .or_else(|| l.status.detail().map(truncate))
                                 .unwrap_or_else(|| "-".into()),
-                            p.tools
-                                .as_ref()
-                                .map(|t| t.len().to_string())
-                                .unwrap_or_else(|| "-".into()),
+                            l.tools.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
                         ]
                     })
                     .collect();
                 print_table(
-                    &["NAME", "TYPE", "STATUS", "AUTH", "SERVER", "TOOLS"],
+                    &["NAME", "TYPE", "STATUS", "AGE", "AUTH", "SERVER", "TOOLS"],
                     &rows,
                 );
             }
@@ -1443,13 +1439,21 @@ fn import_candidates() -> Vec<std::path::PathBuf> {
     out
 }
 
-fn auth_label(p: &Probe) -> String {
-    match (p.auth, &p.status) {
+fn auth_label(l: &Listing) -> String {
+    match (l.auth, &l.status) {
         (client::AuthUsed::Env, _) => "env".into(),
         (client::AuthUsed::Saved, _) => "saved".into(),
         (client::AuthUsed::None, Status::AuthRequired) => "needed".into(),
         (client::AuthUsed::None, Status::TokenRejected) => "rejected".into(),
         (client::AuthUsed::None, _) => "-".into(),
+    }
+}
+
+fn age_label(seconds: u64) -> String {
+    match seconds {
+        0 => "now".into(),
+        s if s < 60 => format!("{s}s"),
+        s => format!("{}m", s / 60),
     }
 }
 

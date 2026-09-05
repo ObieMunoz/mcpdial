@@ -1,15 +1,19 @@
 //! Named servers become live sessions here: target resolution, credential
-//! selection and refresh, and the parallel status probe behind `mcpdial ls`.
+//! selection and refresh, and the parallel status probe behind `mcpdial ls` -
+//! whose answers are remembered for [`STATUS_TTL`], so the next listing dials
+//! nothing.
 
-use crate::config::{ServerConfig, Store};
+use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
 use crate::oauth;
 use crate::protocol::{Error, Result};
 use crate::session::Session;
 use crate::transport::http::{HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
 use crate::transport::{Logger, Transport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
 /// Per-invocation knobs that apply to any server.
@@ -96,7 +100,7 @@ pub struct Connection {
     pub auth: AuthUsed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuthUsed {
     None,
@@ -218,7 +222,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
 
 // -- status -------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Status {
     Connected,
@@ -334,9 +338,13 @@ fn classify(e: &Error, had_credential: bool) -> Status {
     }
 }
 
-/// Probe every configured server concurrently, in config order.
-pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<Probe>> {
-    let servers = store.servers()?;
+/// Probe the given servers concurrently, keeping the order they were given in.
+fn probe_each(
+    store: &Store,
+    servers: &[(String, ServerConfig)],
+    opts: &Options,
+    with_tools: bool,
+) -> Vec<Probe> {
     let mut results: Vec<Option<Probe>> = vec![None; servers.len()];
     std::thread::scope(|scope| {
         for (slot, (name, cfg)) in results.iter_mut().zip(servers.iter()) {
@@ -353,7 +361,156 @@ pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<
             scope.spawn(move || *slot = Some(probe(&store, &r, &opts, with_tools)));
         }
     });
-    Ok(results.into_iter().flatten().collect())
+    results.into_iter().flatten().collect()
+}
+
+/// Probe every configured server concurrently, in config order.
+pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<Probe>> {
+    let servers: Vec<(String, ServerConfig)> = store.servers()?.into_iter().collect();
+    Ok(probe_each(store, &servers, opts, with_tools))
+}
+
+// -- listing ------------------------------------------------------------------------
+
+/// How long a remembered status stands in for a live one.
+///
+/// Long enough that a burst of listings costs nothing, short enough that the
+/// answer still describes this sitting at the terminal rather than the last one.
+pub const STATUS_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Whether [`listing`] may answer from the remembered probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// Reuse a status younger than [`STATUS_TTL`]; probe the rest.
+    Remembered,
+    /// Probe every server, whatever was remembered.
+    Live,
+}
+
+/// One row of `mcpdial ls`: a status, and how old that status is.
+#[derive(Debug, Clone, Serialize)]
+pub struct Listing {
+    pub name: String,
+    pub kind: &'static str,
+    pub location: String,
+    pub status: Status,
+    pub auth: AuthUsed,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<usize>,
+    pub checked_at: u64,
+    pub age_seconds: u64,
+}
+
+impl Listing {
+    fn probed(p: &Probe, checked_at: u64) -> Self {
+        Self {
+            name: p.name.clone(),
+            kind: p.kind,
+            location: p.location.clone(),
+            status: p.status.clone(),
+            auth: p.auth,
+            server: p.server.clone(),
+            tools: p.tools.as_ref().map(Vec::len),
+            checked_at,
+            age_seconds: 0,
+        }
+    }
+
+    /// The row a remembered probe stands for, or `None` if this build cannot
+    /// read the status back.
+    fn remembered(name: &str, cfg: &ServerConfig, rec: &ProbeRecord, now: u64) -> Option<Self> {
+        Some(Self {
+            name: name.to_string(),
+            kind: cfg.kind(),
+            location: cfg.location().to_string(),
+            status: serde_json::from_value(rec.status.clone()).ok()?,
+            auth: serde_json::from_value(rec.auth.clone()).ok()?,
+            server: rec.server.clone(),
+            tools: rec.tools,
+            checked_at: rec.checked_at,
+            age_seconds: now.saturating_sub(rec.checked_at),
+        })
+    }
+
+    fn record(&self, key: u64) -> ProbeRecord {
+        ProbeRecord {
+            checked_at: self.checked_at,
+            key,
+            status: serde_json::to_value(&self.status).expect("a status is serializable"),
+            auth: serde_json::to_value(self.auth).expect("an auth is serializable"),
+            server: self.server.clone(),
+            tools: self.tools,
+        }
+    }
+}
+
+/// What each server's status is a status *of*. Edit the server, or save or drop
+/// a credential for it, and what was remembered no longer describes it.
+fn probe_keys(store: &Store, servers: &BTreeMap<String, ServerConfig>) -> BTreeMap<String, u64> {
+    let credentials = store.credentials().unwrap_or_default();
+    servers
+        .iter()
+        .map(|(name, cfg)| {
+            let mut h = DefaultHasher::new();
+            serde_json::to_string(cfg)
+                .expect("a server config is serializable")
+                .hash(&mut h);
+            credentials
+                .get(name)
+                .is_some_and(Credential::has_token)
+                .hash(&mut h);
+            (name.clone(), h.finish())
+        })
+        .collect()
+}
+
+fn still_current(rec: &ProbeRecord, key: u64, now: u64) -> bool {
+    rec.key == key && now.saturating_sub(rec.checked_at) < STATUS_TTL.as_secs()
+}
+
+/// Every saved server with a status, dialing only the ones the remembered
+/// probes cannot answer for.
+pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Vec<Listing>> {
+    let servers = store.servers()?;
+    let keys = probe_keys(store, &servers);
+    let now = now();
+    let remembered = match freshness {
+        Freshness::Remembered => store.probes().unwrap_or_default(),
+        Freshness::Live => BTreeMap::new(),
+    };
+
+    let mut rows: BTreeMap<String, Listing> = BTreeMap::new();
+    let mut cold: Vec<(String, ServerConfig)> = Vec::new();
+    for (name, cfg) in &servers {
+        let usable = remembered
+            .get(name)
+            .filter(|rec| still_current(rec, keys[name], now))
+            .and_then(|rec| Listing::remembered(name, cfg, rec, now));
+        match usable {
+            Some(row) => {
+                rows.insert(name.clone(), row);
+            }
+            None => cold.push((name.clone(), cfg.clone())),
+        }
+    }
+
+    let fresh: Vec<Listing> = probe_each(store, &cold, opts, true)
+        .iter()
+        .map(|p| Listing::probed(p, now))
+        .collect();
+    if !fresh.is_empty() {
+        // A cache that cannot be written is a slow `ls`, not a failed one.
+        let _ = store.save_probes(
+            fresh
+                .iter()
+                .map(|row| (row.name.clone(), row.record(keys[&row.name])))
+                .collect(),
+        );
+    }
+    rows.extend(fresh.into_iter().map(|row| (row.name.clone(), row)));
+    Ok(rows.into_values().collect())
 }
 
 /// Human-readable parameter summary from a tool's JSON schema.
