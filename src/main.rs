@@ -11,6 +11,7 @@ use mcpdial::session::{
 };
 use mcpdial::{oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -138,10 +139,14 @@ enum Cmd {
         #[arg(long)]
         no_probe: bool,
     },
-    /// Import servers from a host's config (Claude Code, Claude Desktop, Cursor, ...)
+    /// Import servers from a host's config (Claude, Cursor, Windsurf, VS Code, Codex, OpenCode)
     Import {
-        /// A JSON file with an `mcpServers` object. Omit to scan the usual locations.
+        /// A host's config: JSON with an `mcpServers`, `servers` (VS Code) or `mcp`
+        /// (OpenCode) object, or Codex's `config.toml`. Omit to scan the usual locations.
         file: Option<std::path::PathBuf>,
+        /// Scan one host's locations only: vscode, codex, opencode, claude, cursor or windsurf
+        #[arg(long, value_name = "HOST", conflicts_with = "file")]
+        from: Option<mcpdial::import_config::Host>,
         /// Overwrite servers that already exist under the same name
         #[arg(long)]
         force: bool,
@@ -1463,23 +1468,24 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Import { file, force } => {
+        Cmd::Import { file, from, force } => {
             let files: Vec<std::path::PathBuf> = match file {
                 Some(f) => vec![f],
-                None => import_candidates()
+                None => mcpdial::import_config::candidates(from)
                     .into_iter()
                     .filter(|p| p.exists())
                     .collect(),
             };
             if files.is_empty() {
                 return Err(Error::usage(
-                    "no config files found; pass a path to a JSON file with an mcpServers object",
+                    "no config files found; pass a path to a host's config file",
                 )
                 .into());
             }
             let existing = store.servers()?;
             let mut imported: Vec<String> = Vec::new();
             let mut skipped: Vec<String> = Vec::new();
+            let mut notes: BTreeMap<String, Vec<String>> = BTreeMap::new();
             // The running commentary is for a human; a program gets one object at the end.
             let say = |line: String| {
                 if !cli.json {
@@ -1489,9 +1495,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             for path in &files {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
-                let doc: Value = serde_json::from_str(&text)
+                let found = mcpdial::import_config::read(path, &text)
                     .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
-                let found = mcpdial::import_config::extract(&doc);
                 if found.is_empty() {
                     say(format!("{}: no servers", path.display()));
                     continue;
@@ -1514,8 +1519,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 f.scope,
                                 path.display()
                             ));
-                            if let Some(n) = f.note {
+                            for n in &f.notes {
                                 say(format!("       note: {n}"));
+                            }
+                            if !f.notes.is_empty() {
+                                notes.insert(f.name.clone(), f.notes);
                             }
                             imported.push(f.name);
                         }
@@ -1527,7 +1535,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
             }
             if cli.json {
-                println!("{}", json!({ "imported": imported, "skipped": skipped }));
+                let mut receipt = json!({ "imported": imported, "skipped": skipped });
+                if !notes.is_empty() {
+                    receipt["notes"] = json!(notes);
+                }
+                println!("{receipt}");
             } else {
                 eprintln!("imported {} server(s)", imported.len());
             }
@@ -2369,28 +2381,6 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
     }
-}
-
-/// Where hosts keep their `mcpServers` config, most specific first.
-fn import_candidates() -> Vec<std::path::PathBuf> {
-    let mut out = vec![std::path::PathBuf::from(".mcp.json")];
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        out.push(home.join(".claude.json"));
-        out.push(home.join(".cursor/mcp.json"));
-        out.push(home.join(".codeium/windsurf/mcp_config.json"));
-        if cfg!(target_os = "macos") {
-            out.push(home.join("Library/Application Support/Claude/claude_desktop_config.json"));
-        } else if cfg!(target_os = "windows") {
-            if let Some(appdata) = std::env::var_os("APPDATA") {
-                out.push(
-                    std::path::PathBuf::from(appdata).join("Claude/claude_desktop_config.json"),
-                );
-            }
-        } else {
-            out.push(home.join(".config/Claude/claude_desktop_config.json"));
-        }
-    }
-    out
 }
 
 const LISTING_HEADERS: [&str; 7] = ["NAME", "TYPE", "STATUS", "AGE", "AUTH", "SERVER", "TOOLS"];

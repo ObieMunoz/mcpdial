@@ -121,7 +121,7 @@ mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-
 mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--timeout SECS] [--force] [--no-probe]
 mcpdial add NAME --catalog ID    one entry of the reviewed catalog; `mcpdial catalog` lists them
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
-mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
+mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor, Windsurf, VS Code, Codex, OpenCode configs
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 
@@ -233,9 +233,30 @@ input is read plainly, exactly as before, so scripts are unaffected.
 
 `mcpdial import` reads the `mcpServers` shape that Claude Code, Claude Desktop, Cursor,
 and Windsurf all use, including the per-project entries nested in `~/.claude.json`, and
-saves each server under its existing name. With no file argument it scans the usual
-locations. `command` plus `args` become one stdio command line, `env` and `cwd` are
-kept, and `url` plus `headers` become an HTTP server. Nothing else in those files is read.
+saves each server under its existing name. It also reads VS Code's `mcp.json`, where
+the object is called `servers`, Codex's `config.toml` with its `[mcp_servers.NAME]`
+tables, and OpenCode's `opencode.json` with its `mcp` object. With no file argument it
+scans the usual locations: `.mcp.json` and `.vscode/mcp.json` in the current
+directory, then `~/.claude.json`, Cursor, Windsurf, `~/.codex/config.toml`,
+`~/.config/opencode/opencode.json`, and the Claude Desktop and VS Code user files
+where each platform keeps them. `--from vscode|codex|opencode|claude|cursor|windsurf`
+scans one host's locations alone, for when two hosts use the same name for different
+servers. `command` plus `args` become one stdio command line, `env` and `cwd` are kept,
+and `url` plus `headers` become an HTTP server; Codex's `bearer_token_env_var` is saved
+as `token_env`. Nothing else in those files is read.
+
+VS Code's `${input:ID}` references, which the editor prompts for, are saved as
+`${MCPDIAL_INPUT_ID}` placeholders (the id uppercased, anything but letters and digits
+as `_`), and a note names each variable to set before dialing; nothing is prompted for
+and no secret is written. A server's `envFile` is opened only to learn its keys: each
+becomes a `${KEY}` placeholder in the saved `env`, the note lists them, and the values
+stay in the file. Under `--json` the notes ride in the receipt under `notes`, keyed by
+server name.
+
+Codex's `config.toml` is read by a small reader of its own rather than a full TOML
+parser: tables, dotted keys, strings, arrays, inline tables, booleans, numbers and
+comments, which is everything a server entry uses. A multi-line string, an array of
+tables or a date in the file is refused with its line number rather than misread.
 
 ### Adding from the catalog
 

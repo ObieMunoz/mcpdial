@@ -133,7 +133,7 @@ one object on stdout instead, so nothing has to be confirmed by parsing a senten
 ```
 mcpdial add NAME ... --json      {"saved":{"name":"x","kind":"http","location":"https://u/mcp",...}}
 mcpdial rm NAME --json           {"removed":"x"}
-mcpdial import FILE --json       {"imported":["a","b"],"skipped":["c"]}
+mcpdial import FILE --json       {"imported":["a","b"],"skipped":["c"],"notes":{"a":["..."]}}
 mcpdial login TARGET --json      {"login":{"name":"x","expires_at":1760000000,"refreshable":true,"registration":"dynamic"}}
 mcpdial logout TARGET --json     {"removed_credential":"x"}     null when none was saved
 mcpdial token set NAME --json    {"saved_credential":"x"}
