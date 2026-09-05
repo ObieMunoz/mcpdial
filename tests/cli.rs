@@ -76,7 +76,85 @@ fn stateless_http_and_json_output() {
 
     let o = run(mcpdial(&home).args(["raw", &s.url, "tools/list"]));
     assert_eq!(o.code, 0);
-    assert!(o.stdout.contains("\"name\": \"add\""));
+    assert!(o.stdout.contains("\"name\": \"echo\""));
+    assert!(o.stdout.contains("\"nextCursor\""), "{}", o.stdout);
+}
+
+#[test]
+fn tool_lists_are_merged_across_pages() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("paged");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "paged", "--http", &s.url])).code,
+        0
+    );
+
+    let o = run(mcpdial(&home).args(["tools", "paged"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.starts_with("2 tool(s):"), "{}", o.stdout);
+    assert!(
+        o.stdout.contains("echo") && o.stdout.contains("add"),
+        "both pages: {}",
+        o.stdout
+    );
+
+    let pages: Vec<Value> = s
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.json())
+        .filter(|m| m["method"] == "tools/list")
+        .collect();
+    assert_eq!(pages.len(), 2, "{pages:?}");
+    assert!(pages[0]["params"].get("cursor").is_none());
+    assert_eq!(pages[1]["params"]["cursor"], "page-2");
+
+    let o = run(mcpdial(&home).args(["--json", "tools", "paged"]));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    let names: Vec<&str> = v["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["echo", "add"]);
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let rows: Vec<Value> = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(rows[0]["tools"], 2, "{}", o.stdout);
+
+    let tool_from_the_second_page = "add";
+    let o = run(mcpdial(&home).args(["schema", "paged", tool_from_the_second_page]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o = run(mcpdial(&home).args([
+        "call",
+        "paged",
+        tool_from_the_second_page,
+        r#"{"a":1,"b":2}"#,
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "The sum of 1 and 2 is 3.");
+}
+
+#[test]
+fn a_repeating_cursor_stops_instead_of_looping() {
+    let s = start(Mode::StuckCursor);
+    let home = temp_home("stuck");
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "tools", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.starts_with("2 tool(s):"), "{}", o.stdout);
+
+    let pages = s
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.json()["method"] == "tools/list")
+        .count();
+    assert_eq!(pages, 2, "stopped the moment the cursor repeated");
 }
 
 #[test]

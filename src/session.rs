@@ -5,6 +5,11 @@ use crate::protocol::{
 };
 use crate::transport::Transport;
 use serde_json::{json, Value};
+use std::collections::HashSet;
+
+/// Backstop for a server that mints a fresh cursor forever, which the
+/// repeated-cursor check below cannot catch.
+const MAX_PAGES: usize = 1000;
 
 pub struct Session<T: Transport> {
     pub transport: T,
@@ -54,13 +59,34 @@ impl<T: Transport> Session<T> {
         Ok(&self.server_info)
     }
 
+    /// Every `*/list` method answers with items under `key` and an optional
+    /// `nextCursor`, handed back as `{"cursor": "..."}`. Stopping at the first page
+    /// loses the rest with no error: a tool that is really there reads as unknown.
+    pub fn list_paginated(&mut self, method: &str, key: &str) -> Result<Vec<Value>> {
+        let mut items: Vec<Value> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut cursor: Option<String> = None;
+
+        for _ in 0..MAX_PAGES {
+            let params = cursor.take().map(|c| json!({ "cursor": c }));
+            let mut res = self.request(method, params)?;
+            if let Some(page) = res.get_mut(key).and_then(Value::as_array_mut) {
+                items.append(page);
+            }
+            let cursor_to_a_further_page = res
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|c| !c.is_empty());
+            match cursor_to_a_further_page {
+                Some(c) if seen.insert(c.to_string()) => cursor = Some(c.to_string()),
+                _ => break,
+            }
+        }
+        Ok(items)
+    }
+
     pub fn list_tools(&mut self) -> Result<Vec<Value>> {
-        let mut res = self.request("tools/list", None)?;
-        Ok(res
-            .get_mut("tools")
-            .and_then(|t| t.as_array_mut())
-            .map(std::mem::take)
-            .unwrap_or_default())
+        self.list_paginated("tools/list", "tools")
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
@@ -159,6 +185,87 @@ mod tests {
         assert_eq!(render_content(&r), "hi");
         assert_eq!(s.transport.sent[1]["id"], 2);
         assert_eq!(s.transport.sent[1]["params"]["name"], "a");
+    }
+
+    #[test]
+    fn a_paginated_list_is_read_to_the_end() {
+        let mut s = fake(vec![
+            Some(
+                json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"nextCursor":"c1"}}),
+            ),
+            Some(
+                json!({"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"b"}],"nextCursor":"c2"}}),
+            ),
+            Some(json!({"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"c"}]}})),
+        ]);
+        let names: Vec<String> = s
+            .list_tools()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["a", "b", "c"], "pages arrive in order");
+
+        let sent = &s.transport.sent;
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent[0].get("params").is_none(),
+            "no cursor on the first page"
+        );
+        assert_eq!(sent[1]["params"]["cursor"], "c1");
+        assert_eq!(sent[2]["params"]["cursor"], "c2");
+    }
+
+    #[test]
+    fn the_helper_works_for_any_list_method() {
+        let mut s = fake(vec![
+            Some(
+                json!({"jsonrpc":"2.0","id":1,"result":{"prompts":[{"name":"a"}],"nextCursor":"c1"}}),
+            ),
+            Some(json!({"jsonrpc":"2.0","id":2,"result":{"prompts":[{"name":"b"}]}})),
+        ]);
+        let got = s.list_paginated("prompts/list", "prompts").unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(s.transport.sent[1]["method"], "prompts/list");
+    }
+
+    #[test]
+    fn an_empty_or_null_cursor_ends_the_list() {
+        for last in [json!(""), Value::Null] {
+            let mut s = fake(vec![Some(
+                json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"nextCursor":last}}),
+            )]);
+            assert_eq!(s.list_tools().unwrap().len(), 1);
+            assert_eq!(s.transport.sent.len(), 1, "asked once and stopped");
+        }
+    }
+
+    #[test]
+    fn a_repeated_cursor_stops_the_loop() {
+        let stuck =
+            json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"nextCursor":"same"}});
+        let mut s = fake(vec![Some(stuck); 10]);
+        assert_eq!(s.list_tools().unwrap().len(), 2);
+        assert_eq!(
+            s.transport.sent.len(),
+            2,
+            "the second page repeats a cursor we have already followed"
+        );
+    }
+
+    #[test]
+    fn endless_fresh_cursors_stop_at_the_page_cap() {
+        struct Endless(u64);
+        impl Transport for Endless {
+            fn send(&mut self, _payload: &Value) -> Result<Option<Value>> {
+                self.0 += 1;
+                Ok(Some(json!({"jsonrpc":"2.0","id":self.0,"result":{
+                    "tools":[{"name":format!("t{}", self.0)}],
+                    "nextCursor":format!("c{}", self.0)}})))
+            }
+        }
+        let mut s = Session::new(Endless(0));
+        assert_eq!(s.list_tools().unwrap().len(), MAX_PAGES);
     }
 
     #[test]
