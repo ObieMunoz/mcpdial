@@ -117,8 +117,8 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 ## Commands
 
 ```
-mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V]
-mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V]
+mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V] [--force] [--no-probe]
+mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--force] [--no-probe]
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
 mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
 mcpdial rm NAME

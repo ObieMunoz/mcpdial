@@ -441,6 +441,17 @@ impl Store {
         file.probes.retain(|name, _| saved.contains_key(name));
         write_json(&path, &file, false)
     }
+
+    /// Drop what was remembered about one server, for when it is replaced.
+    pub fn forget_probe(&self, name: &str) -> Result<()> {
+        let path = self.probes_path();
+        let _lock = FileLock::acquire(&path)?;
+        let mut file = read_json::<ProbesFile>(&path)?;
+        if file.probes.remove(name).is_some() {
+            write_json(&path, &file, false)?;
+        }
+        Ok(())
+    }
 }
 
 fn validate_name(name: &str) -> Result<()> {

@@ -97,7 +97,7 @@ fn tool_lists_are_merged_across_pages() {
     let s = start(Mode::Stateless);
     let home = temp_home("paged");
     assert_eq!(
-        run(mcpdial(&home).args(["add", "paged", "--http", &s.url])).code,
+        run(mcpdial(&home).args(["add", "paged", "--http", &s.url, "--no-probe"])).code,
         0
     );
 
@@ -332,7 +332,8 @@ fn saved_servers_and_status_listing() {
             "--http",
             &auth.url,
             "--token-env",
-            "FAKE_TOKEN"
+            "FAKE_TOKEN",
+            "--no-probe"
         ]))
         .code,
         0
@@ -410,6 +411,11 @@ fn saved_servers_and_status_listing() {
 /// Run `login` with no browser, scrape the auth URL from stderr, and play the browser
 /// ourselves: the fake authorization server 302s straight back to the loopback callback.
 fn drive_login(home: &std::path::Path, target: &str, extra: &[&str]) -> String {
+    drive_login_out(home, target, extra).0
+}
+
+/// [`drive_login`], handing back stderr and then whatever went to stdout.
+fn drive_login_out(home: &std::path::Path, target: &str, extra: &[&str]) -> (String, String) {
     let mut child = mcpdial(home)
         .args(["login", target, "--no-browser"])
         .args(extra)
@@ -456,10 +462,10 @@ fn drive_login(home: &std::path::Path, target: &str, extra: &[&str]) -> String {
         .read_to_string()
         .unwrap()
         .contains("close this tab"));
-    let status = child.wait().unwrap();
+    let out = child.wait_with_output().unwrap();
     let log = drain.join().unwrap();
-    assert!(status.success(), "login exited {status}:\n{log}");
-    log
+    assert!(out.status.success(), "login exited {}:\n{log}", out.status);
+    (log, String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[test]
@@ -621,7 +627,7 @@ fn oauth_login_saves_a_token_and_refreshes_it() {
     let o = run(mcpdial(&home).args(["ls"]));
     assert!(o.stdout.contains("auth required"), "{}", o.stdout);
     let o = run(mcpdial(&home).args(["token", "show", "work"]));
-    assert_eq!(o.code, 1);
+    assert_eq!(o.code, 2);
 }
 
 #[test]
@@ -1153,6 +1159,116 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
     assert_eq!(lines[1]["error"]["kind"], "rpc");
     assert_eq!(lines[2]["content"][0]["text"], "Echo: two");
     assert_eq!(out.status.code(), Some(1));
+
+    // Under --json every line on either stream is an object: the schema hint
+    // under a failed result, a missing credential, and each mutation's receipt.
+    let objects = |text: &str| -> Vec<Value> {
+        text.lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON ({e}): {l:?}")))
+            .collect()
+    };
+    let local = format!("stdio:{}", echo_command());
+    let o = run(mcpdial(&home).args(["--json", "call", &local, "strict", "{}"]));
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert_eq!(
+        serde_json::from_str::<Value>(&o.stdout).unwrap()["isError"],
+        true
+    );
+    let err = objects(&o.stderr);
+    assert_eq!(err.len(), 1, "{}", o.stderr);
+    assert!(
+        err[0]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("usage: mcpdial call"),
+        "{}",
+        o.stderr
+    );
+
+    let o = run(mcpdial(&home).args(["--json", "token", "show", "nobody"]));
+    assert_eq!(o.code, 2);
+    assert!(o.stdout.is_empty());
+    let err = objects(&o.stderr);
+    assert_eq!(err[0]["error"]["kind"], "config");
+    assert_eq!(err[0]["error"]["message"], "no credential saved for nobody");
+
+    let o = run(mcpdial(&home).args(["--json", "add", "fake", "--http", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+    let out = objects(&o.stdout);
+    assert_eq!(out.len(), 1, "{}", o.stdout);
+    assert_eq!(out[0]["saved"]["name"], "fake");
+    assert_eq!(out[0]["saved"]["kind"], "http");
+    assert_eq!(out[0]["saved"]["location"], s.url);
+    assert_eq!(out[0]["saved"]["status"]["state"], "connected");
+
+    let o = run(mcpdial(&home)
+        .env("TOK", "t")
+        .args(["--json", "token", "set", "fake", "--env", "TOK"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+    assert_eq!(objects(&o.stdout), [json!({"saved_credential": "fake"})]);
+    let o = run(mcpdial(&home).args(["--json", "token", "rm", "fake"]));
+    assert_eq!(objects(&o.stdout), [json!({"removed_credential": "fake"})]);
+    let o = run(mcpdial(&home).args(["--json", "logout", "fake"]));
+    assert_eq!(objects(&o.stdout), [json!({"removed_credential": null})]);
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+
+    let cfg = home.join("import.json");
+    std::fs::write(
+        &cfg,
+        json!({"mcpServers": {
+            "fake": {"type": "http", "url": s.url},
+            "other": {"type": "http", "url": s.url},
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    let o = run(mcpdial(&home).args(["--json", "import", cfg.to_str().unwrap()]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+    assert_eq!(
+        objects(&o.stdout),
+        [json!({"imported": ["other"], "skipped": ["fake"]})]
+    );
+    let o = run(mcpdial(&home).args(["--json", "rm", "other"]));
+    assert_eq!(objects(&o.stdout), [json!({"removed": "other"})]);
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+
+    // login's receipt has the same shape; its progress lines stay prose.
+    let (_, stdout) = drive_login_out(&home, &auth.url, &["--json"]);
+    let out = objects(&stdout);
+    assert_eq!(out.len(), 1, "{stdout}");
+    assert_eq!(out[0]["login"]["name"], auth.url);
+    assert!(out[0]["login"]["expires_at"].is_u64(), "{stdout}");
+    assert_eq!(out[0]["login"]["refreshable"], true);
+
+    // In the shell, info is one line like every other command, and the hint
+    // under a failed result is an object on stderr.
+    let mut child = mcpdial(&home)
+        .args(["--json", "shell", &local])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"info\ncall strict {}\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let lines = objects(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(lines.len(), 2, "{}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(lines[0]["serverInfo"]["name"], "echo-server");
+    assert_eq!(lines[1]["isError"], true);
+    let err = objects(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(err.len(), 1, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(err[0]["hint"]
+        .as_str()
+        .unwrap()
+        .starts_with("usage: call strict"));
 }
 
 #[test]
@@ -1583,7 +1699,7 @@ fn a_warm_listing_spawns_no_stdio_server() {
         echo_server().display()
     );
     assert_eq!(
-        run(mcpdial(&home).args(["add", "local", "--stdio", &command])).code,
+        run(mcpdial(&home).args(["add", "local", "--stdio", &command, "--no-probe"])).code,
         0
     );
     let spawned = || std::fs::read(&spawns).map(|b| b.len()).unwrap_or(0);
@@ -1613,7 +1729,7 @@ fn a_remembered_status_shows_its_age_until_the_ttl_runs_out() {
     let s = start(Mode::Stateless);
     let home = temp_home("age");
     assert_eq!(
-        run(mcpdial(&home).args(["add", "web", "--http", &s.url])).code,
+        run(mcpdial(&home).args(["add", "web", "--http", &s.url, "--no-probe"])).code,
         0
     );
     let dialed = || s.requests.lock().unwrap().len();
@@ -1697,7 +1813,8 @@ fn a_saved_status_does_not_survive_the_server_it_described() {
     );
 
     assert_eq!(
-        run(mcpdial(&home).args(["add", "web", "--http", &second.url])).code,
+        run(mcpdial(&home).args(["add", "web", "--http", &second.url, "--force", "--no-probe"]))
+            .code,
         0
     );
     assert_eq!(
