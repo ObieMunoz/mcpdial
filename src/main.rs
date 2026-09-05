@@ -711,18 +711,26 @@ fn json_kind(v: &Value) -> &'static str {
     }
 }
 
-/// Levenshtein distance, for "did you mean" suggestions.
+/// Damerau-Levenshtein distance (optimal string alignment), for "did you mean"
+/// suggestions: two letters swapped, `ecoh` for `echo`, is one slip of the
+/// fingers, so it counts as one edit.
 fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
+    let mut two_back = vec![0usize; b.len() + 1];
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0usize; b.len() + 1];
-    for (i, ca) in a.chars().enumerate() {
-        cur[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            cur[j + 1] = (prev[j] + usize::from(ca != *cb))
-                .min(prev[j + 1] + 1)
-                .min(cur[j] + 1);
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let substitute = prev[j - 1] + usize::from(a[i - 1] != b[j - 1]);
+            let mut best = substitute.min(prev[j] + 1).min(cur[j - 1] + 1);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(two_back[j - 2] + 1);
+            }
+            cur[j] = best;
         }
+        std::mem::swap(&mut two_back, &mut prev);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
@@ -794,19 +802,28 @@ fn suggest_tool(tools: &[Value], name: &str, tools_cmd: &str) -> Option<String> 
     })
 }
 
-/// The hint that answers "what shape did you want?" after a call went wrong:
-/// the tool's own usage when the tool exists, a near miss when it does not.
+/// The hint that answers "what did you want?" after a call went wrong: a near
+/// miss when the tool does not exist, however the server chose to say so; the
+/// tool's own usage when it does and `argument_error` says the arguments were
+/// the mistake; nothing when the tool simply failed at its job.
 fn call_hint(
     tools: &[Value],
     name: &str,
+    argument_error: bool,
     prefix: &str,
     quote: &str,
     tools_cmd: &str,
 ) -> Option<String> {
     match find_tool(tools, name) {
-        Some(t) => Some(tool_usage(t, prefix, quote)),
+        Some(t) => argument_error.then(|| tool_usage(t, prefix, quote)),
         None => suggest_tool(tools, name, tools_cmd),
     }
+}
+
+/// An answer from the server, as opposed to a line that never got through: only
+/// then is it worth a second request to find out what it would have accepted.
+fn server_refused(e: &Error) -> bool {
+    matches!(e, Error::Rpc { .. })
 }
 
 /// A server error that the tool's schema would have prevented. Any other error
@@ -1148,8 +1165,16 @@ fn shell_call_hint(
     cache: &mut Option<Vec<Value>>,
     conn: &mut client::Connection,
     tool: &str,
+    argument_error: bool,
 ) -> Option<String> {
-    call_hint(shell_tools(cache, conn), tool, "call", "", "`tools`")
+    call_hint(
+        shell_tools(cache, conn),
+        tool,
+        argument_error,
+        "call",
+        "",
+        "`tools`",
+    )
 }
 
 /// Tab completion for the shell: command names in the first word, then whatever
@@ -1732,7 +1757,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             match parse_object(args, "arguments") {
                                 Err(e) => Err(Failure {
                                     error: e,
-                                    hint: shell_call_hint(&mut cache, &mut conn, tool),
+                                    hint: shell_call_hint(&mut cache, &mut conn, tool, true),
                                 }),
                                 Ok(a) => match conn.session.call_tool(tool, a) {
                                     Ok(mut result) => {
@@ -1745,10 +1770,15 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                                 let failed = print_tool_result(
                                                     &result, &out, cli.json, true,
                                                 );
-                                                if failed && reads_as_argument_error(&out) {
-                                                    if let Some(hint) =
-                                                        shell_call_hint(&mut cache, &mut conn, tool)
-                                                    {
+                                                if failed {
+                                                    let argument_error =
+                                                        reads_as_argument_error(&out);
+                                                    if let Some(hint) = shell_call_hint(
+                                                        &mut cache,
+                                                        &mut conn,
+                                                        tool,
+                                                        argument_error,
+                                                    ) {
                                                         print_hint(&hint, cli.json);
                                                     }
                                                 }
@@ -1756,8 +1786,15 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                         )
                                     }
                                     Err(e) => {
-                                        let hint = is_argument_error(&e)
-                                            .then(|| shell_call_hint(&mut cache, &mut conn, tool))
+                                        let hint = server_refused(&e)
+                                            .then(|| {
+                                                shell_call_hint(
+                                                    &mut cache,
+                                                    &mut conn,
+                                                    tool,
+                                                    is_argument_error(&e),
+                                                )
+                                            })
                                             .flatten();
                                         Err(Failure { error: e, hint })
                                     }
@@ -2168,11 +2205,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 )
             })?;
             let mut conn = dial(&store, &opts, &target)?;
-            let usage = |conn: &mut client::Connection| {
+            let hint = |conn: &mut client::Connection, argument_error: bool| {
                 let tools = conn.session.list_tools().unwrap_or_default();
                 call_hint(
                     &tools,
                     &tool,
+                    argument_error,
                     &format!("mcpdial call {}", shell_word(&target)),
                     "'",
                     &format!("`mcpdial tools {}`", shell_word(&target)),
@@ -2180,9 +2218,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             };
             let mut result = match conn.session.call_tool(&tool, arguments) {
                 Ok(result) => result,
-                // The server rejected the arguments; say what it wanted instead.
+                // The server said no; say what it wanted instead.
                 Err(e) => {
-                    let hint = is_argument_error(&e).then(|| usage(&mut conn)).flatten();
+                    let hint = server_refused(&e)
+                        .then(|| hint(&mut conn, is_argument_error(&e)))
+                        .flatten();
                     return Err(Failure { error: e, hint });
                 }
             };
@@ -2192,10 +2232,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             };
             let text = rendered(&mut result, cli.json, &files, render_content)?;
             let is_error = print_tool_result(&result, &text, cli.json, false);
-            // A failed result that is really a schema complaint gets the same
-            // answer as the JSON-RPC error other servers would have sent.
-            if is_error && reads_as_argument_error(&text) {
-                if let Some(hint) = usage(&mut conn) {
+            // A failed result that is really a schema complaint, or a server's way
+            // of saying it has no such tool, gets the same answer as the JSON-RPC
+            // error other servers would have sent.
+            if is_error {
+                if let Some(hint) = hint(&mut conn, reads_as_argument_error(&text)) {
                     print_hint(&hint, cli.json);
                 }
             }
@@ -2668,6 +2709,15 @@ mod tests {
         // Far enough away that a guess would be noise.
         assert_eq!(closest("profile", SHELL_COMMANDS.iter().copied()), None);
         assert_eq!(closest("xyz", ["ab"].into_iter()), None);
+        // Two letters swapped is one slip, not two, even in a short word.
+        assert_eq!(closest("ecoh", ["echo"].into_iter()), Some("echo"));
+        assert_eq!(closest("raed", ["read", "raw"].into_iter()), Some("read"));
+        assert_eq!(edit_distance("ecoh", "echo"), 1);
+        assert_eq!(edit_distance("echo", "echo"), 0);
+        assert_eq!(edit_distance("", "echo"), 4);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        // A transposition is one edit; the letters around it still cost their own.
+        assert_eq!(edit_distance("ca", "abc"), 3);
 
         assert_eq!(shell_word("chrome"), "chrome");
         assert_eq!(shell_word("https://x/mcp"), "https://x/mcp");
