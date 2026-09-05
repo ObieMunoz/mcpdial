@@ -1,6 +1,8 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use mcpdial::client::{self, describe_params, Options, Probe, Status};
+use mcpdial::protocol::METHOD_NOT_FOUND;
+use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
 use mcpdial::{oauth, Credential, Error, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read, Write};
@@ -125,6 +127,30 @@ enum Cmd {
     },
     /// Show one tool's name, description, and input and output schemas
     Schema { target: String, tool: String },
+    /// Show the resources a server offers, and its URI templates
+    Resources {
+        target: String,
+        /// Show full descriptions and mime types
+        #[arg(short, long)]
+        long: bool,
+    },
+    /// Read one resource. Text goes to stdout; binary needs a redirect
+    Read { target: String, uri: String },
+    /// Show the prompts a server offers
+    Prompts {
+        target: String,
+        /// Show full descriptions and arguments
+        #[arg(short, long)]
+        long: bool,
+    },
+    /// Render a prompt into the messages it expands to
+    Prompt {
+        target: String,
+        name: String,
+        /// JSON object of arguments: inline, @file, or - for stdin
+        #[arg(default_value = "{}")]
+        arguments: String,
+    },
     /// Send any JSON-RPC method
     Raw {
         target: String,
@@ -378,6 +404,14 @@ fn find_tool<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
     tools.iter().find(|t| t["name"] == name)
 }
 
+fn field_values(items: &[Value], key: &str) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|i| i[key].as_str())
+        .map(String::from)
+        .collect()
+}
+
 /// The shape a tool expects: a call that would be well-formed, then one line per
 /// parameter. `prefix` is whatever comes before the tool name in that call, and
 /// `quote` wraps the argument object, which a shell needs quoted and the REPL does not.
@@ -455,6 +489,50 @@ fn reads_as_argument_error(text: &str) -> bool {
     t.contains("-32602") || t.contains("invalid arguments") || t.contains("validation error")
 }
 
+/// A server that never implemented `resources/*` or `prompts/*` answers `-32601`,
+/// which reads as a mistake in the request. Its `initialize` result already listed
+/// what it does implement, so point there instead of at the bare code.
+fn missing_capability(e: Error, capability: &str, info_cmd: &str) -> Failure {
+    let never_implemented = matches!(&e, Error::Rpc { code, .. } if *code == METHOD_NOT_FOUND);
+    if never_implemented {
+        Failure::hinted(
+            e,
+            format!("this server offers no {capability}; {info_cmd} lists what it does offer."),
+        )
+    } else {
+        e.into()
+    }
+}
+
+fn advertises(server_info: &Value, capability: &str) -> bool {
+    server_info["capabilities"].get(capability).is_some()
+}
+
+/// A resource on stdout, byte for byte. Base64 is no use to anyone reading it and
+/// raw bytes corrupt a terminal, so binary asks for a redirect rather than picking
+/// one of those two ways to be useless.
+fn write_resource(bodies: &[ResourceBody], redirect: &str) -> Result<(), Failure> {
+    let stdout = std::io::stdout();
+    let binary = bodies.iter().any(|b| matches!(b, ResourceBody::Bytes(_)));
+    if binary && stdout.is_terminal() {
+        return Err(Failure::hinted(
+            Error::usage("this resource is binary and stdout is a terminal"),
+            format!("send it somewhere it can land: {redirect} > file"),
+        ));
+    }
+    let mut out = stdout.lock();
+    for body in bodies {
+        let bytes = match body {
+            ResourceBody::Text(t) => t.as_bytes(),
+            ResourceBody::Bytes(b) => b.as_slice(),
+        };
+        out.write_all(bytes)
+            .map_err(|e| Failure::from(Error::transport(format!("writing to stdout: {e}"))))?;
+    }
+    out.flush().ok();
+    Ok(())
+}
+
 fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
     items
         .iter()
@@ -469,22 +547,38 @@ fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
         .collect()
 }
 
-const SHELL_COMMANDS: &[&str] = &["tools", "schema", "call", "raw", "info", "help", "quit"];
+const SHELL_COMMANDS: &[&str] = &[
+    "tools",
+    "schema",
+    "call",
+    "resources",
+    "read",
+    "prompts",
+    "prompt",
+    "raw",
+    "info",
+    "help",
+    "quit",
+];
 
-const SHELL_SUMMARY: &str =
-    "commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, raw METHOD, info, help, quit";
+const SHELL_SUMMARY: &str = "commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, \
+     resources, read URI, prompts, prompt NAME, raw METHOD, info, help, quit";
 
 const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
   schema TOOL                one tool's full JSON input schema
   help [TOOL]                this list, or one tool's parameters
   call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
+  resources [--long]         every resource, then every URI template
+  read URI                   one resource's contents
+  prompts [--long]           every prompt this server offers
+  prompt NAME {"arg": "..."} expand a prompt into its messages
   raw METHOD {"json": ...}   send any JSON-RPC method
   info                       the initialize result
   quit                       close the session
 
-At a terminal: Up and Down walk the history, Tab completes commands and tool
-names, and ^C abandons the line being typed."#;
+At a terminal: Up and Down walk the history, Tab completes commands, tool and
+prompt names and resource URIs, and ^C abandons the line being typed."#;
 
 /// The answer to a tool name this server does not have.
 fn no_such_tool(tools: &[Value], name: &str) -> Failure {
@@ -504,11 +598,13 @@ fn shell_call_hint(
     call_hint(shell_tools(cache, conn), tool, "call", "", "`tools`")
 }
 
-/// Tab completion for the shell: command names in the first word, tool names
-/// after the three commands whose one argument is a tool.
+/// Tab completion for the shell: command names in the first word, then whatever
+/// the command that was typed takes as its one argument.
 #[derive(Default)]
 struct ShellHelper {
     tools: Vec<String>,
+    resources: Vec<String>,
+    prompts: Vec<String>,
 }
 
 impl rustyline::completion::Completer for ShellHelper {
@@ -530,6 +626,8 @@ impl rustyline::completion::Completer for ShellHelper {
         let pool: Vec<String> = match before.split_whitespace().collect::<Vec<_>>()[..] {
             [] => SHELL_COMMANDS.iter().map(|c| c.to_string()).collect(),
             ["call" | "schema" | "help"] => self.tools.clone(),
+            ["read"] => self.resources.clone(),
+            ["prompt"] => self.prompts.clone(),
             _ => Vec::new(),
         };
         Ok((
@@ -643,15 +741,13 @@ impl Input {
         }
     }
 
-    /// Offer these tool names to Tab completion.
-    fn set_tools(&mut self, tools: &[Value]) {
+    /// Offer what the session has learned to Tab completion.
+    fn set_completions(&mut self, tools: &[Value], resources: &[Value], prompts: &[Value]) {
         if let Input::Tty { editor, .. } = self {
             if let Some(helper) = editor.helper_mut() {
-                helper.tools = tools
-                    .iter()
-                    .filter_map(|t| t["name"].as_str())
-                    .map(String::from)
-                    .collect();
+                helper.tools = field_values(tools, "name");
+                helper.resources = field_values(resources, "uri");
+                helper.prompts = field_values(prompts, "name");
             }
         }
     }
@@ -822,12 +918,25 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             // tools/list, fetched at most once, so a mistake can be answered with
             // the shape the server actually wants.
             let mut cache: Option<Vec<Value>> = None;
+            let mut resources: Option<Vec<Value>> = None;
+            let mut prompts: Option<Vec<Value>> = None;
             if matches!(input, Input::Tty { .. }) {
                 // One eager fetch: it gives Tab something to complete and warms
                 // the same cache the hints read.
                 let tools = shell_tools(&mut cache, &mut conn).to_vec();
-                input.set_tools(&tools);
+                if advertises(&conn.server_info, "resources") {
+                    resources = conn.session.list_resources().ok();
+                }
+                if advertises(&conn.server_info, "prompts") {
+                    prompts = conn.session.list_prompts().ok();
+                }
+                input.set_completions(
+                    &tools,
+                    resources.as_deref().unwrap_or_default(),
+                    prompts.as_deref().unwrap_or_default(),
+                );
             }
+            let info_cmd = "`info`";
             while let Some(raw) = input.next()? {
                 let text = raw.trim();
                 if text.is_empty() || text.starts_with('#') {
@@ -835,6 +944,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
                 let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
                 let rest = rest.trim();
+                let long = rest == "--long" || rest == "-l";
                 let outcome: Result<(), Failure> = match word {
                     "quit" | "exit" => break,
                     "help" if rest.is_empty() => {
@@ -888,10 +998,93 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 println!("{}", json!({ "tools": tools }));
                             } else {
                                 println!("{} tool(s):", tools.len());
-                                print_tools(&tools, rest == "--long" || rest == "-l");
+                                print_tools(&tools, long);
                             }
                             cache = Some(tools);
                         }),
+                    "resources" => match conn.session.list_resources() {
+                        Err(e) => Err(missing_capability(e, "resources", info_cmd)),
+                        Ok(found) => {
+                            let templates =
+                                conn.session.list_resource_templates().unwrap_or_default();
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    json!({"resources": found, "resourceTemplates": templates})
+                                );
+                            } else {
+                                println!("{} resource(s):", found.len());
+                                print_resources(&found, long);
+                                if !templates.is_empty() {
+                                    println!("\n{} template(s):", templates.len());
+                                    print_resources(&templates, long);
+                                }
+                            }
+                            resources = Some(found);
+                            Ok(())
+                        }
+                    },
+                    "read" if rest.is_empty() => Err(Failure::hinted(
+                        Error::usage("read needs a resource URI"),
+                        "usage: read URI   (`resources` lists what this server offers)",
+                    )),
+                    "read" => match conn.session.read_resource(rest) {
+                        Err(e) => Err(missing_capability(e, "resources", info_cmd)),
+                        Ok(result) if cli.json => {
+                            println!("{result}");
+                            Ok(())
+                        }
+                        Ok(result) => {
+                            resource_bodies(&result)
+                                .map_err(Failure::from)
+                                .and_then(|bodies| {
+                                    let redirect =
+                                        format!("mcpdial read {} {}", shell_word(&target), rest);
+                                    write_resource(&bodies, &redirect)
+                                })
+                        }
+                    },
+                    "prompts" => match conn.session.list_prompts() {
+                        Err(e) => Err(missing_capability(e, "prompts", info_cmd)),
+                        Ok(found) => {
+                            if cli.json {
+                                println!("{}", json!({ "prompts": found }));
+                            } else {
+                                println!("{} prompt(s):", found.len());
+                                print_prompts(&found, long);
+                            }
+                            prompts = Some(found);
+                            Ok(())
+                        }
+                    },
+                    "prompt" => {
+                        let (name, args) =
+                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+                        let args = match args.trim() {
+                            "" => "{}",
+                            a => a,
+                        };
+                        if name.is_empty() {
+                            Err(Failure::hinted(
+                                Error::usage("prompt needs a name"),
+                                "usage: prompt NAME {\"arg\": \"value\"}   (`prompts` lists what this server offers)",
+                            ))
+                        } else {
+                            parse_object(args, "arguments")
+                                .and_then(|a| conn.session.get_prompt(name, a))
+                                .map_err(|e| missing_capability(e, "prompts", info_cmd))
+                                .map(|result| {
+                                    if cli.json {
+                                        println!("{result}");
+                                    } else {
+                                        let messages = render_messages(&result);
+                                        if !messages.is_empty() {
+                                            println!("{messages}");
+                                        }
+                                    }
+                                })
+                        }
+                    }
                     "call" => {
                         let (tool, args) =
                             rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
@@ -1004,9 +1197,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         })
                     }
                 };
-                if word == "tools" {
-                    input.set_tools(cache.as_deref().unwrap_or_default());
-                }
+                input.set_completions(
+                    cache.as_deref().unwrap_or_default(),
+                    resources.as_deref().unwrap_or_default(),
+                    prompts.as_deref().unwrap_or_default(),
+                );
                 if let Err(f) = outcome {
                     failures += 1;
                     if cli.json {
@@ -1046,6 +1241,103 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             println!("{}", serde_json::to_string_pretty(t).unwrap());
             if t.get("outputSchema").is_some() {
                 eprintln!("this tool declares an outputSchema: results carry structuredContent");
+            }
+            Ok(0)
+        }
+
+        Cmd::Resources { target, long } => {
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let resources = conn
+                .session
+                .list_resources()
+                .map_err(|e| missing_capability(e, "resources", &info_cmd))?;
+            // Templates are optional even where resources are not, so a server with
+            // none of them must not turn the whole listing into an error.
+            let templates = conn.session.list_resource_templates().unwrap_or_default();
+            if cli.json {
+                let both = json!({ "resources": resources, "resourceTemplates": templates });
+                println!("{}", serde_json::to_string_pretty(&both).unwrap());
+            } else {
+                println!("{} resource(s):\n", resources.len());
+                print_resources(&resources, long);
+                if !templates.is_empty() {
+                    println!("\n{} template(s):\n", templates.len());
+                    print_resources(&templates, long);
+                }
+            }
+            Ok(0)
+        }
+
+        Cmd::Read { target, uri } => {
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let result = conn
+                .session
+                .read_resource(&uri)
+                .map_err(|e| missing_capability(e, "resources", &info_cmd))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                return Ok(0);
+            }
+            let redirect = format!("mcpdial read {} {}", shell_word(&target), shell_word(&uri));
+            write_resource(&resource_bodies(&result)?, &redirect)?;
+            Ok(0)
+        }
+
+        Cmd::Prompts { target, long } => {
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let prompts = conn
+                .session
+                .list_prompts()
+                .map_err(|e| missing_capability(e, "prompts", &info_cmd))?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "prompts": prompts })).unwrap()
+                );
+            } else {
+                println!("{} prompt(s):\n", prompts.len());
+                print_prompts(&prompts, long);
+            }
+            Ok(0)
+        }
+
+        Cmd::Prompt {
+            target,
+            name,
+            arguments,
+        } => {
+            let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
+                Failure::hinted(
+                    e,
+                    format!(
+                        "`mcpdial prompts {} --long` shows what {name} takes",
+                        shell_word(&target)
+                    ),
+                )
+            })?;
+            let r = client::resolve(&store, &target)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let result = conn
+                .session
+                .get_prompt(&name, arguments)
+                .map_err(|e| missing_capability(e, "prompts", &info_cmd))?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            } else {
+                if let Some(d) = result["description"].as_str() {
+                    eprintln!("{d}");
+                }
+                let messages = render_messages(&result);
+                if !messages.is_empty() {
+                    println!("{messages}");
+                }
             }
             Ok(0)
         }
@@ -1514,17 +1806,26 @@ fn truncate(s: &str) -> String {
 }
 
 fn print_tools(tools: &[Value], long: bool) {
-    for t in tools {
-        let name = t["name"].as_str().unwrap_or("?");
-        let desc = t["description"].as_str().unwrap_or("").trim();
+    print_named(tools, long, "parameters", describe_params);
+}
+
+fn print_prompts(prompts: &[Value], long: bool) {
+    print_named(prompts, long, "arguments", describe_prompt_args);
+}
+
+/// Tools and prompts list identically; only the word for what they take differs.
+fn print_named(items: &[Value], long: bool, takes: &str, describe: impl Fn(&Value) -> Vec<String>) {
+    for item in items {
+        let name = item["name"].as_str().unwrap_or("?");
+        let desc = item["description"].as_str().unwrap_or("").trim();
         if long {
             println!("{name}");
             for line in desc.lines() {
                 println!("    {}", line.trim_end());
             }
-            let params = describe_params(t);
+            let params = describe(item);
             if !params.is_empty() {
-                println!("  parameters:");
+                println!("  {takes}:");
                 for p in params {
                     println!("    {p}");
                 }
@@ -1533,6 +1834,56 @@ fn print_tools(tools: &[Value], long: bool) {
         } else {
             let first = desc.lines().next().unwrap_or("");
             println!("  {name:<28} {}", truncate_at(first, 90));
+        }
+    }
+}
+
+/// A prompt's arguments carry no schema: every one of them is a string.
+fn describe_prompt_args(prompt: &Value) -> Vec<String> {
+    prompt["arguments"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|a| {
+            let mut line = a["name"].as_str().unwrap_or("?").to_string();
+            if a["required"].as_bool().unwrap_or(false) {
+                line.push_str(" (required)");
+            }
+            if let Some(d) = a["description"].as_str() {
+                let first = d.trim().lines().next().unwrap_or("");
+                if !first.is_empty() {
+                    line.push_str(&format!(" - {first}"));
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+/// Resources and templates print the same way; only the key holding the URI differs.
+fn print_resources(resources: &[Value], long: bool) {
+    for r in resources {
+        let uri = r["uri"]
+            .as_str()
+            .or_else(|| r["uriTemplate"].as_str())
+            .unwrap_or("?");
+        let desc = r["description"].as_str().unwrap_or("").trim();
+        if long {
+            println!("{uri}");
+            for line in desc.lines() {
+                println!("    {}", line.trim_end());
+            }
+            if let Some(mime) = r["mimeType"].as_str() {
+                println!("    type: {mime}");
+            }
+            println!();
+        } else {
+            let summary = match desc.is_empty() {
+                true => r["name"].as_str().unwrap_or(""),
+                false => desc.lines().next().unwrap_or(""),
+            };
+            println!("  {uri:<44} {}", truncate_at(summary, 74));
         }
     }
 }
@@ -1583,11 +1934,13 @@ mod tests {
     }
 
     #[test]
-    fn completes_commands_then_tool_names() {
+    fn completes_commands_then_tool_and_prompt_names_and_resource_uris() {
         let helper = ShellHelper {
             tools: ["list_pages", "list_console_messages", "new_page"]
                 .map(String::from)
                 .to_vec(),
+            resources: ["file:///a.md", "file:///b.png"].map(String::from).to_vec(),
+            prompts: ["summarize", "translate"].map(String::from).to_vec(),
         };
         // The first word is a command.
         let (at, found) = complete(&helper, "sch");
@@ -1598,6 +1951,10 @@ mod tests {
         assert_eq!(found, ["list_pages", "list_console_messages"]);
         assert_eq!(complete(&helper, "schema new").1, ["new_page"]);
         assert_eq!(complete(&helper, "help li").1.len(), 2);
+        // Each of the other two pools answers to its own command.
+        assert_eq!(complete(&helper, "read file:///b").1, ["file:///b.png"]);
+        assert_eq!(complete(&helper, "prompt sum").1, ["summarize"]);
+        assert!(complete(&helper, "read sum").1.is_empty());
         // Nothing to say about a tool's arguments, or about other commands.
         assert!(complete(&helper, "call new_page {\"ur").1.is_empty());
         assert!(complete(&helper, "raw tools/").1.is_empty());
