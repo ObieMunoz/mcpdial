@@ -118,7 +118,11 @@ fn refresh_and_save(
     opts: &Options,
 ) -> Result<Credential> {
     let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
-    let fresh = oauth::refresh(&http, cred)?;
+    let fresh = if cred.renews_by_grant() {
+        oauth::renew_client_credentials(&http, cred)?
+    } else {
+        oauth::refresh(&http, cred)?
+    };
     store.save_credential(name, fresh.clone())?;
     Ok(fresh)
 }

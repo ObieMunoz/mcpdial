@@ -139,6 +139,7 @@ mcpdial shell TARGET             one session, many commands; state persists betw
 
 mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--client-metadata-url URL]
                      [--no-client-metadata] [--redirect-host H] [--no-browser]
+mcpdial login TARGET --grant client-credentials --client-id ID (--client-secret | --client-secret-env VAR)
 mcpdial logout TARGET
 mcpdial token set NAME [--env VAR]   token from stdin or an env var, never an argument
 mcpdial token show NAME              metadata only; the secret is never printed
@@ -378,6 +379,14 @@ The redirect URI is `http://127.0.0.1:PORT/callback`, and if the server refuses 
 name. If both are refused, the server is not following RFC 8252 and the error says what
 to change; for a Doorkeeper server that is one line in `config/initializers/doorkeeper.rb`.
 Use `--redirect-host` to skip the guessing.
+
+**`mcpdial login NAME --grant client-credentials`** is for a cron job, a CI step or a
+headless agent that owns a confidential client: pass `--client-id` and the secret from
+stdin (`--client-secret`) or the environment (`--client-secret-env VAR`), never as an
+argument, and the token is requested with the client-credentials grant. No browser is
+involved, then or later: when the token expires it is renewed by running the grant
+again with the saved secret. A server that advertises `grant_types_supported` without
+`client_credentials` is refused up front, with the grants it does offer.
 
 Servers must be addressed at their final URL. A redirect (say, `www.` to the bare host)
 would turn the POST into a GET, so `mcpdial` refuses to follow it and names the URL to

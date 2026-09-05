@@ -11,12 +11,14 @@
 //! * Grant: authorization code + PKCE (S256) on a loopback redirect, with the RFC 8707
 //!   `resource` indicator so the token is bound to this MCP server.
 //! * Refresh: `refresh_token` grant, transparently, whenever a saved token has expired.
+//! * Machines: the `client_credentials` grant for a confidential client, which needs
+//!   no browser at all and is simply run again when its token expires.
 //!
-//! There is no `client_credentials` path in practice - the servers seen so far only
-//! offer `authorization_code` and `refresh_token` - so the browser step cannot be
-//! avoided. It can be made to happen once. That is what the credential store is for.
+//! Most servers only offer `authorization_code` and `refresh_token`, so for them the
+//! browser step cannot be avoided. It can be made to happen once. That is what the
+//! credential store is for.
 
-use crate::config::{now, Credential};
+use crate::config::{now, Credential, CLIENT_CREDENTIALS};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
 use crate::transport::http::{header, redirect_error, USER_AGENT};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -40,6 +42,9 @@ pub struct Metadata {
     pub client_id_metadata_document_supported: bool,
     pub scopes_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
+    /// Empty when the server did not say; RFC 8414 then implies `authorization_code`
+    /// and `implicit`, but servers that leave it out mostly support more.
+    pub grant_types_supported: Vec<String>,
     /// The MCP endpoint, sent as the `resource` indicator.
     pub resource: String,
 }
@@ -279,6 +284,7 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         token_endpoint_auth_methods_supported: string_list(
             &meta["token_endpoint_auth_methods_supported"],
         ),
+        grant_types_supported: string_list(&meta["grant_types_supported"]),
         resource: mcp_url.to_string(),
     })
 }
@@ -925,6 +931,139 @@ pub fn refresh(http: &Http, cred: &Credential) -> Result<Credential> {
     credential_from_token_response(&value, cred.clone())
 }
 
+// -- client credentials ----------------------------------------------------------
+
+/// Run the client-credentials grant for `mcp_url`: discovery as `login` does it, then
+/// one token request that a confidential client answers for itself. No browser, no
+/// redirect, no registration, so the flags that serve those are refused.
+pub fn login_client_credentials(
+    http: &Http,
+    mcp_url: &str,
+    opts: &LoginOptions,
+    mut notify: impl FnMut(&str),
+) -> Result<Credential> {
+    if opts.port.is_some() || opts.redirect_host.is_some() || !opts.open_browser {
+        return Err(Error::usage(
+            "--port, --redirect-host and --no-browser belong to the authorization-code \
+             grant; the client-credentials grant opens no browser and takes no redirect",
+        ));
+    }
+    let client_id = opts.client_id.as_deref().ok_or_else(|| {
+        Error::usage(
+            "--grant client-credentials needs --client-id, a client registered out of band",
+        )
+    })?;
+    let client_secret = opts.client_secret.as_deref().ok_or_else(|| {
+        Error::usage(
+            "--grant client-credentials needs that client's secret: --client-secret reads \
+             it from stdin, --client-secret-env VAR from the environment",
+        )
+    })?;
+    let chal = challenge(http, mcp_url)?;
+    if chal.is_none() {
+        notify("note: the server accepted an anonymous initialize; a token may not be required");
+    }
+    let meta = discover(http, mcp_url, chal.as_deref())?;
+    notify(&format!("authorization server: {}", meta.issuer));
+    client_credentials(http, &meta, client_id, client_secret, opts.scope.clone())
+}
+
+/// A usage error naming what the server does offer when `client_credentials` is
+/// not among its advertised grants. A server that advertises nothing is given
+/// the benefit of the doubt.
+fn require_grant(meta: &Metadata, grant: &str) -> Result<()> {
+    let offered = &meta.grant_types_supported;
+    if offered.is_empty() || offered.iter().any(|g| g == grant) {
+        return Ok(());
+    }
+    Err(Error::usage(format!(
+        "{} does not offer the {grant} grant; it supports: {}",
+        meta.issuer,
+        offered.join(", ")
+    )))
+}
+
+/// Ask the token endpoint for a token on the client's own behalf (RFC 6749
+/// section 4.4) and return the credential to save.
+pub fn client_credentials(
+    http: &Http,
+    meta: &Metadata,
+    client_id: &str,
+    client_secret: &str,
+    scope: Option<String>,
+) -> Result<Credential> {
+    require_grant(meta, CLIENT_CREDENTIALS)?;
+    let scope = scope
+        .or_else(|| (!meta.scopes_supported.is_empty()).then(|| meta.scopes_supported.join(" ")));
+    let base = Credential {
+        token_endpoint: Some(meta.token_endpoint.clone()),
+        token_endpoint_auth_method: Some(
+            client_auth_method(&meta.token_endpoint_auth_methods_supported).to_string(),
+        ),
+        client_id: Some(client_id.to_string()),
+        registration: Some(Registration::PreRegistered.as_str().to_string()),
+        client_secret: Some(client_secret.to_string()),
+        scope,
+        resource: Some(meta.resource.clone()),
+        source: Some(CLIENT_CREDENTIALS.into()),
+        ..Default::default()
+    };
+    client_credentials_grant(http, base)
+}
+
+/// Run the grant again with everything the saved credential remembers, which is
+/// how a client-credentials token is refreshed: there is no refresh token, and
+/// nothing about it needs a human.
+pub fn renew_client_credentials(http: &Http, cred: &Credential) -> Result<Credential> {
+    if !cred.renews_by_grant() {
+        return Err(Error::auth(
+            "credential has no client id and secret to renew with; run login again",
+        ));
+    }
+    client_credentials_grant(http, cred.clone())
+}
+
+/// The token request itself. `base` carries the endpoint, the client and the
+/// scope; what comes back is written over its token fields.
+fn client_credentials_grant(http: &Http, base: Credential) -> Result<Credential> {
+    let endpoint = base
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| Error::auth("credential has no token endpoint; run login again"))?;
+    let (Some(client_id), Some(client_secret)) =
+        (base.client_id.as_deref(), base.client_secret.as_deref())
+    else {
+        return Err(Error::auth(
+            "the client-credentials grant needs a client id and secret",
+        ));
+    };
+    let mut params = vec![("grant_type", CLIENT_CREDENTIALS), ("client_id", client_id)];
+    if let Some(s) = base.scope.as_deref() {
+        params.push(("scope", s));
+    }
+    if let Some(r) = base.resource.as_deref() {
+        params.push(("resource", r));
+    }
+    let basic = authenticate_client(
+        &mut params,
+        base.token_endpoint_auth_method.as_deref(),
+        Some(client_id),
+        Some(client_secret),
+    );
+    let (status, value, text) = http.post_form(endpoint, &params, basic.as_deref())?;
+    if !(200..300).contains(&status) {
+        return Err(Error::auth(format!(
+            "client credentials grant failed: HTTP {status}\n{text}"
+        )));
+    }
+    let scope = base.scope.clone();
+    let mut cred = credential_from_token_response(&value, base)?;
+    if cred.scope.is_none() {
+        cred.scope = scope;
+    }
+    Ok(cred)
+}
+
 fn credential_from_token_response(value: &Value, mut base: Credential) -> Result<Credential> {
     let access = value["access_token"]
         .as_str()
@@ -1191,6 +1330,38 @@ mod tests {
                 true
             ),
             ClientId::Register
+        );
+    }
+
+    #[test]
+    fn the_grant_is_refused_only_when_the_server_lists_grants_and_leaves_it_out() {
+        let meta = |grants: &[&str]| Metadata {
+            issuer: "https://as".into(),
+            authorization_endpoint: String::new(),
+            token_endpoint: String::new(),
+            registration_endpoint: None,
+            client_id_metadata_document_supported: false,
+            scopes_supported: Vec::new(),
+            token_endpoint_auth_methods_supported: Vec::new(),
+            grant_types_supported: grants.iter().map(|g| g.to_string()).collect(),
+            resource: String::new(),
+        };
+        assert!(require_grant(&meta(&[]), CLIENT_CREDENTIALS).is_ok());
+        assert!(require_grant(
+            &meta(&["authorization_code", "client_credentials"]),
+            CLIENT_CREDENTIALS
+        )
+        .is_ok());
+        let err = require_grant(
+            &meta(&["authorization_code", "refresh_token"]),
+            CLIENT_CREDENTIALS,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Usage(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "https://as does not offer the client_credentials grant; it supports: \
+             authorization_code, refresh_token"
         );
     }
 

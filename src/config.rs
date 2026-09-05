@@ -248,10 +248,14 @@ pub struct Credential {
     /// The `resource` indicator (RFC 8707) the token was issued for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
-    /// How the token was obtained: "oauth" or "manual".
+    /// How the token was obtained: "oauth", "manual" or "client_credentials".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
 }
+
+/// The `source` of a token the client-credentials grant issued. Such a token is
+/// renewed by running the grant again, which needs no refresh token and no human.
+pub const CLIENT_CREDENTIALS: &str = "client_credentials";
 
 impl Credential {
     pub fn is_expired(&self) -> bool {
@@ -261,7 +265,14 @@ impl Credential {
         self.access_token.as_deref().is_some_and(|t| !t.is_empty())
     }
     pub fn can_refresh(&self) -> bool {
-        self.refresh_token.is_some() && self.token_endpoint.is_some()
+        (self.refresh_token.is_some() || self.renews_by_grant()) && self.token_endpoint.is_some()
+    }
+    /// A client-credentials token with its client id and secret still saved: the
+    /// grant can simply be run again when it expires.
+    pub fn renews_by_grant(&self) -> bool {
+        self.source.as_deref() == Some(CLIENT_CREDENTIALS)
+            && self.client_id.is_some()
+            && self.client_secret.is_some()
     }
 }
 
@@ -1206,5 +1217,32 @@ mod tests {
         http.headers.clear();
         let dialed = http.expanded(&env).unwrap();
         assert_eq!(dialed.token_env.as_deref(), Some("${NOT_A_PLACEHOLDER}"));
+    }
+
+    #[test]
+    fn a_client_credentials_token_with_its_secret_counts_as_refreshable() {
+        let mut cred = Credential {
+            access_token: Some("t".into()),
+            token_endpoint: Some("https://as/token".into()),
+            client_id: Some("id".into()),
+            client_secret: Some("s".into()),
+            source: Some(CLIENT_CREDENTIALS.into()),
+            ..Default::default()
+        };
+        assert!(cred.refresh_token.is_none() && cred.can_refresh());
+
+        cred.source = Some("oauth".into());
+        assert!(!cred.can_refresh(), "an OAuth token needs a refresh token");
+
+        cred.source = Some(CLIENT_CREDENTIALS.into());
+        cred.client_secret = None;
+        assert!(
+            !cred.can_refresh(),
+            "the grant cannot run without the secret"
+        );
+
+        cred.client_secret = Some("s".into());
+        cred.token_endpoint = None;
+        assert!(!cred.can_refresh());
     }
 }
