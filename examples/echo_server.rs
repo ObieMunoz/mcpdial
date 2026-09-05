@@ -7,26 +7,33 @@
 //!
 //! Set `ECHO_SERVER_HANG=1` to make it swallow every request, for timeout tests.
 //! Set `ECHO_SERVER_TAG` to have it echoed back as the server's `instructions`.
+//! Set `ECHO_SERVER_PING=1` to make it talk first during `tools/call`: a
+//! notification, a `ping`, and a request it knows the client cannot serve. The
+//! call does not finish until both requests are answered, which is what a real
+//! server checking a slow connection does to a client that only listens for its
+//! own id.
 //! The `count` tool returns how many times it has been called in this process,
 //! which is how the tests tell one long session from several short ones.
 
 use serde_json::{json, Value};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Lines, StdinLock, Write};
 
 fn main() {
     let hang = std::env::var_os("ECHO_SERVER_HANG").is_some();
+    let ping = std::env::var_os("ECHO_SERVER_PING").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let mut count = 0u32;
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
 
     // Real servers do this too: a non-protocol line on stdout that a client must skip.
     writeln!(out, "echo_server ready").unwrap();
     out.flush().unwrap();
     eprintln!("echo_server: this is stderr noise");
 
-    for line in io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
+    while let Some(Ok(line)) = lines.next() {
         if line.trim().is_empty() {
             continue;
         }
@@ -42,6 +49,31 @@ fn main() {
 
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
+
+        // Interrupt the call the client is waiting on. A wrong answer is reported
+        // through the call itself, so a test that only reads the tool's output
+        // still catches it; no answer at all leaves us blocked here until the
+        // client gives up, which is the bug this mode exists to catch.
+        if ping && method == "tools/call" {
+            tell(
+                &mut out,
+                &json!({"jsonrpc": "2.0", "method": "notifications/message",
+                        "params": {"level": "info", "data": "working"}}),
+            );
+            let pong = ask(&mut out, &mut lines, "srv-ping", "ping");
+            let refusal = ask(&mut out, &mut lines, "srv-roots", "roots/list");
+            if pong.get("result").is_none() {
+                let complaint = format!("ping answered {pong}");
+                tell(&mut out, &err(id.clone(), -32001, &complaint));
+                continue;
+            }
+            if refusal["error"]["code"] != -32601 {
+                let complaint = format!("roots/list answered {refusal}");
+                tell(&mut out, &err(id.clone(), -32001, &complaint));
+                continue;
+            }
+        }
+
         let reply = match method {
             "initialize" => {
                 let mut result = json!({
@@ -108,6 +140,26 @@ fn main() {
         writeln!(out, "{reply}").unwrap();
         out.flush().unwrap();
     }
+}
+
+/// Write one message and make sure it is on its way.
+fn tell(out: &mut impl Write, msg: &Value) {
+    writeln!(out, "{msg}").unwrap();
+    out.flush().unwrap();
+}
+
+/// Send the client a request and block until the answer to it arrives, the way a
+/// server waiting on a `ping` does. Anything else on the way is skipped, and a
+/// client that hangs up gets `null` back rather than a panic.
+fn ask(out: &mut impl Write, lines: &mut Lines<StdinLock<'_>>, id: &str, method: &str) -> Value {
+    tell(out, &json!({"jsonrpc": "2.0", "id": id, "method": method}));
+    while let Some(Ok(line)) = lines.next() {
+        match serde_json::from_str::<Value>(&line) {
+            Ok(reply) if reply["id"] == id => return reply,
+            _ => continue,
+        }
+    }
+    Value::Null
 }
 
 fn ok(id: Value, result: Value) -> Value {

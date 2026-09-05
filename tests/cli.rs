@@ -963,3 +963,44 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
     assert_eq!(lines[2]["content"][0]["text"], "Echo: two");
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn stdio_answers_what_the_server_asks_mid_call() {
+    let home = temp_home("ping");
+    let target = format!("stdio:{}", echo_server().display());
+
+    // In this mode the server interrupts `tools/call` with a notification, a
+    // `ping`, and a request we do not serve, and finishes the call only once both
+    // requests are answered correctly. A client that just waits for its own id
+    // deadlocks here and reports the timeout as the server's fault.
+    let o = run(mcpdial(&home).env("ECHO_SERVER_PING", "1").args([
+        "-v",
+        "--timeout",
+        "20",
+        "call",
+        &target,
+        "echo",
+        r#"{"message":"mid-call"}"#,
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "Echo: mid-call");
+
+    // The trace shows all three: the notification skipped, the ping answered with
+    // an empty result, and the unsupported method refused with -32601.
+    assert!(
+        o.stderr.contains("(other message)") && o.stderr.contains("notifications/message"),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr
+            .contains(r#"{"id":"srv-ping","jsonrpc":"2.0","result":{}}"#),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains(r#""code":-32601"#) && o.stderr.contains("srv-roots"),
+        "{}",
+        o.stderr
+    );
+}
