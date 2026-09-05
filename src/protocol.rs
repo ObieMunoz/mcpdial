@@ -13,6 +13,9 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const CLIENT_NAME: &str = "mcpdial";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// JSON-RPC's "method not found", the honest answer to a request we do not serve.
+pub const METHOD_NOT_FOUND: i64 = -32601;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Everything that can go wrong, sorted by who is to blame.
@@ -160,7 +163,7 @@ fn decode_sse(body: &str) -> Result<Option<Value>> {
 
     for event in sse_events(body) {
         match serde_json::from_str::<Value>(&event) {
-            Ok(msg) if answers_a_request(&msg) => return Ok(Some(msg)),
+            Ok(msg) if matches!(classify(&msg, None), Incoming::Response) => return Ok(Some(msg)),
             Ok(_the_server_talking_to_us) => continue,
             Err(e) => unparseable = unparseable.or(Some(e)),
         }
@@ -195,13 +198,50 @@ fn sse_events(body: &str) -> Vec<String> {
     events
 }
 
-/// True for an answer to something we sent, the rule [`StdioTransport`] applies
-/// to stdout. `error` stands in for `id` when the server could not read the id.
+/// What a message from the server is, to a client waiting for one particular id.
+///
+/// The pair that matters is `id` **and** `method`: that combination is a request
+/// addressed to us, and dropping it leaves the server waiting for an answer that
+/// never comes.
+#[derive(Debug)]
+pub enum Incoming<'a> {
+    /// The answer we are waiting for.
+    Response,
+    /// The server is asking us something and may block until we reply to `id`.
+    ServerRequest { id: &'a Value, method: &'a str },
+    /// One-way traffic - progress, logging. Nothing is owed.
+    Notification { method: &'a str },
+    /// An answer to somebody else's id, or a frame we cannot place.
+    Foreign,
+}
+
+/// Sort one incoming message, the rule [`StdioTransport`] applies to stdout.
+///
+/// `awaiting` is the id we are blocked on, or `None` to accept any response: an
+/// HTTP body carries the answer to the POST it came back from, so there is no
+/// other id it could be. `error` stands in for `id` in that case, because a server
+/// that could not read the id we sent has nothing to echo back.
 ///
 /// [`StdioTransport`]: crate::StdioTransport
-fn answers_a_request(msg: &Value) -> bool {
-    let the_server_is_asking_us_something = msg.get("method").is_some();
-    !the_server_is_asking_us_something && (msg.get("id").is_some() || msg.get("error").is_some())
+pub fn classify<'a>(msg: &'a Value, awaiting: Option<&Value>) -> Incoming<'a> {
+    // A null id is not an id: JSON-RPC uses it for a request the server could not
+    // parse, and answering it would address a reply to nobody.
+    let id = msg.get("id").filter(|id| !id.is_null());
+    match (msg.get("method").and_then(Value::as_str), id) {
+        (Some(method), Some(id)) => Incoming::ServerRequest { id, method },
+        (Some(method), None) => Incoming::Notification { method },
+        (None, id) => {
+            let answers_us = match awaiting {
+                Some(ours) => id == Some(ours),
+                None => id.is_some() || msg.get("error").is_some(),
+            };
+            if answers_us {
+                Incoming::Response
+            } else {
+                Incoming::Foreign
+            }
+        }
+    }
 }
 
 /// Raise a JSON-RPC `error` member as [`Error::Rpc`], otherwise pass the message on.
@@ -234,6 +274,34 @@ pub fn notification(method: &str, params: Option<Value>) -> Value {
         msg["params"] = p;
     }
     msg
+}
+
+/// The reply owed to a server request, given its id and method.
+///
+/// `ping` is the one request every MCP client must answer whatever it declared. A
+/// server that pings during a long call and hears nothing back either drops the
+/// connection or waits for a peer that is never coming, and the stall gets
+/// reported as the server's fault. Everything else - `sampling/createMessage`,
+/// `roots/list`, `elicitation/create` - we turned down by sending an empty
+/// `capabilities` at initialize, so a refusal is both truthful and something the
+/// server can act on at once; silence it can only time out.
+pub fn answer(id: &Value, method: &str) -> Value {
+    match method {
+        "ping" => reply(id, json!({})),
+        other => reply_error(
+            id,
+            METHOD_NOT_FOUND,
+            &format!("{CLIENT_NAME} does not implement {other}"),
+        ),
+    }
+}
+
+pub fn reply(id: &Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+pub fn reply_error(id: &Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 #[cfg(test)]
@@ -389,5 +457,67 @@ mod tests {
         let r = request("tools/list", 7, None);
         assert_eq!(r["id"], 7);
         assert!(r.get("params").is_none());
+    }
+
+    #[test]
+    fn a_method_beside_an_id_is_a_request_to_us() {
+        let ours = json!(2);
+        let ping = json!({"jsonrpc":"2.0","id":"srv-1","method":"ping"});
+        match classify(&ping, Some(&ours)) {
+            Incoming::ServerRequest { id, method } => {
+                assert_eq!(id, "srv-1");
+                assert_eq!(method, "ping");
+            }
+            other => panic!("expected a server request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_method_alone_is_a_notification() {
+        let ours = json!(2);
+        let note = json!({"jsonrpc":"2.0","method":"notifications/message"});
+        assert!(matches!(
+            classify(&note, Some(&ours)),
+            Incoming::Notification {
+                method: "notifications/message"
+            }
+        ));
+        // A null id is the same thing: there is nobody to address a reply to.
+        let null_id = json!({"jsonrpc":"2.0","id":null,"method":"notifications/progress"});
+        assert!(matches!(
+            classify(&null_id, Some(&ours)),
+            Incoming::Notification { .. }
+        ));
+    }
+
+    #[test]
+    fn only_our_own_id_answers_us() {
+        let ours = json!(2);
+        let mine = json!({"jsonrpc":"2.0","id":2,"result":{}});
+        let theirs = json!({"jsonrpc":"2.0","id":99,"result":{}});
+        assert!(matches!(classify(&mine, Some(&ours)), Incoming::Response));
+        assert!(matches!(classify(&theirs, Some(&ours)), Incoming::Foreign));
+        // With no id to wait for, any response will do, error or not.
+        assert!(matches!(classify(&theirs, None), Incoming::Response));
+        let no_id = json!({"jsonrpc":"2.0","error":{"code":-32700,"message":"parse error"}});
+        assert!(matches!(classify(&no_id, None), Incoming::Response));
+        assert!(matches!(classify(&no_id, Some(&ours)), Incoming::Foreign));
+    }
+
+    #[test]
+    fn ping_is_answered_and_the_rest_refused() {
+        let id = json!("srv-1");
+        let pong = answer(&id, "ping");
+        assert_eq!(pong["id"], "srv-1");
+        assert_eq!(pong["result"], json!({}));
+        assert!(pong.get("error").is_none());
+
+        let refusal = answer(&id, "sampling/createMessage");
+        assert_eq!(refusal["error"]["code"], METHOD_NOT_FOUND);
+        assert!(refusal["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("sampling/createMessage"));
+        assert!(refusal.get("result").is_none());
     }
 }
