@@ -94,6 +94,10 @@ mcpdial tools [TARGET] [--long]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | -]
 mcpdial schema TARGET TOOL       one tool's input schema
+mcpdial resources TARGET [--long]  every resource, then every URI template
+mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect
+mcpdial prompts TARGET [--long]  every prompt a server offers
+mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | -]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
 
@@ -145,9 +149,9 @@ chrome> quit
 ```
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
-`raw`, `info`, `help`, and `quit`; a `#` starts a comment. With `--json` each result is
-one line of JSON. In a script, any failed command makes the exit code 1 after the script
-finishes.
+`resources`, `read`, `prompts`, `prompt`, `raw`, `info`, `help`, and `quit`; a `#` starts
+a comment. With `--json` each result is one line of JSON. In a script, any failed command
+makes the exit code 1 after the script finishes.
 
 Arguments are one JSON object. When a line does not work, the answer says what the tool
 actually takes rather than leaving you to go read the schema:
