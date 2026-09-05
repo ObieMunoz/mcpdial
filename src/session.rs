@@ -1,7 +1,8 @@
 //! Request id allocation, the initialize handshake, and the methods that matter.
 
 use crate::protocol::{
-    check, notification, request, Error, Result, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION,
+    check, negotiate, notification, request, Error, KnownVersion, Result, CLIENT_NAME,
+    CLIENT_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
@@ -18,6 +19,8 @@ pub struct Session<T: Transport> {
     next_id: u64,
     /// The `result` of `initialize`, once it has run.
     pub server_info: Value,
+    /// The version agreed at `initialize`; until then, the one it will offer.
+    version: KnownVersion,
 }
 
 impl<T: Transport> Session<T> {
@@ -26,7 +29,21 @@ impl<T: Transport> Session<T> {
             transport,
             next_id: 0,
             server_info: Value::Null,
+            version: KnownVersion::LATEST,
         }
+    }
+
+    /// Offer `version` at `initialize` instead of the newest one, for a server
+    /// that misbehaves when offered something it has never heard of.
+    pub fn offering(mut self, version: KnownVersion) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The protocol version this session runs on, for gating what is asked of the
+    /// server: `session.version() >= KnownVersion::V2025_11_25`.
+    pub fn version(&self) -> KnownVersion {
+        self.version
     }
 
     /// Send a request and return its `result`. JSON-RPC errors become [`crate::Error::Rpc`].
@@ -48,15 +65,22 @@ impl<T: Transport> Session<T> {
 
     /// The handshake. Stateless servers ignore `notifications/initialized`;
     /// stateful ones refuse everything that follows if it is missing.
+    ///
+    /// A server that answers with a version we do not speak is an error here, and
+    /// the notification is withheld: the spec has the client disconnect instead.
     pub fn initialize(&mut self) -> Result<&Value> {
-        self.server_info = self.request(
+        let offered = self.version;
+        let info = self.request(
             "initialize",
             Some(json!({
-                "protocolVersion": PROTOCOL_VERSION,
+                "protocolVersion": offered.as_str(),
                 "capabilities": {},
                 "clientInfo": { "name": CLIENT_NAME, "version": CLIENT_VERSION },
             })),
         )?;
+        self.version = negotiate(offered, &info["protocolVersion"])?;
+        self.server_info = info;
+        self.transport.negotiated(self.version);
         self.notify("notifications/initialized", None)?;
         Ok(&self.server_info)
     }
@@ -226,6 +250,7 @@ mod tests {
     struct Fake {
         sent: Vec<Value>,
         replies: VecDeque<Option<Value>>,
+        told: Option<KnownVersion>,
     }
 
     impl Transport for Fake {
@@ -233,12 +258,16 @@ mod tests {
             self.sent.push(payload.clone());
             Ok(self.replies.pop_front().unwrap_or(None))
         }
+        fn negotiated(&mut self, version: KnownVersion) {
+            self.told = Some(version);
+        }
     }
 
     fn fake(replies: Vec<Option<Value>>) -> Session<Fake> {
         Session::new(Fake {
             sent: Vec::new(),
             replies: replies.into(),
+            told: None,
         })
     }
 
@@ -258,6 +287,68 @@ mod tests {
             sent[1].get("id").is_none(),
             "a notification must not carry an id"
         );
+    }
+
+    #[test]
+    fn initialize_offers_the_newest_version_and_keeps_what_the_server_answers() {
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18"}}),
+        )]);
+        assert_eq!(
+            s.version(),
+            KnownVersion::V2025_11_25,
+            "the offer, until then"
+        );
+        s.initialize().unwrap();
+        assert_eq!(
+            s.transport.sent[0]["params"]["protocolVersion"],
+            "2025-11-25"
+        );
+        assert_eq!(s.version(), KnownVersion::V2025_06_18);
+        assert_eq!(
+            s.transport.told,
+            Some(KnownVersion::V2025_06_18),
+            "the transport hears the agreed version, not the offer"
+        );
+        assert!(
+            s.version() < KnownVersion::V2025_11_25,
+            "so gating reads naturally"
+        );
+    }
+
+    #[test]
+    fn a_pinned_version_is_the_one_offered() {
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}),
+        )])
+        .offering(KnownVersion::V2025_03_26);
+        s.initialize().unwrap();
+        assert_eq!(
+            s.transport.sent[0]["params"]["protocolVersion"],
+            "2025-03-26"
+        );
+        assert_eq!(s.version(), KnownVersion::V2025_03_26);
+    }
+
+    #[test]
+    fn a_version_we_do_not_speak_ends_the_handshake() {
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"1999-01-01"}}),
+        )]);
+        let e = s.initialize().unwrap_err();
+        assert!(matches!(e, Error::Transport(_)), "{e:?}");
+        let text = e.to_string();
+        assert!(
+            text.contains("1999-01-01") && text.contains("2025-11-25"),
+            "{text}"
+        );
+        assert!(text.contains("--protocol-version"), "{text}");
+        assert_eq!(
+            s.transport.sent.len(),
+            1,
+            "no notifications/initialized: the spec says disconnect"
+        );
+        assert_eq!(s.transport.told, None);
     }
 
     #[test]

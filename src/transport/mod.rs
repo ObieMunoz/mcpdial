@@ -3,7 +3,7 @@
 pub mod http;
 pub mod stdio;
 
-use crate::protocol::Result;
+use crate::protocol::{KnownVersion, Result};
 use serde_json::Value;
 
 /// Something that can deliver one JSON-RPC message and hand back the reply.
@@ -11,6 +11,9 @@ use serde_json::Value;
 /// `send` returns `Ok(None)` for notifications, which by definition get no answer.
 pub trait Transport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>>;
+    /// Told once, after `initialize`, which version the session settled on. HTTP
+    /// puts it on every request from then on; stdio has nowhere to put it.
+    fn negotiated(&mut self, _version: KnownVersion) {}
     fn close(&mut self) {}
 }
 
@@ -24,6 +27,9 @@ pub(crate) fn silent() -> Logger {
 impl Transport for Box<dyn Transport> {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
         (**self).send(payload)
+    }
+    fn negotiated(&mut self, version: KnownVersion) {
+        (**self).negotiated(version)
     }
     fn close(&mut self) {
         (**self).close()

@@ -8,8 +8,10 @@
 
 use serde_json::{json, Value};
 use std::fmt;
+use std::str::FromStr;
 
-pub const PROTOCOL_VERSION: &str = "2025-06-18";
+/// What `initialize` offers unless a version is pinned: the newest one we speak.
+pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST.as_str();
 pub const CLIENT_NAME: &str = "mcpdial";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -17,6 +19,97 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The protocol revisions mcpdial speaks, newest first.
+///
+/// Ordered by date, so a feature gate reads `session.version() >= V2025_11_25`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KnownVersion {
+    V2025_11_25,
+    V2025_06_18,
+    V2025_03_26,
+}
+
+impl KnownVersion {
+    pub const ALL: [KnownVersion; 3] = [
+        KnownVersion::V2025_11_25,
+        KnownVersion::V2025_06_18,
+        KnownVersion::V2025_03_26,
+    ];
+    pub const LATEST: KnownVersion = KnownVersion::ALL[0];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            KnownVersion::V2025_11_25 => "2025-11-25",
+            KnownVersion::V2025_06_18 => "2025-06-18",
+            KnownVersion::V2025_03_26 => "2025-03-26",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<KnownVersion> {
+        KnownVersion::ALL.into_iter().find(|v| v.as_str() == s)
+    }
+
+    fn listed() -> String {
+        KnownVersion::ALL
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl PartialOrd for KnownVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for KnownVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl fmt::Display for KnownVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for KnownVersion {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        KnownVersion::parse(s).ok_or_else(|| {
+            format!(
+                "{s:?} is not a protocol version mcpdial speaks (one of {})",
+                KnownVersion::listed()
+            )
+        })
+    }
+}
+
+/// The version a session runs on, given what `initialize` offered and the
+/// `protocolVersion` the server answered with.
+///
+/// A server that supports the offer echoes it; one that does not names another
+/// version it supports, and the spec has a client that does not speak that one
+/// disconnect. A server that names none is taken to have accepted the offer.
+pub fn negotiate(offered: KnownVersion, answered: &Value) -> Result<KnownVersion> {
+    let answered = match answered {
+        Value::Null => return Ok(offered),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    KnownVersion::parse(&answered).ok_or_else(|| {
+        Error::transport(format!(
+            "the server answered initialize with protocol version {answered}, which mcpdial \
+             does not speak (offered {offered}; known: {}).\n\
+             Hint: offer one the server accepts with --protocol-version VERSION.",
+            KnownVersion::listed()
+        ))
+    })
+}
 
 /// Everything that can go wrong, sorted by who is to blame.
 #[derive(Debug)]
@@ -519,5 +612,48 @@ mod tests {
             .unwrap()
             .contains("sampling/createMessage"));
         assert!(refusal.get("result").is_none());
+    }
+
+    #[test]
+    fn known_versions_order_by_date_and_the_newest_is_offered() {
+        use KnownVersion::*;
+        assert!(V2025_11_25 > V2025_06_18 && V2025_06_18 > V2025_03_26);
+        assert_eq!(KnownVersion::LATEST, V2025_11_25);
+        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+        assert_eq!("2025-03-26".parse::<KnownVersion>(), Ok(V2025_03_26));
+        let e = "2024-11-05".parse::<KnownVersion>().unwrap_err();
+        assert!(e.contains("2024-11-05") && e.contains("2025-11-25"), "{e}");
+        assert_eq!(V2025_06_18.to_string(), "2025-06-18");
+    }
+
+    #[test]
+    fn a_known_answer_is_agreed_to_and_none_means_the_offer_stood() {
+        use KnownVersion::*;
+        assert_eq!(
+            negotiate(V2025_11_25, &json!("2025-11-25")).unwrap(),
+            V2025_11_25
+        );
+        assert_eq!(
+            negotiate(V2025_11_25, &json!("2025-06-18")).unwrap(),
+            V2025_06_18
+        );
+        assert_eq!(negotiate(V2025_06_18, &Value::Null).unwrap(), V2025_06_18);
+    }
+
+    #[test]
+    fn an_unknown_answer_is_a_transport_error_naming_both_versions() {
+        let e = negotiate(KnownVersion::V2025_11_25, &json!("1999-01-01")).unwrap_err();
+        assert!(matches!(e, Error::Transport(_)), "{e:?}");
+        let text = e.to_string();
+        assert!(
+            text.contains("1999-01-01") && text.contains("2025-11-25"),
+            "{text}"
+        );
+        assert!(text.contains("--protocol-version"), "{text}");
+        let not_a_string = negotiate(KnownVersion::V2025_11_25, &json!(3)).unwrap_err();
+        assert!(
+            not_a_string.to_string().contains("version 3"),
+            "{not_a_string}"
+        );
     }
 }

@@ -149,4 +149,8 @@ terminal; piped input is read one line at a time with no editing and no history.
 - A stdio server that exits before replying reports its exit status and last stderr
   lines in the error message. A wrong package name shows up there as an npm 404.
 - Servers are called at their final URL. A redirect is reported, not followed.
+- `initialize` offers protocol `2025-11-25`; `info --json` reports the version the
+  server agreed to under `protocolVersion`. A `transport` error naming a version
+  mcpdial does not speak means the server wants one it was not offered; retry with
+  `--protocol-version 2025-06-18` (or `2025-03-26`), and save it with `add`.
 - `mcpdial guide` prints this document.

@@ -117,8 +117,8 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 ## Commands
 
 ```
-mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR]
-mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR]
+mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V]
+mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V]
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
 mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
 mcpdial rm NAME
@@ -146,7 +146,14 @@ mcpdial completions SHELL        a completion script; see Install above
 
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
-environment, `--user-agent` to override the default browser UA.
+environment, `--user-agent` to override the default browser UA, and
+`--protocol-version VERSION` to offer an older MCP revision at `initialize`.
+
+`initialize` offers protocol `2025-11-25` and runs on whichever version the server
+answers with, out of `2025-11-25`, `2025-06-18` and `2025-03-26`; `mcpdial info` shows
+the one agreed. A server that answers with a version mcpdial does not speak is reported
+as such. For a server that misbehaves when offered the newest, `--protocol-version
+2025-06-18` offers that instead, and `add --protocol-version` saves the choice.
 
 ### Seeing what a server offers
 

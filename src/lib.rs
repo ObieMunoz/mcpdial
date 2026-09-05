@@ -31,7 +31,7 @@ pub mod transport;
 
 pub use client::{connect, probe, probe_all, resolve, Connection, Probe, Status};
 pub use config::{Credential, ServerConfig, Store};
-pub use protocol::{decode_body, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
+pub use protocol::{decode_body, Error, KnownVersion, Result, CLIENT_NAME, PROTOCOL_VERSION};
 pub use session::{render_content, Session};
 pub use transport::http::{HttpTransport, USER_AGENT};
 pub use transport::stdio::StdioTransport;
