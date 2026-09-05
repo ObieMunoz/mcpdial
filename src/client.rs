@@ -5,7 +5,7 @@ use crate::config::{ServerConfig, Store};
 use crate::oauth;
 use crate::protocol::{Error, Result};
 use crate::session::Session;
-use crate::transport::http::{HttpTransport, USER_AGENT};
+use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
 use crate::transport::{Logger, Transport};
 use serde::Serialize;
@@ -228,6 +228,8 @@ pub enum Status {
     TokenRejected,
     /// 403 without a challenge: WAF, allowlist, geo. A token will not help.
     Blocked,
+    /// Reachable and healthy, but speaking protocol 2024-11-05's HTTP+SSE transport.
+    LegacySse,
     Http {
         status: u16,
     },
@@ -246,6 +248,7 @@ impl Status {
             Status::AuthRequired => "auth required".into(),
             Status::TokenRejected => "token rejected".into(),
             Status::Blocked => "blocked (403)".into(),
+            Status::LegacySse => "legacy sse".into(),
             Status::Http { status } => format!("http {status}"),
             Status::Unreachable { .. } => "unreachable".into(),
             Status::Error { .. } => "error".into(),
@@ -327,6 +330,7 @@ fn classify(e: &Error, had_credential: bool) -> Status {
             (403, None) => Status::Blocked,
             (s, _) => Status::Http { status: *s },
         },
+        Error::Transport(d) if is_legacy_sse_error(d) => Status::LegacySse,
         Error::Transport(d) => Status::Unreachable { detail: d.clone() },
         other => Status::Error {
             detail: other.to_string(),
@@ -468,6 +472,17 @@ mod tests {
         );
         assert!(matches!(
             classify(&Error::transport("x"), false),
+            Status::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn the_older_transport_is_not_filed_under_unreachable() {
+        let found = crate::transport::http::legacy_sse_error("https://example.test/sse");
+        assert_eq!(classify(&found, false), Status::LegacySse);
+        assert_eq!(Status::LegacySse.label(), "legacy sse");
+        assert!(matches!(
+            classify(&Error::transport("connection refused"), false),
             Status::Unreachable { .. }
         ));
     }
