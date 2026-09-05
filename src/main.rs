@@ -507,6 +507,34 @@ fn missing_capability(e: Error, capability: &str, info_cmd: &str) -> Failure {
     }
 }
 
+/// Rendered tool or prompt text on stdout. On a terminal the control characters
+/// that move the cursor or open an escape sequence are shown as escapes instead:
+/// a server that lists `\r` among its valid keys otherwise overwrites the start
+/// of its own error message. Newlines and tabs are the text's own layout and
+/// stay. A pipe gets the text as the server sent it.
+fn print_text(text: &str) {
+    if std::io::stdout().is_terminal() {
+        println!("{}", visible(text));
+    } else {
+        println!("{text}");
+    }
+}
+
+fn visible(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' | '\t' => out.push(c),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c if c.is_control() => write!(out, "\\x{:02x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn advertises(server_info: &Value, capability: &str) -> bool {
     server_info["capabilities"].get(capability).is_some()
 }
@@ -1082,7 +1110,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                     } else {
                                         let messages = render_messages(&result);
                                         if !messages.is_empty() {
-                                            println!("{messages}");
+                                            print_text(&messages);
                                         }
                                     }
                                 })
@@ -1117,7 +1145,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                             println!("{result}");
                                         } else {
                                             if !out.is_empty() {
-                                                println!("{out}");
+                                                print_text(&out);
                                             }
                                             if failed {
                                                 eprintln!("(tool reported an error)");
@@ -1339,7 +1367,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
                 let messages = render_messages(&result);
                 if !messages.is_empty() {
-                    println!("{messages}");
+                    print_text(&messages);
                 }
             }
             Ok(0)
@@ -1568,7 +1596,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&result).unwrap());
             } else if !text.is_empty() {
-                println!("{text}");
+                print_text(&text);
             }
             // A failed result that is really a schema complaint gets the same
             // answer as the JSON-RPC error other servers would have sent.
@@ -1930,6 +1958,20 @@ mod tests {
     use super::*;
     use rustyline::completion::Completer;
     use rustyline::history::DefaultHistory;
+
+    #[test]
+    fn visible_escapes_what_would_move_the_cursor_and_keeps_layout() {
+        assert_eq!(
+            visible(
+                "Error: k is invalid. Valid keys are: Enter,\r,\n,ShiftLeft,\0,\x1b[0m,\u{9b}\tend"
+            ),
+            "Error: k is invalid. Valid keys are: Enter,\\r,\n,ShiftLeft,\\0,\\x1b[0m,\\x9b\tend"
+        );
+        assert_eq!(
+            visible("plain text\nsecond line"),
+            "plain text\nsecond line"
+        );
+    }
 
     fn complete(helper: &ShellHelper, line: &str) -> (usize, Vec<String>) {
         let history = DefaultHistory::new();
