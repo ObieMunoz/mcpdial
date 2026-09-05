@@ -109,23 +109,32 @@ impl<T: Transport> Drop for Session<T> {
 
 /// Flatten a `tools/call` result to text, one content block per line.
 /// Non-text blocks (images, resources) are emitted as their JSON.
+///
+/// A tool that declares an `outputSchema` may answer with `structuredContent` and no
+/// content blocks at all (2025-06-18). Without the fallback such a result prints as
+/// the empty string, indistinguishable from a tool that legitimately returned nothing.
 pub fn render_content(result: &Value) -> String {
-    result
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .map(
-                    |b| match (b.get("type").and_then(Value::as_str), b.get("text")) {
-                        (Some("text"), Some(Value::String(t))) => t.clone(),
-                        _ => b.to_string(),
-                    },
-                )
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+    let blocks = match result.get("content").and_then(Value::as_array) {
+        Some(blocks) => render_blocks(blocks),
+        None => String::new(),
+    };
+    match result.get("structuredContent") {
+        Some(structured) if blocks.is_empty() => serde_json::to_string_pretty(structured).unwrap(),
+        _ => blocks,
+    }
+}
+
+fn render_blocks(blocks: &[Value]) -> String {
+    blocks
+        .iter()
+        .map(
+            |b| match (b.get("type").and_then(Value::as_str), b.get("text")) {
+                (Some("text"), Some(Value::String(t))) => t.clone(),
+                _ => b.to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
@@ -286,5 +295,25 @@ mod tests {
         assert!(out.starts_with("a\n{"));
         assert!(out.contains("\"type\":\"image\""));
         assert_eq!(render_content(&json!({})), "");
+    }
+
+    #[test]
+    fn render_content_prints_structured_content_when_no_block_renders() {
+        let only = json!({"structuredContent":{"temp":20},"isError":false});
+        assert_eq!(render_content(&only), "{\n  \"temp\": 20\n}");
+
+        let empty_array = json!({"content":[],"structuredContent":{"temp":20}});
+        assert_eq!(render_content(&empty_array), "{\n  \"temp\": 20\n}");
+
+        assert_eq!(render_content(&json!({"content":[]})), "");
+    }
+
+    #[test]
+    fn render_content_leaves_a_result_with_blocks_untouched() {
+        let both = json!({
+            "content":[{"type":"text","text":"20 degrees"}],
+            "structuredContent":{"temp":20},
+        });
+        assert_eq!(render_content(&both), "20 degrees");
     }
 }

@@ -1082,3 +1082,43 @@ fn stdio_answers_what_the_server_asks_mid_call() {
         o.stderr
     );
 }
+
+#[test]
+fn a_structured_only_result_still_prints() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("structured");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "reading"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["celsius"], 20, "{}", o.stdout);
+
+    let o = run(mcpdial(&home).args(["--json", "call", &s.url, "reading"]));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["structuredContent"]["celsius"], 20);
+}
+
+#[test]
+fn content_blocks_win_over_structured_content() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("both-shapes");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "add", r#"{"a":1,"b":2}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "The sum of 1 and 2 is 3.");
+}
+
+#[test]
+fn schema_shows_an_output_schema_and_names_it() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("output-schema");
+
+    let o = run(mcpdial(&home).args(["schema", &s.url, "add"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["outputSchema"]["required"][0], "sum");
+    assert!(o.stderr.contains("structuredContent"), "{}", o.stderr);
+
+    let o = run(mcpdial(&home).args(["schema", &s.url, "echo"]));
+    assert!(o.stderr.is_empty(), "{}", o.stderr);
+}

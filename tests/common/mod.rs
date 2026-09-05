@@ -345,7 +345,11 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
                     params["arguments"]["a"].as_f64().unwrap_or(0.0),
                     params["arguments"]["b"].as_f64().unwrap_or(0.0),
                 );
-                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}]}})
+                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}],"structuredContent":{"sum": a + b}}})
+            }
+            // Left out of tools/list on purpose: a third tool renumbers every listing assertion.
+            "reading" => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"celsius":20},"isError":false}})
             }
             "fail" => {
                 json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}})
@@ -388,7 +392,8 @@ fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
     let echo = json!({"name":"echo","description":"Echo a message back.\nSecond line.",
         "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}});
     let add = json!({"name":"add","description":"Add two numbers.",
-        "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}});
+        "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]},
+        "outputSchema":{"type":"object","properties":{"sum":{"type":"number"}},"required":["sum"]}});
     match cursor {
         None => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[echo],"nextCursor":"page-2"}}),
         Some("page-2") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[add]}}),
