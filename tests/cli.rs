@@ -1197,12 +1197,13 @@ fn the_version_on_the_wire_is_the_one_the_server_agreed_to() {
     assert_eq!(o.code, 0, "{}", o.stderr);
 
     let reqs = s.requests.lock().unwrap();
+    assert_eq!(reqs[0].json()["params"]["protocolVersion"], "2025-11-25");
     let after_the_handshake = &reqs[1..];
     assert!(!after_the_handshake.is_empty());
     for r in after_the_handshake {
         assert_eq!(
             r.header("mcp-protocol-version"),
-            Some("2024-11-05"),
+            Some("2025-06-18"),
             "{}",
             r.body
         );

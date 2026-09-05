@@ -43,6 +43,10 @@ pub struct ServerConfig {
     /// Working directory for a stdio server's process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Protocol version to offer at `initialize` instead of the newest, for a
+    /// server that misbehaves when offered one it has never heard of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
     /// Where the entry came from, when it was added from the catalog or the
     /// registry. Nothing dials with it; `browse` and a later `update` read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -143,6 +147,7 @@ impl ServerConfig {
             token_env: self.token_env.clone(),
             env,
             cwd: self.cwd.as_deref().map(|d| fill("cwd", d)).transpose()?,
+            protocol_version: self.protocol_version.clone(),
             source: self.source.clone(),
         })
     }

@@ -1,7 +1,7 @@
 //! Streamable HTTP: POST JSON-RPC to one URL, read back JSON or a one-shot SSE frame.
 
 use super::{silent, Logger, Transport};
-use crate::protocol::{decode_body, Error, Result, PROTOCOL_VERSION};
+use crate::protocol::{decode_body, Error, KnownVersion, Result};
 use serde_json::Value;
 use std::io::Read;
 use std::time::Duration;
@@ -35,10 +35,10 @@ pub struct HttpTransport {
     /// Set by stateful servers on `initialize`; echoed on every later request.
     /// Stateless servers never send one and we simply never echo one.
     pub session_id: Option<String>,
-    /// Set once `initialize` has answered. Its presence is also the handshake flag:
-    /// the spec puts `MCP-Protocol-Version` on every request after initialization
-    /// and none on `initialize` itself, which has nothing negotiated yet.
-    negotiated_version: Option<String>,
+    /// What the session settled on at `initialize`. Its presence is also the
+    /// handshake flag: the spec puts `MCP-Protocol-Version` on every request after
+    /// initialization and none on `initialize` itself, which has nothing negotiated yet.
+    negotiated_version: Option<KnownVersion>,
 }
 
 impl HttpTransport {
@@ -65,8 +65,8 @@ impl HttpTransport {
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
-        if let Some(version) = &self.negotiated_version {
-            req = req.header("MCP-Protocol-Version", version);
+        if let Some(version) = self.negotiated_version {
+            req = req.header("MCP-Protocol-Version", version.as_str());
         }
         for (k, v) in &self.extra_headers {
             req = req.header(k, v);
@@ -238,16 +238,6 @@ fn is_endpoint_event(line: &str) -> bool {
         .is_some_and(|name| name.trim() == "endpoint")
 }
 
-/// The version the server named in its `initialize` result, falling back to ours
-/// when it named none. A server may agree to a version other than the one we asked
-/// for, and the header has to carry what it actually replied with.
-fn agreed_version(initialize_reply: Option<&Value>) -> String {
-    initialize_reply
-        .and_then(|msg| msg["result"]["protocolVersion"].as_str())
-        .unwrap_or(PROTOCOL_VERSION)
-        .to_string()
-}
-
 impl Transport for HttpTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
         let body = payload.to_string();
@@ -302,11 +292,11 @@ impl Transport for HttpTransport {
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
-        let reply = decode_body(&text, &content_type)?;
-        if payload["method"] == "initialize" {
-            self.negotiated_version = Some(agreed_version(reply.as_ref()));
-        }
-        Ok(reply)
+        decode_body(&text, &content_type)
+    }
+
+    fn negotiated(&mut self, version: KnownVersion) {
+        self.negotiated_version = Some(version);
     }
 
     /// End the session server-side, as Streamable HTTP prescribes; without it the

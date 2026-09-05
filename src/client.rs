@@ -5,7 +5,7 @@
 
 use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
 use crate::oauth;
-use crate::protocol::{Error, Result};
+use crate::protocol::{Error, KnownVersion, Result};
 use crate::session::Session;
 use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
@@ -24,6 +24,8 @@ pub struct Options {
     pub extra_headers: Vec<(String, String)>,
     /// `--token-env` on the command line: beats everything else.
     pub token_env: Option<String>,
+    /// `--protocol-version` on the command line: beats the one saved for the server.
+    pub protocol_version: Option<KnownVersion>,
     pub verbose: bool,
 }
 
@@ -34,6 +36,7 @@ impl Default for Options {
             user_agent: USER_AGENT.to_string(),
             extra_headers: Vec::new(),
             token_env: None,
+            protocol_version: None,
             verbose: false,
         }
     }
@@ -159,12 +162,28 @@ fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTr
     b.build()
 }
 
+/// The version to offer at `initialize`: the flag, else the one saved with the
+/// server, else the newest. A saved value this build does not know is a config
+/// error, since the file was edited to say something we cannot send.
+fn version_to_offer(r: &Resolved, opts: &Options) -> Result<KnownVersion> {
+    if let Some(pinned) = opts.protocol_version {
+        return Ok(pinned);
+    }
+    match &r.config.protocol_version {
+        Some(saved) => saved
+            .parse()
+            .map_err(|e| Error::config(format!("{}: protocol_version {e}", r.name))),
+        None => Ok(KnownVersion::LATEST),
+    }
+}
+
 fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
     auth: AuthUsed,
+    offer: KnownVersion,
 ) -> Result<Connection> {
-    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>);
+    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>).offering(offer);
     let server_info = session.initialize()?.clone();
     Ok(Connection {
         name: r.name.clone(),
@@ -191,6 +210,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         saved: r.saved,
     };
     let r = &dialed;
+    let offer = version_to_offer(r, opts)?;
     if let Some(cmd) = &r.config.stdio {
         let argv = crate::transport::stdio::split_command(cmd)?;
         let env: Vec<(String, String)> = r
@@ -207,18 +227,18 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
             opts.verbose,
             opts.logger(),
         )?;
-        return handshake(r, t, AuthUsed::None);
+        return handshake(r, t, AuthUsed::None, offer);
     }
 
     let (token, auth) = select_token(store, r, opts)?;
-    match handshake(r, http_transport(r, token, opts), auth) {
+    match handshake(r, http_transport(r, token, opts), auth, offer) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
                 return Err(e);
             }
             let cred = refresh_and_save(store, &r.name, &cred, opts)?;
-            handshake(r, http_transport(r, cred.access_token, opts), auth)
+            handshake(r, http_transport(r, cred.access_token, opts), auth, offer)
         }
         outcome => outcome,
     }

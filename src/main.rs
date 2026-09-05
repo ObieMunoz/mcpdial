@@ -5,7 +5,7 @@ use mcpdial::config::Source;
 use mcpdial::protocol::METHOD_NOT_FOUND;
 use mcpdial::registry::{Pick, Registry};
 use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
-use mcpdial::{oauth, Credential, Error, ServerConfig, Store, USER_AGENT};
+use mcpdial::{oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -66,6 +66,10 @@ struct Cli {
     /// A `${VAR}` in any `-H` header value does the same for that header.
     #[arg(long, global = true, value_name = "VAR")]
     token_env: Option<String>,
+
+    /// MCP protocol version to offer at initialize instead of the newest. With `add`, saved.
+    #[arg(long, global = true, value_name = "VERSION")]
+    protocol_version: Option<KnownVersion>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -998,6 +1002,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         user_agent: cli.user_agent.clone(),
         extra_headers: parse_headers(&cli.headers)?,
         token_env: cli.token_env.clone(),
+        protocol_version: cli.protocol_version,
         verbose: cli.verbose,
     };
 
@@ -1062,6 +1067,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             }
             cfg.headers.extend(opts.extra_headers.iter().cloned());
             cfg.token_env = opts.token_env.clone();
+            cfg.protocol_version = opts.protocol_version.map(|v| v.to_string());
             let summary = format!("{} {}", cfg.kind(), cfg.location());
             store.add_server(&name, cfg)?;
             eprintln!("saved {name} ({summary})");

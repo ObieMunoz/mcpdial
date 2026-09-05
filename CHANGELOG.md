@@ -21,6 +21,10 @@ carries its section from here as its release notes.
 - `servers.json` records where a server came from: `add --registry` writes the
   entry's registry name and version under `source`, `ls --no-probe` shows it in a
   `SOURCE` column once any server has one, and `--json` carries the object.
+- `initialize` offers protocol 2025-11-25 and keeps whichever version the server
+  answers with (2025-11-25, 2025-06-18 or 2025-03-26); an answer mcpdial does not
+  speak is a `transport` error naming both versions. `--protocol-version VERSION`
+  offers an older one instead, and `add --protocol-version` saves that for a server.
 
 ## [0.1.0] - 2026-09-05
 
