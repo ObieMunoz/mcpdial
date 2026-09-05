@@ -25,6 +25,23 @@ carries its section from here as its release notes.
   answers with (2025-11-25, 2025-06-18 or 2025-03-26); an answer mcpdial does not
   speak is a `transport` error naming both versions. `--protocol-version VERSION`
   offers an older one instead, and `add --protocol-version` saves that for a server.
+- `add` dials the server it just saved and prints the row `ls` would, so a server
+  that does not answer or needs `login` is known at once; `--no-probe` skips it.
+  With `--json` the row is inside the `saved` receipt.
+- Under `--json`, every command that changes what is saved prints one receipt object
+  on stdout: `saved`, `removed`, `imported`/`skipped`, `login`, `saved_credential`
+  and `removed_credential`.
+
+### Fixed
+
+- `add` rejects an `--http` value that is not an `http(s)://` URL and a `--stdio`
+  command line with no words in it before saving anything, and refuses to replace a
+  name that is already saved unless `--force` is passed, as `import` does.
+- Under `--json`, the usage hint under a failed `call` result is `{"hint": ...}` on
+  stderr rather than prose, `token show` with no saved credential is a config error
+  (exit 2), and `info` in `shell --json` is one line like every other command.
+- `call` prints `(tool reported an error)` on stderr for a result with `isError` set,
+  as `shell` already did, so a plain-sentence failure no longer reads as success.
 
 ## [0.1.0] - 2026-09-05
 

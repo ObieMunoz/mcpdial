@@ -22,7 +22,8 @@
    `mcpdial schema TARGET TOOL` returns just that object.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json` prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text
-   content blocks are printed as plain text, one per line.
+   content blocks are printed as plain text, one per line, and a result with `isError`
+   set is followed by `(tool reported an error)` on stderr.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
    and prints one JSON line per command. Send `quit` or close stdin to finish.
 5. **Add what is missing.** `mcpdial add NAME --registry <registry name>` saves an
@@ -30,7 +31,9 @@
    own `name`, like `io.github.owner/server`, and must be known already. A required
    value the entry leaves to the user is exit 2 with a `hint` naming it, and
    `--arg VALUE` supplies it. Required environment variables are saved as `${VAR}`
-   placeholders and named on stderr; they must be set before the server is dialed.
+   placeholders and named on stderr, or under `saved.notes` with `--json`; they must be
+   set before the server is dialed. Every command that changes what is saved prints a
+   receipt with `--json`; see below.
 
 ## Passing arguments
 
@@ -101,7 +104,35 @@ per parameter, so a retry needs no extra `schema` call:
 If the tool name itself is unknown, `hint` names the nearest one instead. Some servers
 report a schema violation as a *result* with `isError` and the `-32602` text in its
 content rather than as a JSON-RPC error; that case prints the same usage block on
-**stderr**, leaving the result object on stdout untouched.
+**stderr**, as `{"hint":"usage: ..."}` with `--json`, leaving the result object on stdout
+untouched.
+
+With `--json`, every line on either stream is a JSON object.
+
+## Receipts
+
+Commands that change what is saved report on stderr for a human, and with `--json` print
+one object on stdout instead, so nothing has to be confirmed by parsing a sentence:
+
+```
+mcpdial add NAME ... --json      {"saved":{"name":"x","kind":"http","location":"https://u/mcp",...}}
+mcpdial rm NAME --json           {"removed":"x"}
+mcpdial import FILE --json       {"imported":["a","b"],"skipped":["c"]}
+mcpdial login TARGET --json      {"login":{"name":"x","expires_at":1760000000,"refreshable":true}}
+mcpdial logout TARGET --json     {"removed_credential":"x"}     null when none was saved
+mcpdial token set NAME --json    {"saved_credential":"x"}
+mcpdial token rm NAME --json     {"removed_credential":"x"}     null when none was saved
+```
+
+`add` dials the server it just saved and reports the row `ls --json` would, so `saved`
+also carries `status`, `auth`, `server` and `tools`; `--no-probe` skips the dial and
+leaves `name`, `kind` and `location` alone, as does `--registry`, which never runs what
+it saves. The exit code is 0 whenever the save succeeded, whatever `status` says: read
+it. `add` refuses a name that is already saved unless `--force` is passed, and rejects
+an `--http` value that is not an `http(s)://` URL or a `--stdio` command line with no
+words in it; each is a usage error (exit 2) with nothing written. `token show` with no
+saved credential is a config error (exit 2). `login` prints its progress, including the
+authorization URL, as plain lines on stderr in either mode.
 
 ## Shell protocol
 
@@ -124,9 +155,10 @@ quit
 Lines starting with `#` are ignored. Output with `--json`: one line per command. `call`
 prints the result object; `tools` prints `{"tools":[...]}`; `schema` prints the tool
 object; `resources` prints `{"resources":[...],"resourceTemplates":[...]}`; `prompts`
-prints `{"prompts":[...]}`; `read` and `prompt` print their results untouched; errors
-print `{"error":{...}}`. The process exits 1 at the end if any command failed and stdin
-was not a terminal.
+prints `{"prompts":[...]}`; `read`, `prompt` and `info` print their results untouched;
+errors print `{"error":{...}}`. A usage hint under a failed `call` result goes to stderr
+as `{"hint":"..."}`, so stdout stays one line per command. The process exits 1 at the
+end if any command failed and stdin was not a terminal.
 
 A bare tool name is not a command; `call` it. Nothing else in the line is guessed at.
 Line editing, history and Tab completion apply only when stdin and stdout are both a

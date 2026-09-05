@@ -545,6 +545,24 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
     Ok(rows.into_values().collect())
 }
 
+/// One saved server's row, dialed now and remembered, so that `add` can say
+/// what `ls` would without dialing every other server.
+pub fn listing_one(store: &Store, opts: &Options, name: &str) -> Result<Listing> {
+    let servers = store.servers()?;
+    let cfg = servers
+        .get(name)
+        .cloned()
+        .ok_or_else(|| Error::usage(format!("no server named {name:?}")))?;
+    let key = probe_keys(store, &servers)[name];
+    let now = now();
+    let probe = probe_each(store, vec![(name.to_string(), cfg)], opts, true)
+        .pop()
+        .expect("one probe per server");
+    let row = Listing::probed(probe, now);
+    let _ = store.save_probes(BTreeMap::from([(name.to_string(), row.record(key))]));
+    Ok(row)
+}
+
 /// Human-readable parameter summary from a tool's JSON schema.
 pub fn describe_params(tool: &Value) -> Vec<String> {
     let schema = &tool["inputSchema"];

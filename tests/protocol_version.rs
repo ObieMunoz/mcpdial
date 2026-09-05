@@ -117,6 +117,7 @@ fn add_saves_the_pinned_version_and_the_flag_still_beats_it() {
         &s.url,
         "--protocol-version",
         "2025-06-18",
+        "--no-probe",
     ]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     let saved: Value =

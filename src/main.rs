@@ -115,6 +115,12 @@ enum Cmd {
         /// Working directory for the stdio process
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
+        /// Replace a server already saved under this name
+        #[arg(long)]
+        force: bool,
+        /// Save without dialing the server for its status
+        #[arg(long)]
+        no_probe: bool,
     },
     /// Import servers from a host's config (Claude Code, Claude Desktop, Cursor, ...)
     Import {
@@ -322,6 +328,35 @@ fn print_value(v: &Value, compact: bool) {
     } else {
         print_json(v);
     }
+}
+
+/// A hint on stderr: prose for a human, `{"hint": ...}` under `--json`, where
+/// every line on either stream has to be an object.
+fn print_hint(hint: &str, json: bool) {
+    if json {
+        eprintln!("{}", json!({ "hint": hint }));
+    } else {
+        eprintln!("{hint}");
+    }
+}
+
+/// A tool result on stdout, and a marker on stderr when the tool reported an
+/// error: a failure whose text is a plain sentence otherwise reads as success
+/// to anyone not checking `$?`. Under `--json` the object carries `isError`
+/// itself. Returns whether the tool reported an error.
+fn print_tool_result(result: &Value, text: &str, json: bool, one_line: bool) -> bool {
+    let failed = result["isError"].as_bool().unwrap_or(false);
+    if json {
+        print_value(result, one_line);
+    } else {
+        if !text.is_empty() {
+            print_text(text);
+        }
+        if failed {
+            eprintln!("(tool reported an error)");
+        }
+    }
+    failed
 }
 
 fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connection, Failure> {
@@ -752,6 +787,30 @@ fn write_resource(bodies: &[ResourceBody], redirect: &str) -> Result<(), Failure
     Ok(())
 }
 
+/// Where `add` was told a server lives, checked before anything is written: an
+/// http(s) URL with a host, or a command line with at least one word. A mistake
+/// here would otherwise surface on the next `ls`, as an unreachable server.
+fn validate_location(cfg: &ServerConfig) -> Result<(), Error> {
+    // A `${VAR}` is filled in when the server is dialed; what can be checked
+    // now is the shape around it.
+    let filled = cfg.expanded(|_| Some("var".to_string()))?;
+    if let (Some(url), Some(given)) = (&filled.http, &cfg.http) {
+        let has_scheme = url.starts_with("http://") || url.starts_with("https://");
+        let has_host = url
+            .parse::<ureq::http::Uri>()
+            .is_ok_and(|u| u.host().is_some_and(|h| !h.is_empty()));
+        if !has_scheme || !has_host {
+            return Err(Error::usage(format!(
+                "--http needs an http:// or https:// URL, got {given:?}"
+            )));
+        }
+    }
+    if let Some(cmd) = &filled.stdio {
+        mcpdial::transport::stdio::split_command(cmd)?;
+    }
+    Ok(())
+}
+
 fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
     items
         .iter()
@@ -1017,7 +1076,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             arg,
             env,
             cwd,
+            force,
+            no_probe,
         } => {
+            // A registry entry is saved without being run, as documented: its
+            // command usually needs values the user has yet to supply.
+            let dial = !no_probe && registry.is_none();
             let mut notes = Vec::new();
             let mut cfg = match (http, stdio, registry) {
                 (Some(url), None, None) => ServerConfig::http(url),
@@ -1068,11 +1132,40 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             cfg.headers.extend(opts.extra_headers.iter().cloned());
             cfg.token_env = opts.token_env.clone();
             cfg.protocol_version = opts.protocol_version.map(|v| v.to_string());
+            validate_location(&cfg)?;
+            if let Some(old) = store.server(&name)?.filter(|_| !force) {
+                return Err(Error::usage(format!(
+                    "{name} is already saved ({} {}); pass --force to replace it",
+                    old.kind(),
+                    old.location()
+                ))
+                .into());
+            }
             let summary = format!("{} {}", cfg.kind(), cfg.location());
+            let mut saved = json!({ "name": name, "kind": cfg.kind(), "location": cfg.location() });
             store.add_server(&name, cfg)?;
-            eprintln!("saved {name} ({summary})");
-            for note in &notes {
-                print_note(note);
+            if force {
+                store.forget_probe(&name)?;
+            }
+            let row = dial
+                .then(|| client::listing_one(&store, &opts, &name))
+                .transpose()?;
+            if cli.json {
+                if let Some(row) = &row {
+                    saved = serde_json::to_value(row).expect("a listing is serializable");
+                }
+                if !notes.is_empty() {
+                    saved["notes"] = json!(notes);
+                }
+                println!("{}", json!({ "saved": saved }));
+            } else {
+                eprintln!("saved {name} ({summary})");
+                for note in &notes {
+                    print_note(note);
+                }
+                if let Some(row) = &row {
+                    print_table(&LISTING_HEADERS, &[listing_row(row)]);
+                }
             }
             Ok(0)
         }
@@ -1092,7 +1185,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .into());
             }
             let existing = store.servers()?;
-            let mut added = 0;
+            let mut imported: Vec<String> = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            // The running commentary is for a human; a program gets one object at the end.
+            let say = |line: String| {
+                if !cli.json {
+                    eprintln!("{line}");
+                }
+            };
             for path in &files {
                 let text = std::fs::read_to_string(path)
                     .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
@@ -1100,36 +1200,44 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     .map_err(|e| Error::config(format!("{}: {e}", path.display())))?;
                 let found = mcpdial::import_config::extract(&doc);
                 if found.is_empty() {
-                    eprintln!("{}: no servers", path.display());
+                    say(format!("{}: no servers", path.display()));
                     continue;
                 }
                 for f in found {
                     if existing.contains_key(&f.name) && !force {
-                        eprintln!(
+                        say(format!(
                             "  skip {:<16} already saved (use --force to overwrite)",
                             f.name
-                        );
+                        ));
+                        skipped.push(f.name);
                         continue;
                     }
                     let summary = format!("{} {}", f.config.kind(), f.config.location());
                     match store.add_server(&f.name, f.config) {
                         Ok(()) => {
-                            added += 1;
-                            eprintln!(
+                            say(format!(
                                 "  add  {:<16} {summary}  [{} in {}]",
                                 f.name,
                                 f.scope,
                                 path.display()
-                            );
+                            ));
                             if let Some(n) = f.note {
-                                eprintln!("       note: {n}");
+                                say(format!("       note: {n}"));
                             }
+                            imported.push(f.name);
                         }
-                        Err(e) => eprintln!("  skip {:<16} {e}", f.name),
+                        Err(e) => {
+                            say(format!("  skip {:<16} {e}", f.name));
+                            skipped.push(f.name);
+                        }
                     }
                 }
             }
-            eprintln!("imported {added} server(s)");
+            if cli.json {
+                println!("{}", json!({ "imported": imported, "skipped": skipped }));
+            } else {
+                eprintln!("imported {} server(s)", imported.len());
+            }
             Ok(0)
         }
 
@@ -1219,7 +1327,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         }
                     }
                     "info" => {
-                        print_json(&conn.server_info);
+                        print_value(&conn.server_info, cli.json);
                         Ok(())
                     }
                     "tools" => conn
@@ -1332,22 +1440,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 Ok(a) => match conn.session.call_tool(tool, a) {
                                     Ok(result) => {
                                         let out = mcpdial::render_content(&result);
-                                        let failed = result["isError"].as_bool().unwrap_or(false);
-                                        if cli.json {
-                                            println!("{result}");
-                                        } else {
-                                            if !out.is_empty() {
-                                                print_text(&out);
-                                            }
-                                            if failed {
-                                                eprintln!("(tool reported an error)");
-                                            }
-                                        }
+                                        let failed =
+                                            print_tool_result(&result, &out, cli.json, true);
                                         if failed && reads_as_argument_error(&out) {
                                             if let Some(hint) =
                                                 shell_call_hint(&mut cache, &mut conn, tool)
                                             {
-                                                eprintln!("{hint}");
+                                                print_hint(&hint, cli.json);
                                             }
                                         }
                                         Ok(())
@@ -1557,7 +1656,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Rm { name } => {
             if store.remove_server(&name)? {
-                eprintln!("removed {name}");
+                if cli.json {
+                    println!("{}", json!({ "removed": name }));
+                } else {
+                    eprintln!("removed {name}");
+                }
                 Ok(0)
             } else {
                 Err(Error::usage(format!("no server named {name:?}")).into())
@@ -1621,27 +1724,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             } else if listing.is_empty() {
                 eprintln!("{NO_SERVERS}");
             } else {
-                let rows: Vec<Vec<String>> = listing
-                    .iter()
-                    .map(|l| {
-                        vec![
-                            l.name.clone(),
-                            l.kind.into(),
-                            l.status.label(),
-                            age_label(l.age_seconds),
-                            auth_label(l),
-                            l.server
-                                .clone()
-                                .or_else(|| l.status.detail().map(truncate))
-                                .unwrap_or_else(|| "-".into()),
-                            l.tools.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-                        ]
-                    })
-                    .collect();
-                print_table(
-                    &["NAME", "TYPE", "STATUS", "AGE", "AUTH", "SERVER", "TOOLS"],
-                    &rows,
-                );
+                let rows: Vec<Vec<String>> = listing.iter().map(listing_row).collect();
+                print_table(&LISTING_HEADERS, &rows);
             }
             Ok(0)
         }
@@ -1771,18 +1855,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     return Err(Failure { error: e, hint });
                 }
             };
-            let is_error = result["isError"].as_bool().unwrap_or(false);
             let text = mcpdial::render_content(&result);
-            if cli.json {
-                print_json(&result);
-            } else if !text.is_empty() {
-                print_text(&text);
-            }
+            let is_error = print_tool_result(&result, &text, cli.json, false);
             // A failed result that is really a schema complaint gets the same
             // answer as the JSON-RPC error other servers would have sent.
             if is_error && reads_as_argument_error(&text) {
                 if let Some(hint) = usage(&mut conn) {
-                    eprintln!("{hint}");
+                    print_hint(&hint, cli.json);
                 }
             }
             Ok(if is_error { EXIT_ERROR } else { 0 })
@@ -1835,22 +1914,36 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 eprintln!("{line}")
             })?;
             store.save_credential(&r.name, cred.clone())?;
-            eprintln!(
-                "saved token for {} ({}{})",
-                r.name,
-                expiry_label(&cred),
-                if cred.refresh_token.is_some() {
-                    ", refreshable"
-                } else {
-                    ""
-                }
-            );
+            let refreshable = cred.refresh_token.is_some();
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({ "login": {
+                        "name": r.name,
+                        "expires_at": cred.expires_at,
+                        "refreshable": refreshable,
+                    } })
+                );
+            } else {
+                eprintln!(
+                    "saved token for {} ({}{})",
+                    r.name,
+                    expiry_label(&cred),
+                    if refreshable { ", refreshable" } else { "" }
+                );
+            }
             Ok(0)
         }
 
         Cmd::Logout { target } | Cmd::Token(TokenCmd::Rm { name: target }) => {
             let name = credential_key(&store, target);
-            if store.remove_credential(&name)? {
+            let removed = store.remove_credential(&name)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    json!({ "removed_credential": removed.then_some(&name) })
+                );
+            } else if removed {
                 eprintln!("removed credential for {name}");
             } else {
                 eprintln!("no credential saved for {name}");
@@ -1866,15 +1959,18 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             cred.expires_at = None;
             cred.source = Some("manual".into());
             store.save_credential(&key, cred)?;
-            eprintln!("saved token for {key}");
+            if cli.json {
+                println!("{}", json!({ "saved_credential": key }));
+            } else {
+                eprintln!("saved token for {key}");
+            }
             Ok(0)
         }
 
         Cmd::Token(TokenCmd::Show { name }) => {
             let key = credential_key(&store, name);
             let Some(cred) = store.credential(&key)? else {
-                eprintln!("no credential saved for {key}");
-                return Ok(EXIT_ERROR);
+                return Err(Error::config(format!("no credential saved for {key}")).into());
             };
             if cli.json {
                 // Metadata only. The secrets never leave the file through this path.
@@ -1949,6 +2045,24 @@ fn import_candidates() -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+const LISTING_HEADERS: [&str; 7] = ["NAME", "TYPE", "STATUS", "AGE", "AUTH", "SERVER", "TOOLS"];
+
+/// One server as `ls` shows it, which is also what `add` shows after dialing.
+fn listing_row(l: &Listing) -> Vec<String> {
+    vec![
+        l.name.clone(),
+        l.kind.into(),
+        l.status.label(),
+        age_label(l.age_seconds),
+        auth_label(l),
+        l.server
+            .clone()
+            .or_else(|| l.status.detail().map(truncate))
+            .unwrap_or_else(|| "-".into()),
+        l.tools.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+    ]
 }
 
 fn auth_label(l: &Listing) -> String {
@@ -2183,6 +2297,28 @@ mod tests {
         assert_eq!(shell_word("https://x/mcp"), "https://x/mcp");
         assert_eq!(shell_word("stdio:npx -y thing"), "'stdio:npx -y thing'");
         assert_eq!(shell_word("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn a_location_is_checked_before_it_is_saved() {
+        assert!(validate_location(&ServerConfig::http("https://mcp.deepwiki.com/mcp")).is_ok());
+        assert!(validate_location(&ServerConfig::http("http://127.0.0.1:8080")).is_ok());
+        // A placeholder is filled in at dial time; the shape around it is what counts.
+        assert!(validate_location(&ServerConfig::http("https://${HOST}/mcp")).is_ok());
+        for bad in [
+            "notaurl",
+            "ftp://x/mcp",
+            "http://",
+            "https://a b/mcp",
+            "mcp.example.com/mcp",
+        ] {
+            let e = validate_location(&ServerConfig::http(bad)).unwrap_err();
+            assert!(matches!(e, Error::Usage(_)), "{bad}: {e}");
+            assert!(e.to_string().contains(bad), "{bad}: {e}");
+        }
+        assert!(validate_location(&ServerConfig::stdio("npx -y thing /tmp")).is_ok());
+        assert!(validate_location(&ServerConfig::stdio("   ")).is_err());
+        assert!(validate_location(&ServerConfig::stdio("'unterminated")).is_err());
     }
 
     #[test]
