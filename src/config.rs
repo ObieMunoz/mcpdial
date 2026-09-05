@@ -639,6 +639,12 @@ impl FileLock {
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // A lock file whose deletion has not finished is still in the
+                // directory, and Windows answers `create_new` on one with a
+                // permission error rather than with "already exists". The
+                // holder is on its way out, so wait for it as usual. The same
+                // error with no lock file there is our own problem, not a race.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && lock.exists() => {}
                 Err(e) => return Err(e),
             }
             let stale = fs::metadata(lock)
