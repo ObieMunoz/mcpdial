@@ -310,7 +310,91 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 ),
             }
         }
+        p if p.starts_with("/v0.1/servers") => registry(base, &percent_decode(p), query),
         _ => Response::from_string("not found").with_status_code(404),
+    }
+}
+
+/// What the fake registry lists: one entry per shape `add --registry` handles. The
+/// remotes point at this server's own `/mcp`, so a server added from here dials.
+pub fn registry_entries(base: &str) -> Vec<Value> {
+    let mcp = format!("{base}/mcp");
+    vec![
+        json!({
+            "name": "io.github.acme/files",
+            "description": "Serve one directory over MCP. A long enough description that the search table has to cut it short somewhere.",
+            "version": "1.2.0",
+            "packages": [{
+                "registryType": "npm", "identifier": "@acme/files", "version": "1.2.0",
+                "runtimeHint": "npx", "transport": {"type": "stdio"},
+                "runtimeArguments": [{"value": "-y", "type": "positional"}],
+                "packageArguments": [{"type": "positional", "valueHint": "directory", "isRequired": true,
+                                      "format": "filepath", "description": "Directory to serve"}],
+                "environmentVariables": [
+                    {"name": "ACME_TOKEN", "isRequired": true, "isSecret": true, "description": "API token"},
+                    {"name": "ACME_LOG", "description": "Log level"}
+                ]
+            }]
+        }),
+        json!({
+            "name": "io.github.acme/remote",
+            "description": "The fake server, reached over HTTP.",
+            "version": "2.0.0",
+            "remotes": [{"type": "streamable-http", "url": mcp}, {"type": "sse", "url": mcp}]
+        }),
+        json!({
+            "name": "io.github.acme/legacy",
+            "description": "The fake server, listed as SSE only.",
+            "version": "0.9.0",
+            "remotes": [{"type": "sse", "url": mcp}]
+        }),
+        json!({
+            "name": "io.github.acme/box",
+            "description": "A sandbox, as a Python package or a container.",
+            "version": "1.0",
+            "packages": [
+                {"registryType": "pypi", "identifier": "acme-box", "version": "1.0", "transport": {"type": "stdio"}},
+                {"registryType": "oci", "identifier": "ghcr.io/acme/box:1.0", "transport": {"type": "stdio"},
+                 "environmentVariables": [{"name": "BOX_KEY", "isRequired": true}]}
+            ]
+        }),
+    ]
+}
+
+/// The two registry routes mcpdial uses: the list with `search`, `limit` and
+/// `version=latest`, and one server's latest version by percent-encoded name.
+fn registry(base: &str, path: &str, query: &str) -> Resp {
+    let meta = json!({"io.modelcontextprotocol.registry/official": {"status": "active", "isLatest": true}});
+    let entries = registry_entries(base);
+    if path == "/v0.1/servers" {
+        let params = form(query);
+        let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        let needle = param("search").unwrap_or("").to_lowercase();
+        let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(30);
+        let servers: Vec<Value> = entries
+            .into_iter()
+            .filter(|e| {
+                let text = format!("{} {}", e["name"], e["description"]).to_lowercase();
+                text.contains(&needle)
+            })
+            .take(limit)
+            .map(|e| json!({"server": e, "_meta": meta}))
+            .collect();
+        let count = servers.len();
+        return json_resp(
+            200,
+            &json!({"servers": servers, "metadata": {"count": count}}),
+        );
+    }
+    let name = path
+        .strip_prefix("/v0.1/servers/")
+        .and_then(|rest| rest.strip_suffix("/versions/latest"));
+    match name.and_then(|n| entries.into_iter().find(|e| e["name"] == n)) {
+        Some(e) => json_resp(200, &json!({"server": e, "_meta": meta})),
+        None => json_resp(
+            404,
+            &json!({"title": "Not Found", "status": 404, "detail": "Server not found"}),
+        ),
     }
 }
 

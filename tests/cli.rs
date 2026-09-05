@@ -2027,3 +2027,146 @@ fn a_url_that_streams_no_endpoint_event_keeps_its_own_error() {
         "the 404 should still have been checked"
     );
 }
+
+#[test]
+fn add_from_the_registry() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("registry");
+    let at_registry = || {
+        let mut c = mcpdial(&home);
+        c.env("MCPDIAL_REGISTRY", &s.base);
+        c
+    };
+
+    // A Streamable HTTP remote is saved as an http server, and it dials.
+    let o = run(at_registry().args(["add", "web", "--registry", "io.github.acme/remote"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stderr.contains(&format!("saved web (http {})", s.url)),
+        "{}",
+        o.stderr
+    );
+    assert!(!o.stderr.contains("note:"), "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["info", "web"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("fake-mcp"), "{}", o.stdout);
+    let after_info = s.requests.lock().unwrap().len();
+
+    // An SSE-only remote is saved too, with the same note import gives.
+    let o = run(at_registry().args(["add", "old", "--registry", "io.github.acme/legacy"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("note: configured as SSE"), "{}", o.stderr);
+
+    // A required value the entry leaves to the user: exit 2 and nothing saved
+    // without --arg, and the hint says what to pass.
+    let o = run(at_registry().args(["add", "fs", "--registry", "io.github.acme/files"]));
+    assert_eq!(o.code, 2, "{}", o.stderr);
+    assert!(
+        o.stderr.contains("needs 1 value(s)")
+            && o.stderr.contains("--arg VALUE")
+            && o.stderr
+                .contains("directory (required): Directory to serve"),
+        "{}",
+        o.stderr
+    );
+    let saved = std::fs::read_to_string(home.join("servers.json")).unwrap();
+    assert!(!saved.contains("\"fs\""), "{saved}");
+
+    let o = run(at_registry().args([
+        "add",
+        "fs",
+        "--registry",
+        "io.github.acme/files",
+        "--arg",
+        "/tmp/a b",
+        "--env",
+        "ACME_LOG=debug",
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("servers.json")).unwrap()).unwrap();
+    let fs = &saved["servers"]["fs"];
+    assert_eq!(fs["stdio"], "npx -y @acme/files@1.2.0 '/tmp/a b'");
+    assert_eq!(fs["env"]["ACME_TOKEN"], "${ACME_TOKEN}");
+    assert_eq!(fs["env"]["ACME_LOG"], "debug", "--env still applies");
+    assert!(
+        o.stderr
+            .contains("ACME_TOKEN (required, secret): API token")
+            && o.stderr.contains("directory (required)"),
+        "{}",
+        o.stderr
+    );
+
+    // --package picks among several; the first runnable one is the default.
+    let o = run(at_registry().args([
+        "add",
+        "box",
+        "--registry",
+        "io.github.acme/box",
+        "--package",
+        "oci",
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o2 = run(at_registry().args(["add", "box-py", "--registry", "io.github.acme/box"]));
+    assert_eq!(o2.code, 0, "{}", o2.stderr);
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(home.join("servers.json")).unwrap()).unwrap();
+    assert_eq!(
+        saved["servers"]["box"]["stdio"],
+        "docker run -i --rm -e BOX_KEY ghcr.io/acme/box:1.0"
+    );
+    assert_eq!(saved["servers"]["box-py"]["stdio"], "uvx acme-box==1.0");
+    let o = run(at_registry().args(["add", "x", "--registry", "io.github.acme/box", "--remote"]));
+    assert_eq!(o.code, 2);
+    assert!(
+        o.stderr
+            .contains("no remote endpoint; it offers stdio (pypi), stdio (oci)"),
+        "{}",
+        o.stderr
+    );
+
+    // A name the registry does not have, and one that is not a registry name.
+    let o = run(at_registry().args(["add", "x", "--registry", "io.github.nope/nope"]));
+    assert_eq!(o.code, 2);
+    assert!(
+        o.stderr.contains("no server named io.github.nope/nope")
+            && o.stderr.contains("like io.github.owner/server"),
+        "{}",
+        o.stderr
+    );
+    let o = run(at_registry().args(["--json", "add", "x", "--registry", "files"]));
+    assert_eq!(o.code, 2);
+    let e: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(e["error"]["kind"], "usage");
+    assert!(e["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains("like io.github.owner/server"));
+
+    // The flags exclude one another, and nothing was run at add time.
+    let o = run(at_registry().args([
+        "add",
+        "x",
+        "--registry",
+        "io.github.acme/remote",
+        "--http",
+        "http://x/mcp",
+    ]));
+    assert_eq!(o.code, 2);
+    let o = run(at_registry().args(["add", "x", "--package", "npm"]));
+    assert_eq!(o.code, 2);
+    let dialed = s.requests.lock().unwrap()[after_info..]
+        .iter()
+        .any(|r| r.path == "/mcp");
+    assert!(!dialed, "add never dials");
+
+    let o = run(mcpdial(&home).args(["ls", "--no-probe"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    for name in ["web", "old", "fs", "box", "box-py"] {
+        assert!(
+            o.stdout.lines().any(|l| l.starts_with(name)),
+            "{name} missing:\n{}",
+            o.stdout
+        );
+    }
+}
