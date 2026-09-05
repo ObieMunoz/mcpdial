@@ -47,6 +47,8 @@ pub enum Mode {
     /// Protocol 2024-11-05: the URL serves `GET` alone, streaming an `endpoint` event
     /// that names where requests are POSTed.
     LegacySse,
+    /// Accepts every request and answers none of them, until the server is dropped.
+    BlackHole,
 }
 
 /// The client the administrator registered out of band. The secret carries the
@@ -122,6 +124,8 @@ pub fn start(mode: Mode) -> FakeServer {
         let stop = stop.clone();
         let base = base.clone();
         thread::spawn(move || {
+            // What a black hole swallows: kept unanswered until the thread ends.
+            let mut held = Vec::new();
             while !stop.load(Ordering::SeqCst) {
                 let Ok(Some(mut req)) = server.recv_timeout(Duration::from_millis(50)) else {
                     continue;
@@ -139,6 +143,10 @@ pub fn start(mode: Mode) -> FakeServer {
                     body,
                 };
                 requests.lock().unwrap().push(rec.clone());
+                if matches!(mode, Mode::BlackHole) {
+                    held.push(req);
+                    continue;
+                }
                 let resp = route(&mode, &base, &rec, &state);
                 let _ = req.respond(resp);
             }

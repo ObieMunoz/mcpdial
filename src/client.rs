@@ -19,11 +19,20 @@ use std::time::Duration;
 /// What bounds a wait when neither the command line nor the server says.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What bounds a status probe when neither the command line nor the server
+/// says. `ls` is a health check, not a call: a server that takes longer than this
+/// to answer `initialize` is worth reporting as unreachable, and one that is down
+/// should not hold the whole table for a minute.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-invocation knobs that apply to any server.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// `--timeout` on the command line: beats the one saved for the server.
     pub timeout: Option<Duration>,
+    /// What bounds a wait when neither the flag nor the server says:
+    /// [`DEFAULT_TIMEOUT`], or [`PROBE_TIMEOUT`] behind a status probe.
+    pub fallback_timeout: Duration,
     pub user_agent: String,
     pub extra_headers: Vec<(String, String)>,
     /// `--token-env` on the command line: beats everything else.
@@ -37,6 +46,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             timeout: None,
+            fallback_timeout: DEFAULT_TIMEOUT,
             user_agent: USER_AGENT.to_string(),
             extra_headers: Vec::new(),
             token_env: None,
@@ -50,11 +60,11 @@ impl Options {
     /// The wait for anything that is not a saved server: the registry, the
     /// catalog, a login.
     pub fn timeout_or_default(&self) -> Duration {
-        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
+        self.timeout.unwrap_or(self.fallback_timeout)
     }
 
     /// The wait for one server: the flag, else its saved timeout, else the
-    /// default. A saved value that is not a number of seconds is a config error,
+    /// fallback. A saved value that is not a number of seconds is a config error,
     /// since the file was edited to say something that cannot bound a wait.
     pub fn timeout_for(&self, r: &Resolved) -> Result<Duration> {
         if let Some(flag) = self.timeout {
@@ -67,7 +77,16 @@ impl Options {
                     r.name
                 ))
             }),
-            None => Ok(DEFAULT_TIMEOUT),
+            None => Ok(self.fallback_timeout),
+        }
+    }
+
+    /// The same knobs behind a status probe: a server that neither the flag nor
+    /// its own entry says how long to wait for gets [`PROBE_TIMEOUT`].
+    fn for_status(&self) -> Self {
+        Self {
+            fallback_timeout: PROBE_TIMEOUT,
+            ..self.clone()
         }
     }
 
@@ -577,7 +596,7 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
         }
     }
 
-    let fresh: Vec<Listing> = probe_each(store, cold, opts, true)
+    let fresh: Vec<Listing> = probe_each(store, cold, &opts.for_status(), true)
         .into_iter()
         .map(|p| Listing::probed(p, now))
         .collect();
@@ -604,9 +623,14 @@ pub fn listing_one(store: &Store, opts: &Options, name: &str) -> Result<Listing>
         .ok_or_else(|| Error::usage(format!("no server named {name:?}")))?;
     let key = probe_keys(store, &servers)[name];
     let now = now();
-    let probe = probe_each(store, vec![(name.to_string(), cfg)], opts, true)
-        .pop()
-        .expect("one probe per server");
+    let probe = probe_each(
+        store,
+        vec![(name.to_string(), cfg)],
+        &opts.for_status(),
+        true,
+    )
+    .pop()
+    .expect("one probe per server");
     let row = Listing::probed(probe, now);
     let _ = store.save_probes(BTreeMap::from([(name.to_string(), row.record(key))]));
     Ok(row)
@@ -737,6 +761,51 @@ mod tests {
             classify(&Error::transport("connection refused"), false),
             Status::Unreachable { .. }
         ));
+    }
+
+    #[test]
+    fn a_probe_waits_less_than_a_call_unless_told_how_long() {
+        let server = |saved: Option<f64>| Resolved {
+            name: "x".into(),
+            config: ServerConfig {
+                timeout: saved,
+                ..ServerConfig::http("https://x/mcp")
+            },
+            saved: true,
+        };
+        let secs = Duration::from_secs;
+
+        let unspecified = Options::default();
+        assert!(PROBE_TIMEOUT < DEFAULT_TIMEOUT);
+        assert_eq!(
+            unspecified.timeout_for(&server(None)).unwrap(),
+            DEFAULT_TIMEOUT
+        );
+        assert_eq!(unspecified.timeout_or_default(), DEFAULT_TIMEOUT);
+        let probing = unspecified.for_status();
+        assert_eq!(probing.timeout_for(&server(None)).unwrap(), PROBE_TIMEOUT);
+        assert_eq!(probing.timeout_or_default(), PROBE_TIMEOUT);
+
+        // A server that says how long it needs is believed by a probe too.
+        assert_eq!(
+            probing.timeout_for(&server(Some(120.0))).unwrap(),
+            secs(120)
+        );
+
+        // An explicit --timeout means it, in both directions, for a probe and a call.
+        for given in [3, 90] {
+            let told = Options {
+                timeout: Some(secs(given)),
+                ..Options::default()
+            };
+            assert_eq!(told.timeout_for(&server(None)).unwrap(), secs(given));
+            let probing = told.for_status();
+            assert_eq!(probing.timeout_for(&server(None)).unwrap(), secs(given));
+            assert_eq!(
+                probing.timeout_for(&server(Some(120.0))).unwrap(),
+                secs(given)
+            );
+        }
     }
 
     #[test]
