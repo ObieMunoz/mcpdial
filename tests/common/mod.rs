@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -364,10 +364,18 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     };
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
-            "protocolVersion":agreed_version,"capabilities":{"tools":{}},
+            "protocolVersion":agreed_version,
+            "capabilities":{"tools":{},"resources":{},"prompts":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
+        "resources/list" => resources_list(&id, params["cursor"].as_str()),
+        "resources/templates/list" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "resourceTemplates":[{"uriTemplate":"file:///notes/{name}.md","name":"note",
+                "description":"One note, by name.","mimeType":"text/markdown"}]}}),
+        "resources/read" => resources_read(&id, params["uri"].as_str().unwrap_or("")),
+        "prompts/list" => prompts_list(&id, params["cursor"].as_str()),
+        "prompts/get" => prompts_get(&id, params),
         "tools/call" => match params["name"].as_str().unwrap_or("") {
             "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
                 "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
@@ -454,6 +462,74 @@ fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
         Some("page-2") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[add]}}),
         Some(other) => json!({"jsonrpc":"2.0","id":id,
             "error":{"code":-32602,"message":format!("Invalid cursor: {other}")}}),
+    }
+}
+
+/// The first eight bytes of every PNG, and not valid UTF-8, so a test can prove
+/// the bytes reached stdout rather than their base64.
+pub const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// One resource per page, paginated exactly as `tools/list` is.
+fn resources_list(id: &Value, cursor: Option<&str>) -> Value {
+    let readme = json!({"uri":"file:///readme.md","name":"readme",
+        "description":"The project readme.\nSecond line.","mimeType":"text/markdown"});
+    let logo = json!({"uri":"file:///logo.png","name":"logo",
+        "description":"A tiny picture.","mimeType":"image/png"});
+    match cursor {
+        None => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"resources":[readme],"nextCursor":"res-2"}})
+        }
+        Some("res-2") => json!({"jsonrpc":"2.0","id":id,"result":{"resources":[logo]}}),
+        Some(other) => json!({"jsonrpc":"2.0","id":id,
+            "error":{"code":-32602,"message":format!("Invalid cursor: {other}")}}),
+    }
+}
+
+fn resources_read(id: &Value, uri: &str) -> Value {
+    let contents = match uri {
+        "file:///readme.md" => {
+            json!([{"uri":uri,"mimeType":"text/markdown","text":"# fake-mcp\nA readme.\n"}])
+        }
+        "file:///logo.png" => {
+            json!([{"uri":uri,"mimeType":"image/png","blob":STANDARD.encode(PNG_MAGIC)}])
+        }
+        _ => {
+            return json!({"jsonrpc":"2.0","id":id,
+                "error":{"code":-32002,"message":format!("Resource not found: {uri}")}})
+        }
+    };
+    json!({"jsonrpc":"2.0","id":id,"result":{"contents":contents}})
+}
+
+/// One prompt per page, paginated exactly as `tools/list` is.
+fn prompts_list(id: &Value, cursor: Option<&str>) -> Value {
+    let summarize = json!({"name":"summarize","description":"Summarize a document.",
+        "arguments":[{"name":"text","description":"What to summarize","required":true},
+                     {"name":"style","description":"terse or thorough"}]});
+    let greet = json!({"name":"greet","description":"Greet someone."});
+    match cursor {
+        None => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"prompts":[summarize],"nextCursor":"prompt-2"}})
+        }
+        Some("prompt-2") => json!({"jsonrpc":"2.0","id":id,"result":{"prompts":[greet]}}),
+        Some(other) => json!({"jsonrpc":"2.0","id":id,
+            "error":{"code":-32602,"message":format!("Invalid cursor: {other}")}}),
+    }
+}
+
+fn prompts_get(id: &Value, params: &Value) -> Value {
+    let args = &params["arguments"];
+    match params["name"].as_str().unwrap_or("") {
+        "summarize" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "description":"Summarize a document.",
+            "messages":[
+                {"role":"user","content":{"type":"text",
+                    "text":format!("Summarize this: {}", args["text"].as_str().unwrap_or(""))}},
+                {"role":"assistant","content":{"type":"text","text":"Sure."}}]}}),
+        "greet" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "messages":[{"role":"user","content":{"type":"text","text":"Hello."}}]}}),
+        other => json!({"jsonrpc":"2.0","id":id,
+            "error":{"code":-32602,"message":format!("Prompt {other} not found")}}),
     }
 }
 

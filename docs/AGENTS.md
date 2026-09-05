@@ -38,6 +38,31 @@ echo '{"path":"/tmp/x"}' | mcpdial call fs read_text_file -   # from stdin
 
 Use a file or stdin for anything large or containing quotes.
 
+## Resources and prompts
+
+Tools are one third of MCP. `mcpdial info TARGET --json` reports which of the three a
+server implements under `capabilities`.
+
+```
+mcpdial resources TARGET --json   {"resources":[...],"resourceTemplates":[...]}
+mcpdial read TARGET URI --json    the resources/read result
+mcpdial prompts TARGET --json     {"prompts":[...]}
+mcpdial prompt TARGET NAME '{"json":"args"}' --json   the prompts/get result
+```
+
+A `resourceTemplates` entry carries a `uriTemplate` (RFC 6570) instead of a `uri`; expand
+it yourself before calling `read`. A `resources/read` result holds `contents`, each entry
+carrying either `text` or a base64 `blob`. Without `--json`, `read` writes text to stdout
+byte for byte and a blob as the raw bytes it stands for, and refuses to put bytes on a
+terminal: redirect it (`mcpdial read TARGET URI > file`). `prompt` without `--json` prints
+one `role: text` line per message and puts the prompt's description on stderr.
+
+A prompt's `arguments` are names and descriptions with no schema behind them: every value
+is a string. `mcpdial prompts TARGET --long` lists them.
+
+A server that never implemented one of these answers `-32601`. That error carries a `hint`
+naming the missing capability, so a bare method-not-found never has to be decoded.
+
 ## Exit codes and errors
 
 | Exit | Meaning |
@@ -80,6 +105,10 @@ Input, one command per line:
 call TOOL {"json":"args"}     # args optional, default {}
 tools                         # list tools
 schema TOOL                   # one tool's inputSchema
+resources                     # resources, then resource templates
+read URI                      # one resource's contents
+prompts                       # list prompts
+prompt NAME {"json":"args"}   # expand a prompt into its messages
 raw METHOD {"json":"params"}  # any JSON-RPC method
 info                          # the initialize result
 help [TOOL]                   # commands, or one tool's parameters
@@ -88,8 +117,10 @@ quit
 
 Lines starting with `#` are ignored. Output with `--json`: one line per command. `call`
 prints the result object; `tools` prints `{"tools":[...]}`; `schema` prints the tool
-object; errors print `{"error":{...}}`. The process exits 1 at the end if any command
-failed and stdin was not a terminal.
+object; `resources` prints `{"resources":[...],"resourceTemplates":[...]}`; `prompts`
+prints `{"prompts":[...]}`; `read` and `prompt` print their results untouched; errors
+print `{"error":{...}}`. The process exits 1 at the end if any command failed and stdin
+was not a terminal.
 
 A bare tool name is not a command; `call` it. Nothing else in the line is guessed at.
 Line editing, history and Tab completion apply only when stdin and stdout are both a

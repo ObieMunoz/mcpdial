@@ -1,9 +1,11 @@
-//! Request id allocation, the initialize handshake, and the three methods that matter.
+//! Request id allocation, the initialize handshake, and the methods that matter.
 
 use crate::protocol::{
-    check, notification, request, Result, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION,
+    check, notification, request, Error, Result, CLIENT_NAME, CLIENT_VERSION, PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
@@ -96,6 +98,31 @@ impl<T: Transport> Session<T> {
         )
     }
 
+    pub fn list_resources(&mut self) -> Result<Vec<Value>> {
+        self.list_paginated("resources/list", "resources")
+    }
+
+    /// Templates are RFC 6570 URI templates rather than URIs, and arrive from their
+    /// own method: expanding one is the caller's job before [`Self::read_resource`].
+    pub fn list_resource_templates(&mut self) -> Result<Vec<Value>> {
+        self.list_paginated("resources/templates/list", "resourceTemplates")
+    }
+
+    pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
+        self.request("resources/read", Some(json!({ "uri": uri })))
+    }
+
+    pub fn list_prompts(&mut self) -> Result<Vec<Value>> {
+        self.list_paginated("prompts/list", "prompts")
+    }
+
+    pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
+        self.request(
+            "prompts/get",
+            Some(json!({ "name": name, "arguments": arguments })),
+        )
+    }
+
     pub fn close(&mut self) {
         self.transport.close();
     }
@@ -122,6 +149,58 @@ pub fn render_content(result: &Value) -> String {
         Some(structured) if blocks.is_empty() => serde_json::to_string_pretty(structured).unwrap(),
         _ => blocks,
     }
+}
+
+/// Flatten a `prompts/get` result to one `role: text` line per message. Content
+/// that is not text is emitted as its JSON, as in [`render_content`].
+pub fn render_messages(result: &Value) -> String {
+    let Some(messages) = result.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+    messages
+        .iter()
+        .map(|m| {
+            format!(
+                "{}: {}",
+                m["role"].as_str().unwrap_or("?"),
+                render_blocks(std::slice::from_ref(&m["content"]))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One entry of a `resources/read` result.
+#[derive(Debug)]
+pub enum ResourceBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+/// The `contents[]` of a `resources/read` result, with every base64 `blob` decoded
+/// to the bytes the server actually holds. An entry carrying neither `text` nor
+/// `blob` has nothing to hand back and is dropped.
+pub fn resource_bodies(result: &Value) -> Result<Vec<ResourceBody>> {
+    result["contents"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| match (&entry["text"], &entry["blob"]) {
+            (Value::String(text), _) => Some(Ok(ResourceBody::Text(text.clone()))),
+            (_, Value::String(blob)) => Some(decode_blob(blob, &entry["uri"])),
+            _ => None,
+        })
+        .collect()
+}
+
+fn decode_blob(blob: &str, uri: &Value) -> Result<ResourceBody> {
+    STANDARD.decode(blob).map(ResourceBody::Bytes).map_err(|e| {
+        Error::transport(format!(
+            "{}: blob is not valid base64 ({e})",
+            uri.as_str().unwrap_or("resource")
+        ))
+    })
 }
 
 fn render_blocks(blocks: &[Value]) -> String {
@@ -315,5 +394,39 @@ mod tests {
             "structuredContent":{"temp":20},
         });
         assert_eq!(render_content(&both), "20 degrees");
+    }
+
+    #[test]
+    fn render_messages_prefixes_each_message_with_its_role() {
+        let got = render_messages(&json!({"messages":[
+            {"role":"user","content":{"type":"text","text":"summarize this"}},
+            {"role":"assistant","content":{"type":"text","text":"sure"}},
+        ]}));
+        assert_eq!(got, "user: summarize this\nassistant: sure");
+
+        let image = render_messages(&json!({"messages":[
+            {"role":"user","content":{"type":"image","data":"xx","mimeType":"image/png"}},
+        ]}));
+        assert!(image.starts_with("user: {"), "{image}");
+        assert!(image.contains("\"mimeType\":\"image/png\""));
+
+        assert_eq!(render_messages(&json!({})), "");
+    }
+
+    #[test]
+    fn resource_bodies_pass_text_through_and_decode_blobs() {
+        let read = json!({"contents":[
+            {"uri":"file:///a.txt","text":"hello\n"},
+            {"uri":"file:///b.png","blob":"iVBORw0KGgo="},
+            {"uri":"file:///c.empty"},
+        ]});
+        let bodies = resource_bodies(&read).unwrap();
+        assert_eq!(bodies.len(), 2, "an entry with no payload is dropped");
+        assert!(matches!(&bodies[0], ResourceBody::Text(t) if t == "hello\n"));
+        assert!(matches!(&bodies[1], ResourceBody::Bytes(b) if b == b"\x89PNG\r\n\x1a\n"));
+
+        let mangled = json!({"contents":[{"uri":"file:///b.png","blob":"not base64!"}]});
+        let e = resource_bodies(&mangled).unwrap_err().to_string();
+        assert!(e.contains("file:///b.png") && e.contains("base64"), "{e}");
     }
 }
