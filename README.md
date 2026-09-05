@@ -494,9 +494,18 @@ cargo run --example echo_server   # the smallest real stdio MCP server, used by 
 
 ### Cutting a release
 
-1. Set `version` in `Cargo.toml`, and move the `[Unreleased]` entries in
-   `CHANGELOG.md` under a `## [X.Y.Z] - YYYY-MM-DD` heading. `cargo test` fails until
-   the version has a section with at least one entry. Merge that to `main`.
+1. Set `version` in `Cargo.toml` and generate the changelog section from the commits
+   since the last tag with [git-cliff](https://git-cliff.org):
+
+   ```bash
+   git cliff --unreleased --tag vX.Y.Z --prepend CHANGELOG.md
+   ```
+
+   Pull requests are squash-merged, so each commit on `main` is one PR whose title is
+   a conventional commit subject (`feat:`, `fix:`, ...); `cliff.toml` maps those to
+   the Added, Fixed and Changed lists. Nothing in `CHANGELOG.md` is written by hand.
+   `cargo test` fails until the version has a section with at least one entry. Merge
+   that to `main`.
 2. Tag the merge commit and push the tag:
 
    ```bash
