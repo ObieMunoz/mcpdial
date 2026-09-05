@@ -4,12 +4,13 @@
 //!
 //! ```text
 //! servers.json      what you configured: transport, URL or command, headers
-//! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids (mode 0600)
+//! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
 //! ```
 //!
 //! Tokens live in a separate file so `servers.json` can be shared or committed and
-//! the secret-bearing file can stay private.
+//! the secret-bearing file can stay private: mode 0600 on unix, and on Windows a
+//! discretionary access list naming the owning account alone.
 
 use crate::protocol::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -297,11 +298,16 @@ fn write_json<T: Serialize>(path: &Path, value: &T, private: bool) -> Result<()>
     Ok(())
 }
 
-/// Create `path` and fill it. `private` asks for mode 0600 from the start, so
-/// the secrets are never briefly readable by anyone else.
+/// Create `path` and fill it. `private` asks for owner-only access from the
+/// start, so the secrets are never briefly readable by anyone else.
 fn write_file(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
-    #[cfg(not(unix))]
-    let _ = private; // no file mode to ask for here
+    #[cfg(not(any(unix, windows)))]
+    let _ = private; // nothing to restrict the file with here
+    use std::io::Write;
+    #[cfg(windows)]
+    if private {
+        return sys::create_owner_only(path)?.write_all(bytes);
+    }
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -309,7 +315,6 @@ fn write_file(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    use std::io::Write;
     opts.open(path)?.write_all(bytes)
 }
 
@@ -346,6 +351,196 @@ mod sys {
 
     extern "C" {
         pub fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use std::ffi::{c_void, OsStr};
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::path::Path;
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{LocalFree, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Create `path` reachable by the account that runs mcpdial and nobody else,
+    /// which is as close as Windows comes to mode 0600.
+    ///
+    /// `D:P(A;;FA;;;<sid>)` is one access-allowed entry for that account; the `P`
+    /// stops the entries a profile directory hands down - Users, Authenticated
+    /// Users - from being merged in alongside it.
+    ///
+    /// The descriptor goes to `CreateFileW` rather than onto the finished file,
+    /// because a credentials file that exists for even an instant under inherited
+    /// permissions is one another account has already had its chance at. That is
+    /// also why the disposition is `CREATE_NEW`: `CREATE_ALWAYS` would silently
+    /// ignore the descriptor and keep whatever a file already sitting there had.
+    pub fn create_owner_only(path: &Path) -> io::Result<File> {
+        let descriptor = descriptor(&format!("D:P(A;;FA;;;{})", current_user_sid()?))?;
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        let name = wide(path);
+        let handle = unsafe {
+            CreateFileW(
+                name.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    /// The SID of the account this process runs as, in `S-1-5-...` form.
+    pub fn current_user_sid() -> io::Result<String> {
+        let mut token: HANDLE = ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let handle = token.as_raw_handle();
+
+        let mut len = 0u32;
+        // The first call only sizes the buffer, so it is expected to fail.
+        unsafe { GetTokenInformation(handle, TokenUser, ptr::null_mut(), 0, &mut len) };
+        // TOKEN_USER holds a pointer, so the buffer has to be aligned for one.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let read = unsafe {
+            GetTokenInformation(handle, TokenUser, buf.as_mut_ptr().cast(), len, &mut len)
+        };
+        if read == 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let mut text = ptr::null_mut();
+        let converted = unsafe {
+            ConvertSidToStringSidW((*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text)
+        };
+        if converted == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let text = LocalBuffer(text.cast());
+        Ok(unsafe { from_wide(text.0.cast()) })
+    }
+
+    /// Build a security descriptor on the local heap from its SDDL form.
+    fn descriptor(sddl: &str) -> io::Result<LocalBuffer> {
+        let sddl = wide(sddl);
+        let mut built: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut built,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LocalBuffer(built))
+    }
+
+    /// The discretionary access list on `path`, in SDDL form: the list's own
+    /// flags, then one parenthesised entry per trustee.
+    #[cfg(test)]
+    pub fn dacl(path: &Path) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let name = wide(path);
+        let mut found: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut found,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        dacl_of(&LocalBuffer(found))
+    }
+
+    /// `sddl` as Windows hands an access list back. SDDL abbreviates well-known
+    /// accounts, so a list naming the built-in administrator returns `LA` where
+    /// it went in as a SID; an expected list has to make the same trip before it
+    /// can be compared with one read off a file.
+    #[cfg(test)]
+    pub fn rendered(sddl: &str) -> io::Result<String> {
+        dacl_of(&descriptor(sddl)?)
+    }
+
+    #[cfg(test)]
+    fn dacl_of(descriptor: &LocalBuffer) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
+        let mut text = ptr::null_mut();
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                ptr::null_mut(),
+            )
+        };
+        if converted == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let text = LocalBuffer(text.cast());
+        Ok(unsafe { from_wide(text.0.cast()) })
+    }
+
+    fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// # Safety
+    /// `p` must point at a NUL-terminated UTF-16 string.
+    unsafe fn from_wide(p: *const u16) -> String {
+        let mut len = 0;
+        while unsafe { *p.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) })
+    }
+
+    /// Anything the security APIs hand back on the local heap for us to release.
+    struct LocalBuffer(*mut c_void);
+
+    impl Drop for LocalBuffer {
+        fn drop(&mut self) {
+            unsafe { LocalFree(self.0) };
+        }
     }
 }
 
@@ -523,6 +718,24 @@ mod tests {
                 .mode()
                 & 0o777;
             assert_eq!(mode, 0o600, "credentials must not be world readable");
+        }
+
+        #[cfg(windows)]
+        {
+            let owner_only =
+                sys::rendered(&format!("D:(A;;FA;;;{})", sys::current_user_sid().unwrap()))
+                    .unwrap();
+            let dacl = sys::dacl(&s.credentials_path()).unwrap();
+            let (flags, entries) = dacl.split_once('(').expect("a discretionary list");
+            let (_, expected) = owner_only.split_once('(').expect("a discretionary list");
+            assert!(
+                flags.contains('P'),
+                "inherited entries must not apply: {dacl}"
+            );
+            assert_eq!(
+                entries, expected,
+                "credentials must name their owner and nobody else"
+            );
         }
 
         assert!(s.remove_server("wiki").unwrap());
