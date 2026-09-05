@@ -15,7 +15,7 @@
 
 use crate::config::{now, Credential};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
-use crate::transport::http::{redirect_error, USER_AGENT};
+use crate::transport::http::{header, redirect_error, USER_AGENT};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -82,7 +82,7 @@ impl Http {
         &self,
         url: &str,
         content_type: &str,
-        body: String,
+        body: &str,
         basic: Option<&str>,
     ) -> Result<(u16, Value, String)> {
         let mut req = self
@@ -95,7 +95,7 @@ impl Http {
             req = req.header("Authorization", &format!("Basic {credentials}"));
         }
         let mut resp = req
-            .send(&body)
+            .send(body)
             .map_err(|e| Error::auth(format!("POST {url}: {e}")))?;
         let status = resp.status().as_u16();
         let text = resp
@@ -107,7 +107,7 @@ impl Http {
     }
 
     fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value, String)> {
-        self.post(url, "application/json", body.to_string(), None)
+        self.post(url, "application/json", &body.to_string(), None)
     }
 
     fn post_form(
@@ -121,7 +121,7 @@ impl Http {
             .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        self.post(url, "application/x-www-form-urlencoded", body, basic)
+        self.post(url, "application/x-www-form-urlencoded", &body, basic)
     }
 }
 
@@ -156,18 +156,10 @@ pub fn challenge(http: &Http, mcp_url: &str) -> Result<Option<String>> {
         .map_err(|e| Error::auth(format!("could not reach {mcp_url}: {e}")))?;
     let status = resp.status().as_u16();
     if (300..400).contains(&status) {
-        let to = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let to = header(&resp, "location");
         return Err(redirect_error(mcp_url, status, to.as_deref()));
     }
-    let www = resp
-        .headers()
-        .get("www-authenticate")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let www = header(&resp, "www-authenticate");
     let _ = resp.body_mut().read_to_string();
     match (status, www) {
         (_, Some(w)) => Ok(Some(w)),
@@ -225,7 +217,7 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
     }
     prm_urls.push(format!("{origin}/.well-known/oauth-protected-resource"));
 
-    let mut issuer = origin.clone();
+    let mut issuer = origin;
     let mut scopes: Vec<String> = Vec::new();
     for u in &prm_urls {
         if let Some(prm) = http.get_json(u)? {
@@ -640,28 +632,22 @@ pub fn login(
         {
             c.client_id.clone().unwrap()
         }
-        _ => match register(http, &meta, &redirect_for(&host)) {
-            Ok(id) => id,
-            Err(e)
-                if is_redirect_refused(&e)
-                    && opts.redirect_host.is_none()
-                    && host == "127.0.0.1" =>
-            {
+        _ => {
+            let mut registered = register(http, &meta, &redirect_for(&host));
+            let may_fall_back = opts.redirect_host.is_none() && host == "127.0.0.1";
+            if may_fall_back && registered.as_ref().is_err_and(is_redirect_refused) {
                 notify("server refused http://127.0.0.1 as a redirect URI; retrying with http://localhost");
                 host = "localhost".to_string();
-                match register(http, &meta, &redirect_for(&host)) {
-                    Ok(id) => id,
-                    Err(e) if is_redirect_refused(&e) => {
-                        return Err(Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer))))
-                    }
-                    Err(e) => return Err(e),
+                registered = register(http, &meta, &redirect_for(&host));
+            }
+            registered.map_err(|e| {
+                if is_redirect_refused(&e) {
+                    Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer)))
+                } else {
+                    e
                 }
-            }
-            Err(e) if is_redirect_refused(&e) => {
-                return Err(Error::Auth(format!("{e}{}", loopback_hint(&meta.issuer))))
-            }
-            Err(e) => return Err(e),
-        },
+            })?
+        }
     };
     let redirect_uri = redirect_for(&host);
     if saved.is_none_or(|c| c.client_id.as_deref() != Some(client_id.as_str())) {
@@ -818,8 +804,7 @@ fn open_browser(url: &str) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

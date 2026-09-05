@@ -64,8 +64,8 @@ impl Error {
             Error::Http {
                 www_authenticate: Some(_),
                 ..
-            }
-        ) || matches!(self, Error::Http { status: 401, .. })
+            } | Error::Http { status: 401, .. }
+        )
     }
 }
 

@@ -147,7 +147,7 @@ impl StdioTransport {
     /// The server went away before answering. Say how it exited and what it said.
     fn post_mortem(&mut self) -> Error {
         // Give the stderr reader a moment to drain what the process wrote on its way out.
-        let status = match self.child.wait_timeout_polling(Duration::from_millis(500)) {
+        let status = match wait_up_to(&mut self.child, Duration::from_millis(500)) {
             Some(st) => match st.code() {
                 Some(c) => format!("exited with status {c}"),
                 None => "was killed by a signal".to_string(),
@@ -170,22 +170,17 @@ impl StdioTransport {
     }
 }
 
-trait WaitTimeout {
-    fn wait_timeout_polling(&mut self, dur: Duration) -> Option<std::process::ExitStatus>;
-}
-
-impl WaitTimeout for Child {
-    fn wait_timeout_polling(&mut self, dur: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = std::time::Instant::now() + dur;
-        loop {
-            if let Ok(Some(st)) = self.try_wait() {
-                return Some(st);
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(20));
+/// Poll for the child's exit for up to `dur`; `None` if it is still running.
+fn wait_up_to(child: &mut Child, dur: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            return Some(st);
         }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
