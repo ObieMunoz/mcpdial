@@ -18,6 +18,8 @@ mcpdial schema TARGET TOOL              # one tool's schema
 mcpdial call TARGET TOOL '{"k":"v"}' --json
 mcpdial call TARGET TOOL @args.json --json      # large arguments from a file
 mcpdial shell TARGET --json             # one session; one command per stdin line
+mcpdial start NAME [--idle SECS]        # keep a stdio server running; calls share it
+mcpdial stop NAME
 ```
 
 `TARGET` is a saved name, an `http(s)://` URL, or `stdio:<command>`.
@@ -29,7 +31,9 @@ Rules:
 - Read `tools --json` or `schema` before calling a tool you have not called before. A
   rejected call answers with `error.hint`: the tool's usage line and its parameters.
 - Use `shell` for servers whose state matters across calls, such as a browser: each
-  plain `call` is a fresh process.
+  plain `call` is a fresh process. When every command must be its own invocation,
+  `start NAME` keeps a saved stdio server running and later `call`s share it (Unix
+  only); `stop NAME` when done, or start with `--idle 300` so it ends itself.
 - Never run `login` without `--no-browser`; relay the printed URL to the user. Never
   put a token on the command line; use `--token-env VAR`.
 - If a saved server is not there, add it: `mcpdial add NAME --http URL` or

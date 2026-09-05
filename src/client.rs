@@ -40,6 +40,9 @@ pub struct Options {
     /// `--protocol-version` on the command line: beats the one saved for the server.
     pub protocol_version: Option<KnownVersion>,
     pub verbose: bool,
+    /// `--no-daemon` or `$MCPDIAL_NO_DAEMON`: dial a stdio server even when a
+    /// daemon started for it is running.
+    pub no_daemon: bool,
 }
 
 impl Default for Options {
@@ -52,6 +55,7 @@ impl Default for Options {
             token_env: None,
             protocol_version: None,
             verbose: false,
+            no_daemon: false,
         }
     }
 }
@@ -104,6 +108,19 @@ pub struct Resolved {
     pub config: ServerConfig,
     /// True if it came from `servers.json`.
     pub saved: bool,
+}
+
+impl Resolved {
+    /// The same target with every `${VAR}` filled in from the environment: what
+    /// is dialed, as opposed to what was resolved, listed or saved, which still
+    /// names the variable rather than holding its value.
+    pub fn dialed(&self) -> Result<Resolved> {
+        Ok(Resolved {
+            name: self.name.clone(),
+            config: self.config.expanded(|var| std::env::var(var).ok())?,
+            saved: self.saved,
+        })
+    }
 }
 
 /// `name` from the store, `http(s)://...` for an ad-hoc HTTP server, or
@@ -255,42 +272,62 @@ fn handshake(
     })
 }
 
+/// The process behind a stdio server, spawned and ready for `initialize`.
+fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
+    let cmd = r
+        .config
+        .stdio
+        .as_deref()
+        .ok_or_else(|| Error::usage(format!("{} is not a stdio server", r.name)))?;
+    let argv = crate::transport::stdio::split_command(cmd)?;
+    let env: Vec<(String, String)> = r
+        .config
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    StdioTransport::spawn_with(
+        &argv,
+        &env,
+        r.config.cwd.as_deref().map(std::path::Path::new),
+        opts.timeout_for(r)?,
+        opts.verbose,
+        opts.logger(),
+    )
+}
+
+/// A stdio server's process with its session opened, offering the version the
+/// flag or the config asks for: what a daemon holds on behalf of its callers.
+pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport>> {
+    let r = r.dialed()?;
+    let offer = version_to_offer(&r, opts)?;
+    let mut session = Session::new(spawn_stdio(&r, opts)?).offering(offer);
+    session.initialize()?;
+    Ok(session)
+}
+
 /// Open a session and complete the `initialize` handshake.
 ///
 /// A `${VAR}` in the config's headers, env, cwd, URL or command line is read from
 /// the environment first; one that is unset is a config error before anything is
-/// sent. For HTTP servers with a saved OAuth credential, a 401 triggers one refresh and
-/// retry before giving up, so an expired token that the clock did not predict still
+/// sent. A saved stdio server with a daemon running (`mcpdial start`) is reached
+/// through the daemon's socket, so the session is the one it holds open. For HTTP
+/// servers with a saved OAuth credential, a 401 triggers one refresh and retry
+/// before giving up, so an expired token that the clock did not predict still
 /// works without a visible hiccup.
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
-    // The `${VAR}` placeholders are filled in here and nowhere earlier, so what
-    // was resolved, listed or saved still names the variable rather than holding
-    // its value.
-    let dialed = Resolved {
-        name: r.name.clone(),
-        config: r.config.expanded(|var| std::env::var(var).ok())?,
-        saved: r.saved,
-    };
+    let dialed = r.dialed()?;
     let r = &dialed;
     let offer = version_to_offer(r, opts)?;
     let timeout = opts.timeout_for(r)?;
-    if let Some(cmd) = &r.config.stdio {
-        let argv = crate::transport::stdio::split_command(cmd)?;
-        let env: Vec<(String, String)> = r
-            .config
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let t = StdioTransport::spawn_with(
-            &argv,
-            &env,
-            r.config.cwd.as_deref().map(std::path::Path::new),
-            timeout,
-            opts.verbose,
-            opts.logger(),
-        )?;
-        return handshake(r, t, AuthUsed::None, offer);
+    if r.config.stdio.is_some() {
+        #[cfg(unix)]
+        if r.saved && !opts.no_daemon {
+            if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger())? {
+                return handshake(r, t, AuthUsed::None, offer);
+            }
+        }
+        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, offer);
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
@@ -501,6 +538,9 @@ pub struct Listing {
     pub tools: Option<usize>,
     pub checked_at: u64,
     pub age_seconds: u64,
+    /// A daemon started with `mcpdial start` is listening for this server.
+    /// Always looked up live, whatever the rest of the row remembers.
+    pub running: bool,
 }
 
 impl Listing {
@@ -515,6 +555,7 @@ impl Listing {
             tools: p.tools.as_ref().map(Vec::len),
             checked_at,
             age_seconds: 0,
+            running: false,
         }
     }
 
@@ -531,6 +572,7 @@ impl Listing {
             tools: rec.tools,
             checked_at: rec.checked_at,
             age_seconds: now.saturating_sub(rec.checked_at),
+            running: false,
         })
     }
 
@@ -610,6 +652,9 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
         );
     }
     rows.extend(fresh.into_iter().map(|row| (row.name.clone(), row)));
+    for row in rows.values_mut() {
+        row.running = crate::daemon::is_running(store, &row.name);
+    }
     Ok(rows.into_values().collect())
 }
 

@@ -9,7 +9,7 @@ use mcpdial::session::{
     extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
     Media, MediaSink, ResourceBody,
 };
-use mcpdial::{oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
+use mcpdial::{daemon, oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -85,6 +85,11 @@ struct Cli {
     /// printing them (call, prompt, read, shell)
     #[arg(long, global = true, value_name = "DIR")]
     save_dir: Option<PathBuf>,
+
+    /// Dial a stdio server afresh even when `start` left one running
+    /// (MCPDIAL_NO_DAEMON=1 does the same everywhere)
+    #[arg(long, global = true)]
+    no_daemon: bool,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -174,6 +179,22 @@ enum Cmd {
     },
     /// Keep one session open and run commands from stdin (state persists between calls)
     Shell { target: String },
+    /// Keep a stdio server running in the background; later commands share its session
+    Start {
+        name: String,
+        /// Exit after this many seconds with no caller (default: never)
+        #[arg(long, value_name = "SECS")]
+        idle: Option<f64>,
+    },
+    /// End a server kept running by `start`
+    Stop { name: String },
+    /// Run a server's daemon in this process (what `start` runs in the background)
+    #[command(hide = true)]
+    Daemon {
+        name: String,
+        #[arg(long, value_name = "SECS")]
+        idle: Option<f64>,
+    },
     /// Forget a server and any credential saved for it
     Rm { name: String },
     /// List saved servers with their connection status
@@ -1356,6 +1377,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         token_env: cli.token_env.clone(),
         protocol_version: cli.protocol_version,
         verbose: cli.verbose,
+        no_daemon: cli.no_daemon || daemon::disabled_by_env(),
         ..Options::default()
     };
     if let Some(dir) = &cli.save_dir {
@@ -1948,6 +1970,40 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             })
         }
 
+        Cmd::Start { name, idle } => {
+            let idle = idle_duration(idle)?;
+            let pid = daemon::start(&store, &name, idle, &opts)?;
+            if cli.json {
+                print_json(&json!({
+                    "name": name, "pid": pid,
+                    "socket": daemon::socket_path(&store, &name),
+                }));
+            } else {
+                eprintln!("started {name} (pid {pid})");
+            }
+            Ok(0)
+        }
+
+        Cmd::Stop { name } => {
+            daemon::stop(&store, &name, &opts)?;
+            eprintln!("stopped {name}");
+            Ok(0)
+        }
+
+        // Only `start` runs this, with nothing but a pipe back to it on stdout:
+        // an error before the socket is open is reported there, for `start` to
+        // print as its own.
+        Cmd::Daemon { name, idle } => {
+            let idle = idle_duration(idle)?;
+            match daemon::serve(&store, &name, &opts, idle) {
+                Ok(()) => Ok(0),
+                Err(e) => {
+                    println!("{}", error_json(&e));
+                    Ok(EXIT_ERROR)
+                }
+            }
+        }
+
         Cmd::Schema { target, tool } => {
             let mut conn = dial(&store, &opts, &target)?;
             let tools = conn.session.list_tools()?;
@@ -2116,6 +2172,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 "headers": c.headers, "token_env": c.token_env,
                                 "credential": creds.get(n).is_some_and(Credential::has_token),
                                 "source": c.source, "timeout": c.timeout,
+                                "running": daemon::is_running(&store, n),
                             })
                         })
                         .collect();
@@ -2124,12 +2181,19 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     // A column earns its place only once a server has something for it.
                     let with_source = servers.values().any(|c| c.source.is_some());
                     let with_timeout = servers.values().any(|c| c.timeout.is_some());
+                    let running: Vec<&String> = servers
+                        .keys()
+                        .filter(|n| daemon::is_running(&store, n))
+                        .collect();
                     let mut headers = vec!["NAME", "TYPE", "AUTH"];
                     if with_source {
                         headers.push("SOURCE");
                     }
                     if with_timeout {
                         headers.push("TIMEOUT");
+                    }
+                    if !running.is_empty() {
+                        headers.push("DAEMON");
                     }
                     headers.push("LOCATION");
                     let rows: Vec<Vec<String>> = servers
@@ -2148,6 +2212,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             }
                             if with_timeout {
                                 row.push(c.timeout.map_or("-".into(), |t| format!("{t}s")));
+                            }
+                            if !running.is_empty() {
+                                row.push(daemon_label(running.contains(&n)));
                             }
                             row.push(c.location().into());
                             row
@@ -2496,7 +2563,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
     }
 }
 
-const LISTING_HEADERS: [&str; 7] = ["NAME", "TYPE", "STATUS", "AGE", "AUTH", "SERVER", "TOOLS"];
+const LISTING_HEADERS: [&str; 8] = [
+    "NAME", "TYPE", "STATUS", "AGE", "AUTH", "DAEMON", "SERVER", "TOOLS",
+];
 
 /// One server as `ls` shows it, which is also what `add` shows after dialing.
 fn listing_row(l: &Listing) -> Vec<String> {
@@ -2506,6 +2575,7 @@ fn listing_row(l: &Listing) -> Vec<String> {
         l.status.label(),
         age_label(l.age_seconds),
         auth_label(l),
+        daemon_label(l.running),
         l.server
             .clone()
             .or_else(|| l.status.detail().map(truncate))
@@ -2521,6 +2591,19 @@ fn auth_label(l: &Listing) -> String {
         (client::AuthUsed::None, Status::AuthRequired) => "needed".into(),
         (client::AuthUsed::None, Status::TokenRejected) => "rejected".into(),
         (client::AuthUsed::None, _) => "-".into(),
+    }
+}
+
+fn daemon_label(running: bool) -> String {
+    if running { "running" } else { "-" }.into()
+}
+
+/// `--idle SECS` as a duration; zero or less would be a daemon that quits at once.
+fn idle_duration(secs: Option<f64>) -> Result<Option<Duration>, Failure> {
+    match secs {
+        None => Ok(None),
+        Some(s) if s > 0.0 => Ok(Some(Duration::from_secs_f64(s))),
+        Some(_) => Err(Error::usage("--idle needs a positive number of seconds").into()),
     }
 }
 

@@ -138,6 +138,8 @@ mcpdial prompts TARGET [--long]  every prompt a server offers
 mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | -]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
+mcpdial start NAME [--idle SECS] keep a stdio server running; later commands share its session
+mcpdial stop NAME                end it
 
 mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--client-metadata-url URL]
                      [--no-client-metadata] [--redirect-host H] [--no-browser]
@@ -152,8 +154,9 @@ mcpdial completions SHELL        a completion script; see Install above
 
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
-environment, `--user-agent` to override the default browser UA, and
-`--protocol-version VERSION` to offer an older MCP revision at `initialize`.
+environment, `--user-agent` to override the default browser UA, `--protocol-version
+VERSION` to offer an older MCP revision at `initialize`, and `--no-daemon` to dial a
+server afresh even while `start` has one running.
 
 `--timeout` bounds every wait: the flag on the command line, else the timeout saved
 with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
@@ -229,6 +232,42 @@ At a terminal the prompt is a real line editor: Up and Down walk the history, Ta
 completes command names and tool names, and `^C` abandons the line being typed (twice
 leaves). History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped
 input is read plainly, exactly as before, so scripts are unaffected.
+
+### Keeping a stdio server running between calls
+
+A shell is one process holding one session. An agent that issues one command at a
+time cannot hold it open, and a server started with `npx -y ...` pays its startup on
+every `call`. `mcpdial start` runs the server in the background and keeps the session;
+every command that names the server then goes through that process instead of dialing:
+
+```
+$ mcpdial start chrome
+started chrome (pid 41234)
+$ mcpdial call chrome new_page '{"url":"https://example.com"}'
+$ mcpdial call chrome list_pages        # the same Chrome, the same page
+$ mcpdial ls                            # DAEMON column says `running`
+$ mcpdial stop chrome
+stopped chrome
+```
+
+Nothing starts in the background unless you say `start`: a plain `call` is still a full
+session of its own, so a script that never heard of `start` behaves exactly as before.
+`start --idle 300` makes the daemon exit after five minutes with no caller, which is
+the setting to use for a server you keep forgetting to stop; the default is to run
+until `stop`. `--no-daemon` on any command, or `MCPDIAL_NO_DAEMON=1` in the
+environment, dials a fresh process even while a daemon is running.
+
+Requests are relayed one caller at a time: a second `call` while the first is still
+waiting on the server queues behind it, and a `shell` attached to the daemon holds the
+queue until it quits. A request the server makes mid-call (a `ping`, `roots/list`) is
+handed to the calling process, which is the one at a terminal. The daemon's
+`--timeout` bounds how long it waits on the server for any one request. If the daemon
+was killed rather than stopped, the next command finds the socket dead, removes it with
+a note on stderr, and dials as if it had never been there.
+
+`start` applies to saved stdio servers and to Unix (macOS, Linux). An HTTP server has
+no process to keep, and session reuse for it is a separate matter; on Windows `start`
+and `stop` say they are not supported yet, and everything else dials.
 
 ### Importing from a host you already configured
 
@@ -479,7 +518,11 @@ host config, and `add --registry` writes them for what an entry marks as require
 ~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (owner only)
 ~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
 ~/.config/mcpdial/registry/          a copy of the registry's list, for `search`
+~/.config/mcpdial/run/NAME.sock      where a server kept running by `start` listens
 ```
+
+The `run` directory is created mode 0700, so only its owner can reach a running
+server through it.
 
 Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
 `rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry `search` and
