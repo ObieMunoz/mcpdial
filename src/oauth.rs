@@ -603,7 +603,7 @@ pub fn login(
         },
     };
     let redirect_uri = redirect_for(&host);
-    if !saved.is_some_and(|c| c.client_id.as_deref() == Some(client_id.as_str())) {
+    if saved.is_none_or(|c| c.client_id.as_deref() != Some(client_id.as_str())) {
         notify(&format!("registered client {client_id}"));
     }
 
