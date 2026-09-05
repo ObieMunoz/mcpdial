@@ -30,6 +30,45 @@ cargo install --git https://github.com/ObieMunoz/mcpdial
 
 Or from a checkout: `cargo install --path .`. One static binary, no runtime dependencies.
 
+### Shell completions
+
+`mcpdial completions SHELL` prints a completion script for `bash`, `zsh`, `fish`,
+`elvish` or `powershell`. It is generated from the argument parser itself, so it covers
+every subcommand, every flag and every fixed value without drifting from the binary.
+The command is hidden from `mcpdial --help` so it does not crowd the command list, but
+it completes like any other and `mcpdial completions --help` describes it.
+
+**bash**, with [bash-completion](https://github.com/scop/bash-completion) installed:
+
+```bash
+mkdir -p ~/.local/share/bash-completion/completions
+mcpdial completions bash > ~/.local/share/bash-completion/completions/mcpdial
+```
+
+Without it, source the script from `~/.bashrc` instead:
+
+```bash
+echo 'source <(mcpdial completions bash)' >> ~/.bashrc
+```
+
+**zsh**, in a file called `_mcpdial` anywhere on `$fpath`:
+
+```bash
+mkdir -p ~/.zfunc
+mcpdial completions zsh > ~/.zfunc/_mcpdial
+```
+
+`~/.zshrc` then needs `fpath=(~/.zfunc $fpath)` *before* it calls `compinit`. On
+Homebrew, `$(brew --prefix)/share/zsh/site-functions/` is already on `$fpath`, so
+writing there takes no `.zshrc` change. Either way, `rm -f ~/.zcompdump*` and start a
+new shell if the old completions linger.
+
+**fish**:
+
+```bash
+mcpdial completions fish > ~/.config/fish/completions/mcpdial.fish
+```
+
 ## Targets
 
 Every command that talks to a server takes a `TARGET`, which is one of:
@@ -64,6 +103,7 @@ mcpdial token set NAME [--env VAR]   token from stdin or an env var, never an ar
 mcpdial token show NAME              metadata only; the secret is never printed
 mcpdial token rm NAME
 mcpdial guide                    the usage guide for programs and agents
+mcpdial completions SHELL        a completion script; see Install above
 ```
 
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,

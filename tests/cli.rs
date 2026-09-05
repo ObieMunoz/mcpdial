@@ -1082,3 +1082,37 @@ fn stdio_answers_what_the_server_asks_mid_call() {
         o.stderr
     );
 }
+
+#[test]
+fn completion_scripts_for_every_shell() {
+    let home = temp_home("completions");
+
+    for (shell, registration_line) in [
+        ("bash", "complete -F _mcpdial"),
+        ("zsh", "#compdef mcpdial"),
+        ("fish", "complete -c mcpdial"),
+        ("elvish", "edit:completion:arg-completer[mcpdial]"),
+        ("powershell", "Register-ArgumentCompleter"),
+    ] {
+        let o = run(mcpdial(&home).args(["completions", shell]));
+        assert_eq!(o.code, 0, "{shell}: {}", o.stderr);
+        assert!(!o.stdout.is_empty(), "{shell}: empty script");
+        assert!(
+            o.stdout.contains(registration_line),
+            "{shell}: no {registration_line:?}"
+        );
+        assert!(o.stdout.contains("token-env"), "{shell}: no global flags");
+        assert!(
+            o.stdout.contains("no-probe"),
+            "{shell}: no per-command flags"
+        );
+    }
+
+    let o = run(mcpdial(&home).args(["completions", "csh"]));
+    assert_eq!(o.code, 2);
+    assert!(o.stdout.is_empty());
+
+    let o = run(mcpdial(&home).args(["--help"]));
+    assert_eq!(o.code, 0);
+    assert!(!o.stdout.contains("completions"), "{}", o.stdout);
+}
