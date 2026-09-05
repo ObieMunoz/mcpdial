@@ -130,13 +130,18 @@ impl StdioTransport {
 impl StdioTransport {
     /// Put one JSON-RPC message on the child's stdin, newline-framed.
     fn write_line(&mut self, body: &str) -> Result<()> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| Error::transport("stdin already closed"))?;
-        writeln!(stdin, "{body}")
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(Error::transport("stdin already closed"));
+        };
+        if writeln!(stdin, "{body}")
             .and_then(|_| stdin.flush())
-            .map_err(|_| Error::transport("server closed stdin before accepting the message"))
+            .is_ok()
+        {
+            return Ok(());
+        }
+        // A server that died on startup gets the write refused rather than the read,
+        // and its exit status and stderr say far more than the broken pipe does.
+        Err(self.post_mortem())
     }
 
     /// The server went away before answering. Say how it exited and what it said.
