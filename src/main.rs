@@ -5,10 +5,15 @@ use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
 use mcpdial::protocol::METHOD_NOT_FOUND;
 use mcpdial::registry::{Pick, Registry, Resolved};
-use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
+use mcpdial::session::{
+    extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
+    Media, MediaSink, ResourceBody,
+};
 use mcpdial::{oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
-use std::io::{IsTerminal, Read, Write};
+use std::fs::OpenOptions;
+use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -73,6 +78,11 @@ struct Cli {
     /// MCP protocol version to offer at initialize instead of the newest. With `add`, saved.
     #[arg(long, global = true, value_name = "VERSION")]
     protocol_version: Option<KnownVersion>,
+
+    /// Write image, audio and blob blocks to DIR/<tool>-<n>.<ext> instead of
+    /// printing them (call, prompt, read, shell)
+    #[arg(long, global = true, value_name = "DIR")]
+    save_dir: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -181,7 +191,7 @@ enum Cmd {
         #[arg(short, long)]
         long: bool,
     },
-    /// Read one resource. Text goes to stdout; binary needs a redirect
+    /// Read one resource. Text goes to stdout; binary needs a redirect or --save-dir
     Read { target: String, uri: String },
     /// Show the prompts a server offers
     Prompts {
@@ -851,6 +861,155 @@ fn advertises(server_info: &Value, capability: &str) -> bool {
     server_info["capabilities"].get(capability).is_some()
 }
 
+/// Where a media block's bytes go: a numbered file under `--save-dir`, or nowhere,
+/// leaving a placeholder on stdout.
+struct MediaFiles<'a> {
+    dir: Option<&'a Path>,
+    /// The tool, prompt or resource the bytes came from, as a file name.
+    stem: String,
+}
+
+impl MediaFiles<'_> {
+    fn saves(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    /// The first free `<stem>-<n>.<ext>` in the directory, so a second call keeps
+    /// the first one's file rather than writing over it.
+    fn place(&self, media: &Media) -> Result<Option<PathBuf>, Error> {
+        let Some(dir) = self.dir else {
+            return Ok(None);
+        };
+        let ext = extension_for(&media.mime_type);
+        let failed =
+            |path: &Path, e: std::io::Error| Error::transport(format!("{}: {e}", path.display()));
+        for n in 1.. {
+            let path = dir.join(format!("{}-{n}.{ext}", self.stem));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(&media.bytes).map_err(|e| failed(&path, e))?;
+                    return Ok(Some(path));
+                }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(failed(&path, e)),
+            }
+        }
+        unreachable!("the counter does not run out")
+    }
+}
+
+/// The sink of a reader with nowhere to put bytes.
+fn placeholders(_: &Media) -> Result<Option<PathBuf>, Error> {
+    Ok(None)
+}
+
+/// A tool or prompt name as a file name: anything a shell or a filesystem would
+/// argue with becomes `_`.
+fn file_stem(name: &str) -> String {
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if stem.trim_matches('.').is_empty() {
+        "media".to_string()
+    } else {
+        stem
+    }
+}
+
+/// A resource's file name from its URI: the last path segment, less its extension.
+fn resource_stem(uri: &str) -> String {
+    let last = uri
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let stem = match last.rsplit_once('.') {
+        Some((before, _)) if !before.is_empty() => before,
+        _ => last,
+    };
+    if stem.is_empty() {
+        "resource".to_string()
+    } else {
+        file_stem(stem)
+    }
+}
+
+type Render = fn(&Value, &mut MediaSink) -> Result<String, Error>;
+
+/// The text `render` makes of a `tools/call` or `prompts/get` result, with its
+/// media handed to `files`. Under `--json` the object itself is what gets printed,
+/// so the media moves into it as `path` and `bytes` instead, and the text is only
+/// for `call`'s argument-error check.
+fn rendered(
+    result: &mut Value,
+    json: bool,
+    files: &MediaFiles,
+    render: Render,
+) -> Result<String, Failure> {
+    let mut sink = |m: &Media| files.place(m);
+    if json {
+        if files.saves() {
+            save_media(result, &mut sink)?;
+        }
+        // The object goes out as the server sent it; a blob it mangled is the
+        // reader's problem, not a reason to fail the command.
+        return Ok(render(result, &mut placeholders).unwrap_or_default());
+    }
+    Ok(render(result, &mut sink)?)
+}
+
+/// A `prompts/get` result on stdout: the object under `--json`, the messages
+/// otherwise.
+fn emit(
+    result: &mut Value,
+    json: bool,
+    compact: bool,
+    files: &MediaFiles,
+    render: Render,
+) -> Result<(), Failure> {
+    let text = rendered(result, json, files, render)?;
+    if json {
+        print_value(result, compact);
+    } else if !text.is_empty() {
+        print_text(&text);
+    }
+    Ok(())
+}
+
+/// A `resources/read` result on stdout: the object under `--json`; with a
+/// `--save-dir`, its text and a line per blob filed there; otherwise the bytes
+/// themselves, which is [`write_resource`]'s business.
+fn emit_resource(
+    result: &mut Value,
+    json: bool,
+    compact: bool,
+    files: &MediaFiles,
+    redirect: &str,
+) -> Result<(), Failure> {
+    let mut sink = |m: &Media| files.place(m);
+    if json {
+        if files.saves() {
+            save_media(result, &mut sink)?;
+        }
+        print_value(result, compact);
+    } else if files.saves() {
+        print!("{}", render_resource(result, &mut sink)?);
+    } else {
+        write_resource(&resource_bodies(result)?, redirect)?;
+    }
+    Ok(())
+}
+
 /// A resource on stdout, byte for byte. Base64 is no use to anyone reading it and
 /// raw bytes corrupt a terminal, so binary asks for a redirect rather than picking
 /// one of those two ways to be useless.
@@ -860,7 +1019,9 @@ fn write_resource(bodies: &[ResourceBody], redirect: &str) -> Result<(), Failure
     if binary && stdout.is_terminal() {
         return Err(Failure::hinted(
             Error::usage("this resource is binary and stdout is a terminal"),
-            format!("send it somewhere it can land: {redirect} > file"),
+            format!(
+                "send it somewhere it can land: {redirect} > file, or {redirect} --save-dir DIR"
+            ),
         ));
     }
     let mut out = stdout.lock();
@@ -1153,6 +1314,18 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         protocol_version: cli.protocol_version,
         verbose: cli.verbose,
     };
+    if let Some(dir) = &cli.save_dir {
+        let renders_media = matches!(
+            cli.cmd,
+            Cmd::Call { .. } | Cmd::Prompt { .. } | Cmd::Read { .. } | Cmd::Shell { .. }
+        );
+        if !renders_media {
+            return Err(Error::usage("--save-dir applies to call, prompt, read and shell").into());
+        }
+        std::fs::create_dir_all(dir)
+            .map_err(|e| Error::usage(format!("--save-dir {}: {e}", dir.display())))?;
+    }
+    let save_dir = cli.save_dir.as_deref();
 
     match cli.cmd {
         Cmd::Add {
@@ -1466,18 +1639,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     )),
                     "read" => match conn.session.read_resource(rest) {
                         Err(e) => Err(missing_capability(e, "resources", info_cmd)),
-                        Ok(result) if cli.json => {
-                            println!("{result}");
-                            Ok(())
-                        }
-                        Ok(result) => {
-                            resource_bodies(&result)
-                                .map_err(Failure::from)
-                                .and_then(|bodies| {
-                                    let redirect =
-                                        format!("mcpdial read {} {}", shell_word(&target), rest);
-                                    write_resource(&bodies, &redirect)
-                                })
+                        Ok(mut result) => {
+                            let redirect = format!("mcpdial read {} {}", shell_word(&target), rest);
+                            let files = MediaFiles {
+                                dir: save_dir,
+                                stem: resource_stem(rest),
+                            };
+                            emit_resource(&mut result, cli.json, true, &files, &redirect)
                         }
                     },
                     "prompts" => match conn.session.list_prompts() {
@@ -1504,15 +1672,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             parse_object(args, "arguments")
                                 .and_then(|a| conn.session.get_prompt(name, a))
                                 .map_err(|e| missing_capability(e, "prompts", info_cmd))
-                                .map(|result| {
-                                    if cli.json {
-                                        println!("{result}");
-                                    } else {
-                                        let messages = render_messages(&result);
-                                        if !messages.is_empty() {
-                                            print_text(&messages);
-                                        }
-                                    }
+                                .and_then(|mut result| {
+                                    let files = MediaFiles {
+                                        dir: save_dir,
+                                        stem: file_stem(name),
+                                    };
+                                    emit(&mut result, cli.json, true, &files, render_messages)
                                 })
                         }
                     }
@@ -1533,18 +1698,25 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                     hint: shell_call_hint(&mut cache, &mut conn, tool),
                                 }),
                                 Ok(a) => match conn.session.call_tool(tool, a) {
-                                    Ok(result) => {
-                                        let out = mcpdial::render_content(&result);
-                                        let failed =
-                                            print_tool_result(&result, &out, cli.json, true);
-                                        if failed && reads_as_argument_error(&out) {
-                                            if let Some(hint) =
-                                                shell_call_hint(&mut cache, &mut conn, tool)
-                                            {
-                                                print_hint(&hint, cli.json);
-                                            }
-                                        }
-                                        Ok(())
+                                    Ok(mut result) => {
+                                        let files = MediaFiles {
+                                            dir: save_dir,
+                                            stem: file_stem(tool),
+                                        };
+                                        rendered(&mut result, cli.json, &files, render_content).map(
+                                            |out| {
+                                                let failed = print_tool_result(
+                                                    &result, &out, cli.json, true,
+                                                );
+                                                if failed && reads_as_argument_error(&out) {
+                                                    if let Some(hint) =
+                                                        shell_call_hint(&mut cache, &mut conn, tool)
+                                                    {
+                                                        print_hint(&hint, cli.json);
+                                                    }
+                                                }
+                                            },
+                                        )
                                     }
                                     Err(e) => {
                                         let hint = is_argument_error(&e)
@@ -1672,16 +1844,16 @@ fn run(cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Read { target, uri } => {
             let mut conn = dial(&store, &opts, &target)?;
-            let result = conn
+            let mut result = conn
                 .session
                 .read_resource(&uri)
                 .map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
-            if cli.json {
-                print_json(&result);
-                return Ok(0);
-            }
             let redirect = format!("mcpdial read {} {}", shell_word(&target), shell_word(&uri));
-            write_resource(&resource_bodies(&result)?, &redirect)?;
+            let files = MediaFiles {
+                dir: save_dir,
+                stem: resource_stem(&uri),
+            };
+            emit_resource(&mut result, cli.json, false, &files, &redirect)?;
             Ok(0)
         }
 
@@ -1719,21 +1891,20 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 )
             })?;
             let mut conn = dial(&store, &opts, &target)?;
-            let result = conn
+            let mut result = conn
                 .session
                 .get_prompt(&name, arguments)
                 .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
-            if cli.json {
-                print_json(&result);
-            } else {
+            if !cli.json {
                 if let Some(d) = result["description"].as_str() {
                     eprintln!("{d}");
                 }
-                let messages = render_messages(&result);
-                if !messages.is_empty() {
-                    print_text(&messages);
-                }
             }
+            let files = MediaFiles {
+                dir: save_dir,
+                stem: file_stem(&name),
+            };
+            emit(&mut result, cli.json, false, &files, render_messages)?;
             Ok(0)
         }
 
@@ -1962,7 +2133,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     &format!("`mcpdial tools {}`", shell_word(&target)),
                 )
             };
-            let result = match conn.session.call_tool(&tool, arguments) {
+            let mut result = match conn.session.call_tool(&tool, arguments) {
                 Ok(result) => result,
                 // The server rejected the arguments; say what it wanted instead.
                 Err(e) => {
@@ -1970,7 +2141,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     return Err(Failure { error: e, hint });
                 }
             };
-            let text = mcpdial::render_content(&result);
+            let files = MediaFiles {
+                dir: save_dir,
+                stem: file_stem(&tool),
+            };
+            let text = rendered(&mut result, cli.json, &files, render_content)?;
             let is_error = print_tool_result(&result, &text, cli.json, false);
             // A failed result that is really a schema complaint gets the same
             // answer as the JSON-RPC error other servers would have sent.
@@ -2361,6 +2536,46 @@ mod tests {
     use super::*;
     use rustyline::completion::Completer;
     use rustyline::history::DefaultHistory;
+
+    #[test]
+    fn media_files_are_named_after_their_source_and_never_overwritten() {
+        assert_eq!(file_stem("take_screenshot"), "take_screenshot");
+        assert_eq!(file_stem("shot/one:two"), "shot_one_two");
+        assert_eq!(file_stem(".."), "media");
+        assert_eq!(resource_stem("file:///logo.png"), "logo");
+        assert_eq!(resource_stem("file:///dir/a.b.c/"), "a.b");
+        assert_eq!(resource_stem("https://host/x?y=1#z"), "x");
+        assert_eq!(resource_stem("file:///.hidden"), ".hidden");
+        assert_eq!(resource_stem(""), "resource");
+
+        let dir = std::env::temp_dir().join(format!(
+            "mcpdial-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = Media {
+            kind: "image".into(),
+            mime_type: "image/png".into(),
+            bytes: b"\x89PNG".to_vec(),
+        };
+        let files = MediaFiles {
+            dir: Some(&dir),
+            stem: "shot".into(),
+        };
+        assert_eq!(files.place(&png).unwrap(), Some(dir.join("shot-1.png")));
+        assert_eq!(files.place(&png).unwrap(), Some(dir.join("shot-2.png")));
+        assert_eq!(std::fs::read(dir.join("shot-1.png")).unwrap(), b"\x89PNG");
+        let nowhere = MediaFiles {
+            dir: None,
+            stem: "shot".into(),
+        };
+        assert_eq!(nowhere.place(&png).unwrap(), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn visible_escapes_what_would_move_the_cursor_and_keeps_layout() {

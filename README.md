@@ -131,7 +131,8 @@ mcpdial info TARGET              server name, version, capabilities, instruction
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | -]
 mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
-mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect
+mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
+mcpdial --save-dir DIR ...       file image, audio and blob blocks as DIR/<tool>-<n>.<ext>
 mcpdial prompts TARGET [--long]  every prompt a server offers
 mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | -]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
