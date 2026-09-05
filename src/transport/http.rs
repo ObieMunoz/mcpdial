@@ -12,6 +12,10 @@ use std::time::Duration;
 pub const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
                               (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
+/// Deliberately not `--timeout`: this runs from a `Drop` on the way out, where a
+/// server that will not answer promptly is not worth waiting for.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct HttpTransport {
     url: String,
     token: Option<String>,
@@ -38,6 +42,22 @@ impl HttpTransport {
             extra_headers: Vec::new(),
             log: None,
         }
+    }
+
+    fn identify<A>(&self, mut req: ureq::RequestBuilder<A>) -> ureq::RequestBuilder<A> {
+        req = req.header("User-Agent", &self.user_agent);
+        if let Some(t) = &self.token {
+            req = req.header("Authorization", &format!("Bearer {t}"));
+        }
+        if let Some(sid) = &self.session_id {
+            req = req
+                .header("Mcp-Session-Id", sid)
+                .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+        }
+        for (k, v) in &self.extra_headers {
+            req = req.header(k, v);
+        }
+        req
     }
 }
 
@@ -109,24 +129,13 @@ impl Transport for HttpTransport {
         let body = payload.to_string();
         (self.log)(&format!("-> POST {}\n   {}", self.url, body));
 
-        let mut req = self
-            .agent
-            .post(&self.url)
-            .header("Content-Type", "application/json")
-            // Advertise both: the server picks the framing.
-            .header("Accept", "application/json, text/event-stream")
-            .header("User-Agent", &self.user_agent);
-        if let Some(t) = &self.token {
-            req = req.header("Authorization", &format!("Bearer {t}"));
-        }
-        if let Some(sid) = &self.session_id {
-            req = req
-                .header("Mcp-Session-Id", sid)
-                .header("MCP-Protocol-Version", PROTOCOL_VERSION);
-        }
-        for (k, v) in &self.extra_headers {
-            req = req.header(k, v);
-        }
+        let req = self.identify(
+            self.agent
+                .post(&self.url)
+                .header("Content-Type", "application/json")
+                // Advertise both: the server picks the framing.
+                .header("Accept", "application/json, text/event-stream"),
+        );
 
         let mut resp = req.send(&body).map_err(|e| match e {
             ureq::Error::Timeout(_) => {
@@ -170,5 +179,33 @@ impl Transport for HttpTransport {
             self.session_id = Some(sid);
         }
         decode_body(&text, &content_type)
+    }
+
+    /// End the session server-side, as Streamable HTTP prescribes; without it the
+    /// server holds it until its own timeout, long after the user has gone.
+    ///
+    /// Runs from `Session::drop`, so no outcome may reach the user: a `405` is the
+    /// server declining client-side termination, which the spec allows, and any
+    /// other error is a session we cannot tidy up on the way out anyway.
+    fn close(&mut self) {
+        let Some(sid) = self.session_id.clone() else {
+            return;
+        };
+        let req = self.identify(
+            self.agent
+                .delete(&self.url)
+                .config()
+                .timeout_global(Some(CLOSE_TIMEOUT))
+                .build(),
+        );
+        // After `identify` has read it into the header, before the request goes
+        // out: a second close then finds no session and sends nothing.
+        self.session_id = None;
+
+        (self.log)(&format!("-> DELETE {} (session {sid})", self.url));
+        match req.call() {
+            Ok(resp) => (self.log)(&format!("<- HTTP {}", resp.status().as_u16())),
+            Err(e) => (self.log)(&format!("<- session {sid} not terminated: {e}")),
+        }
     }
 }

@@ -30,29 +30,34 @@ fn stateful_http_handshake_session_and_call() {
 
     // What actually went over the wire for that last call.
     let reqs = s.requests.lock().unwrap();
-    let last3 = &reqs[reqs.len() - 3..];
-    assert_eq!(last3[0].json()["method"], "initialize");
+    let last4 = &reqs[reqs.len() - 4..];
+    assert_eq!(last4[0].json()["method"], "initialize");
     assert!(
-        last3[0]
+        last4[0]
             .header("user-agent")
             .unwrap()
             .starts_with("Mozilla/5.0"),
         "browser UA is mandatory"
     );
     assert_eq!(
-        last3[0].header("accept").unwrap(),
+        last4[0].header("accept").unwrap(),
         "application/json, text/event-stream"
     );
-    assert!(last3[0].header("mcp-session-id").is_none());
-    assert_eq!(last3[1].json()["method"], "notifications/initialized");
-    assert!(last3[1].json().get("id").is_none());
+    assert!(last4[0].header("mcp-session-id").is_none());
+    assert_eq!(last4[1].json()["method"], "notifications/initialized");
+    assert!(last4[1].json().get("id").is_none());
     assert_eq!(
-        last3[1].header("mcp-session-id"),
+        last4[1].header("mcp-session-id"),
         Some("sess-1"),
         "session id is echoed back"
     );
-    assert_eq!(last3[2].json()["method"], "tools/call");
-    assert_eq!(last3[2].header("mcp-protocol-version"), Some("2025-06-18"));
+    assert_eq!(last4[2].json()["method"], "tools/call");
+    assert_eq!(last4[2].header("mcp-protocol-version"), Some("2025-06-18"));
+    assert_eq!(
+        last4[3].method, "DELETE",
+        "one-shot commands end the session"
+    );
+    assert_eq!(last4[3].header("mcp-session-id"), Some("sess-1"));
 }
 
 #[test]
@@ -888,6 +893,66 @@ fn shell(
         String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code(),
     )
+}
+
+#[test]
+fn http_sessions_are_terminated_on_close() {
+    let s = start(Mode::Stateful);
+    let home = temp_home("session-delete");
+
+    let (_, stderr, code) = shell(&home, &s.url, false, "call add {\"a\":1,\"b\":2}\nquit\n");
+    assert_eq!(code, Some(0), "{stderr}");
+    let deletes: Vec<_> = s
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.method == "DELETE")
+        .cloned()
+        .collect();
+    assert_eq!(deletes.len(), 1, "the shell ends its session, exactly once");
+    assert_eq!(deletes[0].path, "/mcp");
+    assert_eq!(deletes[0].header("mcp-session-id"), Some("sess-1"));
+    assert_eq!(
+        deletes[0].header("mcp-protocol-version"),
+        Some("2025-06-18")
+    );
+    assert!(
+        deletes[0]
+            .header("user-agent")
+            .unwrap()
+            .starts_with("Mozilla/5.0"),
+        "the same client that sent the POSTs"
+    );
+
+    let o = run(mcpdial(&home).args(["-v", "call", &s.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stderr.contains("-> DELETE"), "{}", o.stderr);
+
+    let refuses = start(Mode::StatefulNoDelete);
+    let o = run(mcpdial(&home).args(["call", &refuses.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stdout.trim(), "The sum of 1 and 1 is 2.");
+    assert_eq!(o.stderr, "", "a 405 never reaches the user");
+    assert!(refuses
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.method == "DELETE"));
+
+    let stateless = start(Mode::Stateless);
+    let o = run(mcpdial(&home).args(["call", &stateless.url, "add", r#"{"a":1,"b":1}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        !stateless
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "DELETE"),
+        "a stateless server never issued a session to end"
+    );
 }
 
 #[test]
