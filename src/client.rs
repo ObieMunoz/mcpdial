@@ -697,4 +697,41 @@ mod tests {
         );
         assert_eq!(example_arguments(&json!({"name":"x"})), "{}");
     }
+
+    #[test]
+    fn a_remembered_status_round_trips_and_an_unreadable_one_is_a_miss() {
+        let cfg = ServerConfig::http("https://x/mcp");
+        let taken = Listing::probed(
+            &Probe {
+                name: "x".into(),
+                kind: cfg.kind(),
+                location: cfg.location().to_string(),
+                status: Status::Unreachable {
+                    detail: "no route".into(),
+                },
+                auth: AuthUsed::Saved,
+                server: Some("fake 1.0".into()),
+                tools: Some(vec![json!({"name": "echo"})]),
+            },
+            100,
+        );
+
+        let record = taken.record(7);
+        let back = Listing::remembered("x", &cfg, &record, 160).unwrap();
+        assert_eq!(back.status, taken.status);
+        assert_eq!(back.auth, AuthUsed::Saved);
+        assert_eq!(back.server.as_deref(), Some("fake 1.0"));
+        assert_eq!(back.tools, Some(1));
+        assert_eq!(back.checked_at, 100);
+        assert_eq!(back.age_seconds, 60);
+        assert!(still_current(&record, 7, 100 + STATUS_TTL.as_secs() - 1));
+        assert!(!still_current(&record, 7, 100 + STATUS_TTL.as_secs()));
+        assert!(!still_current(&record, 8, 160), "a different server");
+
+        let from_a_later_build = ProbeRecord {
+            status: json!({"state": "a state this build has never heard of"}),
+            ..record
+        };
+        assert!(Listing::remembered("x", &cfg, &from_a_later_build, 160).is_none());
+    }
 }
