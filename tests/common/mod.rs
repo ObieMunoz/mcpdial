@@ -38,6 +38,9 @@ pub enum Mode {
     /// hand: the token endpoint refuses any request that does not prove the secret,
     /// in the one placement named here.
     Confidential { auth_method: String },
+    /// Protocol 2024-11-05: the URL serves `GET` alone, streaming an `endpoint` event
+    /// that names where requests are POSTed.
+    LegacySse,
 }
 
 /// The client the administrator registered out of band. The secret carries the
@@ -315,6 +318,9 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if let Mode::Blocked = mode {
         return Response::from_string("error code: 1010").with_status_code(403);
     }
+    if let Mode::LegacySse = mode {
+        return legacy_sse(base, rec);
+    }
     if matches!(
         mode,
         Mode::Auth { .. } | Mode::AuthLocalhostOnly | Mode::Confidential { .. }
@@ -439,6 +445,30 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     } else {
         json_resp(200, &reply)
     }
+}
+
+/// The 2024-11-05 handshake, which is a different transport rather than a broken
+/// server: the endpoint is registered for `GET`, so a POST finds no route.
+///
+/// The stream promises a `Content-Length` it never finishes sending, so the client
+/// sees what a real one gives it - an opening `endpoint` event and then a
+/// connection that stays open indefinitely.
+fn legacy_sse(base: &str, rec: &Recorded) -> Resp {
+    if rec.method != "GET" {
+        return Response::from_string("Method Not Allowed").with_status_code(405);
+    }
+    let opening_frame = format!("event: endpoint\ndata: {base}/messages?sessionId=sess-1\n\n");
+    let never_finished = 4096;
+    with_headers(
+        Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            std::io::Cursor::new(opening_frame.into_bytes()),
+            Some(never_finished),
+            None,
+        ),
+        &[("Content-Type", "text/event-stream")],
+    )
 }
 
 /// One tool per page. An unrecognised cursor is an error rather than an empty
