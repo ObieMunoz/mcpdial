@@ -9,6 +9,10 @@ carries its section from here as its release notes.
 
 ### Added
 
+- `catalog`: a reviewed list of servers grouped by category, embedded in the binary
+  and refreshed from `main` at most once a day (`--offline` skips the refresh, and a
+  failed one falls back to the built-in copy). `add NAME --catalog ID` saves one
+  entry; `MCPDIAL_CATALOG` names another URL or file to read the list from.
 - `add NAME --registry <name>` saves an entry of the MCP registry without running it:
   an HTTP remote as is, an npm, PyPI or OCI package as the `npx`, `uvx` or
   `docker run` line it needs, required environment variables as `${VAR}`

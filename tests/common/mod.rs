@@ -313,6 +313,7 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
             }
         }
         p if p.starts_with("/v0.1/servers") => registry(base, &percent_decode(p), query),
+        "/catalog.json" => json_resp(200, &catalog_entries(base)),
         _ => Response::from_string("not found").with_status_code(404),
     }
 }
@@ -361,6 +362,26 @@ pub fn registry_entries(base: &str) -> Vec<Value> {
             ]
         }),
     ]
+}
+
+/// A catalog over the fake registry's entries plus one `config` entry, served at
+/// `/catalog.json` and usable as a fixture file. The registry entries point at
+/// this server's registry, so `add --catalog` resolves without the network.
+pub fn catalog_entries(base: &str) -> Value {
+    json!([
+        {"id": "remote", "name": "Acme Remote", "category": "Docs and search",
+         "summary": "The fake server, from the registry",
+         "registry": "io.github.acme/remote", "transport": "http", "auth": "none"},
+        {"id": "box", "name": "Acme Box", "category": "Databases",
+         "summary": "A sandbox, as a Python package",
+         "registry": "io.github.acme/box", "transport": "stdio", "auth": "env"},
+        {"id": "files", "name": "Acme Files", "category": "Local files",
+         "summary": "Serve one directory; the entry leaves the directory to the user",
+         "registry": "io.github.acme/files", "transport": "stdio", "auth": "env"},
+        {"id": "fake", "name": "Fake", "category": "Local files",
+         "summary": "The fake server, by its URL",
+         "config": {"http": format!("{base}/mcp")}, "transport": "http", "auth": "none"}
+    ])
 }
 
 /// The two registry routes mcpdial uses: the list with `search`, `limit` and
