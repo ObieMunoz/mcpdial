@@ -21,6 +21,7 @@
 use crate::config::{now, Credential, CLIENT_CREDENTIALS};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
 use crate::transport::http::{header, redirect_error, USER_AGENT};
+use crate::transport::retry::{self, Failed, Failure, Retry};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -53,6 +54,7 @@ pub struct Metadata {
 pub struct Http {
     agent: ureq::Agent,
     user_agent: String,
+    retry: Retry,
 }
 
 impl Http {
@@ -64,27 +66,65 @@ impl Http {
         Self {
             agent: ureq::Agent::new_with_config(config),
             user_agent: user_agent.unwrap_or_else(|| USER_AGENT.to_string()),
+            retry: Retry {
+                enabled: true,
+                timeout,
+            },
         }
     }
 
+    /// Whether a discovery `GET` that fails transiently is sent once more.
+    pub fn retry(mut self, enabled: bool) -> Self {
+        self.retry.enabled = enabled;
+        self
+    }
+
+    /// A discovery document, or `None` where the server has none to offer. The
+    /// `GET` is idempotent, so a transient failure gets the one retry any
+    /// idempotent request does; a status the retry cannot mend is a miss.
     fn get_json(&self, url: &str) -> Result<Option<Value>> {
-        let mut resp = match self
+        let mut outcome = self.get_once(url);
+        if let Err(failed) = &outcome {
+            if let Some(delay) = self.retry.delay(true, false, &failed.failure) {
+                thread::sleep(delay);
+                outcome = self.get_once(url);
+            }
+        }
+        match outcome {
+            Ok(json) => Ok(json),
+            Err(Failed {
+                failure: Failure::Status { .. },
+                ..
+            }) => Ok(None),
+            Err(failed) => Err(failed.error),
+        }
+    }
+
+    fn get_once(&self, url: &str) -> std::result::Result<Option<Value>, Failed> {
+        let mut resp = self
             .agent
             .get(url)
             .header("Accept", "application/json")
             .header("User-Agent", &self.user_agent)
             .call()
-        {
-            Ok(r) => r,
-            Err(e) => return Err(Error::auth(format!("GET {url}: {e}"))),
-        };
+            .map_err(|e| Failed {
+                failure: retry::before_any_reply(&e),
+                error: Error::auth(format!("GET {url}: {e}")),
+            })?;
+        let status = resp.status().as_u16();
         if !resp.status().is_success() {
-            return Ok(None);
+            return Err(Failed {
+                error: Error::auth(format!("GET {url}: HTTP {status}")),
+                failure: Failure::Status {
+                    status,
+                    retry_after: retry::retry_after(header(&resp, "retry-after").as_deref()),
+                },
+            });
         }
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| Error::auth(format!("GET {url}: {e}")))?;
+        let text = resp.body_mut().read_to_string().map_err(|e| Failed {
+            error: Error::auth(format!("GET {url}: {e}")),
+            failure: Failure::Interrupted,
+        })?;
         Ok(serde_json::from_str(&text).ok())
     }
 

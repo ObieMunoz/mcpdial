@@ -155,8 +155,9 @@ mcpdial completions SHELL        a completion script; see Install above
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, `--protocol-version
-VERSION` to offer an older MCP revision at `initialize`, and `--no-daemon` to dial a
-server afresh even while `start` has one running.
+VERSION` to offer an older MCP revision at `initialize`, `--no-daemon` to dial a
+server afresh even while `start` has one running, and `--no-retry` to fail on the
+first transient HTTP failure instead of sending the request once more.
 
 `--timeout` bounds every wait: the flag on the command line, else the timeout saved
 with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
