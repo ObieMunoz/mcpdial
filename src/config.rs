@@ -47,6 +47,10 @@ pub struct ServerConfig {
     /// server that misbehaves when offered one it has never heard of.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
+    /// Seconds to wait for a reply from this server when `--timeout` is not given,
+    /// for one that installs packages on first launch or runs tools for minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
     /// Where the entry came from, when it was added from the catalog or the
     /// registry. Nothing dials with it; `browse` and a later `update` read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +152,7 @@ impl ServerConfig {
             env,
             cwd: self.cwd.as_deref().map(|d| fill("cwd", d)).transpose()?,
             protocol_version: self.protocol_version.clone(),
+            timeout: self.timeout,
             source: self.source.clone(),
         })
     }
@@ -978,6 +983,33 @@ mod tests {
             "removing a server drops its token"
         );
         assert!(!s.remove_server("wiki").unwrap());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn timeout_round_trips_and_is_omitted_when_unset() {
+        let s = temp_store();
+        let mut slow = ServerConfig::stdio("npx -y slow-server");
+        slow.timeout = Some(0.5);
+        s.add_server("slow", slow.clone()).unwrap();
+        s.add_server("plain", ServerConfig::http("https://plain.example/mcp"))
+            .unwrap();
+
+        let all = s.servers().unwrap();
+        assert_eq!(all["slow"], slow);
+        assert_eq!(all["plain"].timeout, None);
+        let text = fs::read_to_string(s.servers_path()).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(file["servers"]["slow"]["timeout"], 0.5);
+        assert!(
+            file["servers"]["plain"].get("timeout").is_none(),
+            "a server with no timeout of its own has no key: {text}"
+        );
+        assert_eq!(
+            all["slow"].expanded(|_| None).unwrap().timeout,
+            Some(0.5),
+            "dialing keeps the timeout"
+        );
         fs::remove_dir_all(&s.dir).unwrap();
     }
 
