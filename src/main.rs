@@ -224,6 +224,15 @@ enum Cmd {
     /// Authorize in the browser once and save the token (HTTP servers)
     Login {
         target: String,
+        /// authorization-code (a browser, once) or client-credentials (a confidential
+        /// client's --client-id and secret, no human)
+        #[arg(
+            long,
+            value_name = "GRANT",
+            default_value = "authorization-code",
+            value_parser = ["authorization-code", "client-credentials"]
+        )]
+        grant: String,
         /// Space-separated scopes (default: whatever the server advertises)
         #[arg(long)]
         scope: Option<String>,
@@ -2171,6 +2180,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Login {
             target,
+            grant,
             scope,
             port,
             client_id,
@@ -2182,7 +2192,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             no_browser,
         } => {
             let r = client::resolve(&store, &target)?;
-            let Some(url) = r.config.http.clone() else {
+            let dialed = r.config.expanded(|var| std::env::var(var).ok())?;
+            let Some(url) = dialed.http else {
                 return Err(Error::usage(
                     "login only applies to HTTP servers; stdio servers need no token",
                 )
@@ -2208,11 +2219,15 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
             };
-            let cred = oauth::login(&http, &url, existing.as_ref(), &login_opts, |line| {
-                eprintln!("{line}")
-            })?;
+            let notify = |line: &str| eprintln!("{line}");
+            let cred = match grant.as_str() {
+                "client-credentials" => {
+                    oauth::login_client_credentials(&http, &url, &login_opts, notify)?
+                }
+                _ => oauth::login(&http, &url, existing.as_ref(), &login_opts, notify)?,
+            };
             store.save_credential(&r.name, cred.clone())?;
-            let refreshable = cred.refresh_token.is_some();
+            let refreshable = cred.can_refresh();
             if cli.json {
                 println!(
                     "{}",

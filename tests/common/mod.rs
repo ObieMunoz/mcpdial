@@ -196,6 +196,8 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
             });
             if let Mode::Confidential { auth_method } = mode {
                 meta["token_endpoint_auth_methods_supported"] = json!([auth_method]);
+                meta["grant_types_supported"] =
+                    json!(["authorization_code", "refresh_token", "client_credentials"]);
                 meta.as_object_mut()
                     .unwrap()
                     .remove("registration_endpoint");
@@ -301,6 +303,22 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                         200,
                         &json!({"access_token": tok, "token_type": "Bearer",
                         "expires_in": 3600, "refresh_token": "ref-1", "scope": "mcp"}),
+                    )
+                }
+                // Short-lived and without a refresh token, as RFC 6749 section 4.4.3
+                // has it, so a client that wants to stay signed in must run the grant
+                // again.
+                "client_credentials" if matches!(mode, Mode::Confidential { .. }) => {
+                    assert_eq!(get("client_id"), CONFIDENTIAL_ID);
+                    assert_eq!(get("resource"), format!("{base}/mcp"));
+                    assert_eq!(get("code"), "", "no code in a client-credentials request");
+                    st.issued += 1;
+                    let tok = format!("tok-{}", st.issued);
+                    st.valid_tokens.push(tok.clone());
+                    json_resp(
+                        200,
+                        &json!({"access_token": tok, "token_type": "Bearer",
+                        "expires_in": 60, "scope": get("scope")}),
                     )
                 }
                 "refresh_token" => {

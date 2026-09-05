@@ -3,8 +3,9 @@
 
 mod common;
 
-use common::{echo_command, mcpdial, run, start, temp_home, Mode};
+use common::{echo_command, mcpdial, run, start, temp_home, Mode, CONFIDENTIAL_ID};
 use serde_json::Value;
+use std::process::Stdio;
 
 #[test]
 fn a_saved_header_placeholder_is_filled_in_from_the_environment() {
@@ -140,4 +141,59 @@ fn a_stdio_server_gets_its_env_and_command_line_expanded() {
         .env("MCPDIAL_TEST_ECHO", &echo)
         .args(["info", "stdio:${MCPDIAL_TEST_ECHO}"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
+}
+
+#[test]
+fn login_fills_in_a_placeholder_in_the_url_before_discovery() {
+    let s = start(Mode::Confidential {
+        auth_method: "client_secret_post".into(),
+    });
+    let home = temp_home("placeholders-login");
+    let o = run(mcpdial(&home).args([
+        "add",
+        "work",
+        "--http",
+        "http://${MCPDIAL_TEST_HOST}/mcp",
+        "--no-probe",
+    ]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let host = s.base.strip_prefix("http://").unwrap();
+
+    // The client-credentials grant is the login that needs no browser to finish.
+    let mut login = mcpdial(&home);
+    login
+        .args([
+            "login",
+            "work",
+            "--grant",
+            "client-credentials",
+            "--client-id",
+            CONFIDENTIAL_ID,
+            "--client-secret-env",
+            "MCPDIAL_TEST_SECRET",
+        ])
+        .env("MCPDIAL_TEST_SECRET", common::CONFIDENTIAL_SECRET)
+        .stdin(Stdio::null());
+
+    let o = run(login.env_remove("MCPDIAL_TEST_HOST"));
+    assert_eq!(o.code, 2, "{}", o.stderr);
+    assert!(
+        o.stderr
+            .contains("http URL refers to $MCPDIAL_TEST_HOST, which is not set"),
+        "{}",
+        o.stderr
+    );
+    assert!(s.requests.lock().unwrap().is_empty(), "nothing may be sent");
+
+    let o = run(login.env("MCPDIAL_TEST_HOST", host));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let creds = std::fs::read_to_string(home.join("credentials.json")).unwrap();
+    let cred = &serde_json::from_str::<Value>(&creds).unwrap()["credentials"]["work"];
+    assert_eq!(
+        cred["resource"], s.url,
+        "the token is bound to the expanded URL"
+    );
+    let saved = std::fs::read_to_string(home.join("servers.json")).unwrap();
+    assert!(saved.contains("http://${MCPDIAL_TEST_HOST}/mcp"), "{saved}");
+    assert!(!saved.contains(host), "{saved}");
 }

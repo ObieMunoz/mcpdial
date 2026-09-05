@@ -188,6 +188,10 @@ terminal; piped input is read one line at a time with no editing and no history.
 - `login` identifies the client with `--client-id` if given, else with a client ID
   metadata document when the server advertises support, else by dynamic registration.
   `--no-client-metadata` forces the last; `token show --json` reports `registration`.
+- When a client id and secret are available (a confidential client registered out of
+  band), `mcpdial login TARGET --grant client-credentials --client-id ID
+  --client-secret-env VAR` needs no human: no browser, no redirect, and the token is
+  renewed by running the grant again.
 - If a token already exists in the environment: `mcpdial --token-env VAR ...` or
   `mcpdial token set NAME --env VAR`. Never put a token on the command line.
 - Saved tokens refresh automatically. A `token_rejected` status after that means the
