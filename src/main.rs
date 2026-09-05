@@ -220,7 +220,14 @@ enum TokenCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = Cli::try_parse().unwrap_or_else(|e| {
+        let hint = split_object_hint(&e);
+        let _ = e.print();
+        if let Some(hint) = hint {
+            eprintln!("{hint}");
+        }
+        std::process::exit(e.exit_code());
+    });
     let json = cli.json;
     match run(cli) {
         Ok(code) => ExitCode::from(code),
@@ -356,11 +363,71 @@ fn parse_object(text: &str, what: &str) -> Result<Value, Error> {
             "{what} must be a JSON object like {{\"key\": \"value\"}}, not {}",
             json_kind(&v)
         ))),
-        Err(e) => Err(Error::usage(format!(
-            "{what} must be a JSON object like {{\"key\": \"value\"}}; {:?} is not JSON ({e})",
-            truncate_at(text, 60)
-        ))),
+        Err(e) => Err(Error::usage(match requote_object(text) {
+            Some(fixed) => format!(
+                "{what} must be a JSON object like {{\"key\": \"value\"}}; {:?} is one with its double quotes missing (did you mean {fixed}?)",
+                truncate_at(text, 60)
+            ),
+            None => format!(
+                "{what} must be a JSON object like {{\"key\": \"value\"}}; {:?} is not JSON ({e})",
+                truncate_at(text, 60)
+            ),
+        })),
     }
+}
+
+/// `{url:https://x}` back to `{"url": "https://x"}`: the object a shell was most
+/// likely handed before it removed the double quotes. Flat objects only, since
+/// the quotes were the only thing telling a comma in a value from a separator.
+fn requote_object(text: &str) -> Option<String> {
+    let inner = text.trim().strip_prefix('{')?.strip_suffix('}')?;
+    if inner.contains(['{', '[', '"']) {
+        return None;
+    }
+    let fields = inner
+        .split(',')
+        .map(|pair| {
+            let (key, value) = pair.split_once(':')?;
+            let (key, value) = (key.trim(), value.trim());
+            if key.is_empty() || value.is_empty() {
+                return None;
+            }
+            let value = serde_json::from_str::<Value>(value)
+                .unwrap_or_else(|_| Value::String(value.to_string()));
+            Some(format!("{}: {value}", json!(key)))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("{{{}}}", fields.join(", ")))
+}
+
+/// The hint after an argument object failed to parse on the command line: the
+/// same command with its quotes back when the shell removed them, else `lookup`,
+/// which says where the expected shape is.
+fn json_arg_hint(arguments: &str, command: &str, lookup: String) -> String {
+    match requote_object(arguments) {
+        Some(fixed) => format!(
+            "the shell removed the double quotes; single quotes keep them:\n  {command} {}",
+            shell_word(&fixed)
+        ),
+        None => lookup,
+    }
+}
+
+/// The hint when the shell split an unquoted JSON object at its commas, so that
+/// `{"a": 1, "b": 2}` reached clap as the two words `a:1` and `b:2`.
+fn split_object_hint(e: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if e.kind() != ErrorKind::UnknownArgument {
+        return None;
+    }
+    let ContextValue::String(word) = e.get(ContextKind::InvalidArg)? else {
+        return None;
+    };
+    let looks_like_field = word.contains(':') && !word.starts_with('-');
+    let takes_json = std::env::args().any(|a| a == "call" || a == "prompt");
+    (looks_like_field && takes_json).then(|| {
+        "the shell split a JSON object at its commas; single quotes keep it whole: '{\"key\": \"value\", ...}'".to_string()
+    })
 }
 
 /// What a JSON value is, for an error message.
@@ -1346,9 +1413,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
                 Failure::hinted(
                     e,
-                    format!(
-                        "`mcpdial prompts {} --long` shows what {name} takes",
-                        shell_word(&target)
+                    json_arg_hint(
+                        &arguments,
+                        &format!("mcpdial prompt {} {name}", shell_word(&target)),
+                        format!(
+                            "`mcpdial prompts {} --long` shows what {name} takes",
+                            shell_word(&target)
+                        ),
                     ),
                 )
             })?;
@@ -1565,9 +1636,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
                 Failure::hinted(
                     e,
-                    format!(
-                        "`mcpdial schema {} {tool}` shows what {tool} takes",
-                        shell_word(&target)
+                    json_arg_hint(
+                        &arguments,
+                        &format!("mcpdial call {} {tool}", shell_word(&target)),
+                        format!(
+                            "`mcpdial schema {} {tool}` shows what {tool} takes",
+                            shell_word(&target)
+                        ),
                     ),
                 )
             })?;

@@ -195,6 +195,34 @@ fn errors_map_to_exit_codes() {
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("must be a JSON object"));
 
+    // An unquoted {"message":"hi"} reaches us as {message:hi}: name the cause
+    // and answer with the command line that would have worked.
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", "{message:hi}"]));
+    assert_eq!(o.code, 2);
+    assert!(
+        o.stderr.contains(r#"did you mean {"message": "hi"}?"#),
+        "{}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains(&format!(
+            "mcpdial call {} echo '{{\"message\": \"hi\"}}'",
+            s.url
+        )),
+        "{}",
+        o.stderr
+    );
+
+    // With two keys the shell splits the object at the comma into two words.
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", "message:hi", "n:2"]));
+    assert_eq!(o.code, 2);
+    assert!(
+        o.stderr.contains("unexpected argument 'n:2'")
+            && o.stderr.contains("split a JSON object at its commas"),
+        "{}",
+        o.stderr
+    );
+
     let o = run(mcpdial(&home).args(["info", "no-such-server"]));
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("unknown server"));
@@ -804,6 +832,7 @@ fn shell_explains_the_shape_it_expected() {
         "echo\n",                            // a tool name typed as if it were a command
         "call echo\n",                       // a required argument left out
         "call echo [www.x.com](http://x)\n", // arguments that are not JSON at all
+        "call echo {message:x}\n",           // an object missing its quotes
         "call ech {\"message\":\"x\"}\n",    // a tool name with a typo
         "tolls\n",                           // a command with a typo
         "schema echo\n",
@@ -819,8 +848,8 @@ fn shell_explains_the_shape_it_expected() {
         stderr
             .matches(r#"usage: call echo {"message": "<string>"}"#)
             .count(),
-        4,
-        "bare name, missing argument, unparseable argument and `help echo`: {stderr}"
+        5,
+        "bare name, missing argument, two unparseable arguments and `help echo`: {stderr}"
     );
     assert!(
         stderr.contains("message: string (required)"),
@@ -829,6 +858,11 @@ fn shell_explains_the_shape_it_expected() {
     // Unparseable arguments quote what actually arrived.
     assert!(
         stderr.contains(r#""[www.x.com](http://x)" is not JSON"#),
+        "{stderr}"
+    );
+    // An object that only lacks its quotes gets them back.
+    assert!(
+        stderr.contains(r#"did you mean {"message": "x"}?"#),
         "{stderr}"
     );
     // Near misses are named, for tools and for commands.
