@@ -262,7 +262,8 @@ servers, token selection, and status probing if you want them.
 3. The methods you need are `initialize`, `tools/list`, and `tools/call`.
 
 Two details make a naive `curl` attempt fail, and both are handled here: Streamable HTTP
-servers may frame the reply as `text/event-stream` rather than JSON, and the
+servers may frame the reply as `text/event-stream` rather than JSON - carrying their own
+notifications, logs and pings on that stream ahead of the answer - and the
 `notifications/initialized` notification after `initialize` is mandatory on stateful
 servers. A third detail comes from the edge rather than the protocol: bot mitigation in
 front of public servers rejects default library user agents, so every request carries a
