@@ -257,6 +257,11 @@ crafted entry cannot add to the command line. `mcpdial ls` afterwards is the tes
 
 `MCPDIAL_REGISTRY=URL` points at a private registry that serves the same API.
 
+What was added this way is remembered: the entry's registry name and version are
+saved under `source` in `servers.json`, `ls --no-probe` shows the name in a `SOURCE`
+column, and its `--json` rows carry the object. A server added by hand or by `import`
+has none.
+
 ### Quoting a stdio command line
 
 A `--stdio` string, and the part of a `stdio:` target after the colon, is split into

@@ -8,7 +8,7 @@
 //! piece becomes one argv word, joined with the quoting `import` uses, so nothing in
 //! it can grow into a second command.
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, Source};
 use crate::import_config::shell_join;
 use crate::protocol::{Error, Result};
 use serde_json::Value;
@@ -223,7 +223,7 @@ pub fn convert(server: &Value, pick: &Pick, given: &[String]) -> Result<Resolved
 
     let mut slots = Slots::new(given);
     let mut notes = Vec::new();
-    let config = match pick {
+    let mut config = match pick {
         Pick::Remote => match streamable.or(sse) {
             Some(r) => remote(r, &mut slots, &mut notes)?,
             None => {
@@ -275,11 +275,31 @@ pub fn convert(server: &Value, pick: &Pick, given: &[String]) -> Result<Resolved
             slots.seen.join("\n  ")
         ));
     }
+    config.source = provenance(server);
     Ok(Resolved {
         config,
         notes,
         missing: slots.missing,
     })
+}
+
+/// The entry's own name and version, so `ls` can say where the server came from
+/// and a later `update` has something to compare. An entry naming neither
+/// leaves no trace.
+fn provenance(server: &Value) -> Option<Source> {
+    let field = |key: &str| {
+        server[key]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let source = Source {
+        catalog: None,
+        registry: field("name"),
+        version: field("version"),
+    };
+    (source != Source::default()).then_some(source)
 }
 
 /// The values an entry leaves to the user: an argument without a `value`, or a
@@ -945,6 +965,27 @@ mod tests {
         );
         assert_eq!(r.notes, [SSE_NOTE]);
         assert_eq!(transports(&entry), ["sse"]);
+    }
+
+    #[test]
+    fn the_entry_name_and_version_are_kept_as_the_source() {
+        let r = convert(&npm_with_env(), &Pick::Any, &[]).unwrap();
+        assert_eq!(
+            r.config.source,
+            Some(Source {
+                catalog: None,
+                registry: Some("com.pulsemcp/remote-filesystem".into()),
+                version: Some("0.1.3".into()),
+            })
+        );
+        let r = convert(&remotes(), &Pick::Remote, &args(&["api.autorfp.ai"])).unwrap();
+        let source = r.config.source.unwrap();
+        assert_eq!(source.registry.as_deref(), Some("ae.propick/propick"));
+        assert_eq!(source.version.as_deref(), Some("1.0.0"));
+
+        let nameless = json!({"remotes": [{"type": "streamable-http", "url": "https://x/mcp"}]});
+        let r = convert(&nameless, &Pick::Any, &[]).unwrap();
+        assert_eq!(r.config.source, None, "nothing known, nothing written");
     }
 
     #[test]
