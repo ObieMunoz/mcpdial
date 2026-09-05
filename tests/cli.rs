@@ -963,3 +963,57 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
     assert_eq!(lines[2]["content"][0]["text"], "Echo: two");
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn the_protocol_version_header_rides_every_request_after_initialize() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("protocol-version");
+
+    let o = run(mcpdial(&home).args(["tools", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", r#"{"message":"hi"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+
+    let reqs = s.requests.lock().unwrap();
+    assert!(
+        reqs.iter().all(|r| r.header("mcp-session-id").is_none()),
+        "a stateless server hands out no session id"
+    );
+    for r in reqs.iter() {
+        let msg = r.json();
+        let method = msg["method"].as_str().unwrap_or_default();
+        let sent = r.header("mcp-protocol-version");
+        if method == "initialize" {
+            assert_eq!(sent, None, "nothing is negotiated yet on initialize");
+        } else {
+            assert_eq!(sent, Some("2025-06-18"), "missing on {method}");
+        }
+    }
+    for method in ["tools/list", "tools/call"] {
+        assert!(
+            reqs.iter().any(|r| r.json()["method"] == method),
+            "{method} never reached the server"
+        );
+    }
+}
+
+#[test]
+fn the_version_on_the_wire_is_the_one_the_server_agreed_to() {
+    let s = start(Mode::OlderProtocol);
+    let home = temp_home("older-protocol");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", r#"{"message":"hi"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+
+    let reqs = s.requests.lock().unwrap();
+    let after_the_handshake = &reqs[1..];
+    assert!(!after_the_handshake.is_empty());
+    for r in after_the_handshake {
+        assert_eq!(
+            r.header("mcp-protocol-version"),
+            Some("2024-11-05"),
+            "{}",
+            r.body
+        );
+    }
+}

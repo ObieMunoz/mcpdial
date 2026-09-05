@@ -22,6 +22,10 @@ pub struct HttpTransport {
     /// Set by stateful servers on `initialize`; echoed on every later request.
     /// Stateless servers never send one and we simply never echo one.
     pub session_id: Option<String>,
+    /// Set once `initialize` has answered. Its presence is also the handshake flag:
+    /// the spec puts `MCP-Protocol-Version` on every request after initialization
+    /// and none on `initialize` itself, which has nothing negotiated yet.
+    negotiated_version: Option<String>,
 }
 
 impl HttpTransport {
@@ -89,6 +93,7 @@ impl HttpTransportBuilder {
             agent: ureq::Agent::new_with_config(config),
             log: self.log.unwrap_or_else(silent),
             session_id: None,
+            negotiated_version: None,
         }
     }
 }
@@ -102,6 +107,16 @@ pub fn redirect_error(url: &str, status: u16, location: Option<&str>) -> Error {
         )),
         None => Error::transport(format!("{url} redirected ({status}) with no Location header")),
     }
+}
+
+/// The version the server named in its `initialize` result, falling back to ours
+/// when it named none. A server may agree to a version other than the one we asked
+/// for, and the header has to carry what it actually replied with.
+fn agreed_version(initialize_reply: Option<&Value>) -> String {
+    initialize_reply
+        .and_then(|msg| msg["result"]["protocolVersion"].as_str())
+        .unwrap_or(PROTOCOL_VERSION)
+        .to_string()
 }
 
 impl Transport for HttpTransport {
@@ -120,9 +135,10 @@ impl Transport for HttpTransport {
             req = req.header("Authorization", &format!("Bearer {t}"));
         }
         if let Some(sid) = &self.session_id {
-            req = req
-                .header("Mcp-Session-Id", sid)
-                .header("MCP-Protocol-Version", PROTOCOL_VERSION);
+            req = req.header("Mcp-Session-Id", sid);
+        }
+        if let Some(version) = &self.negotiated_version {
+            req = req.header("MCP-Protocol-Version", version);
         }
         for (k, v) in &self.extra_headers {
             req = req.header(k, v);
@@ -169,6 +185,10 @@ impl Transport for HttpTransport {
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
-        decode_body(&text, &content_type)
+        let reply = decode_body(&text, &content_type)?;
+        if payload["method"] == "initialize" {
+            self.negotiated_version = Some(agreed_version(reply.as_ref()));
+        }
+        Ok(reply)
     }
 }
