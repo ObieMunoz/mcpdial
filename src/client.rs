@@ -108,6 +108,18 @@ pub enum AuthUsed {
     Saved,
 }
 
+fn refresh_and_save(
+    store: &Store,
+    name: &str,
+    cred: &Credential,
+    opts: &Options,
+) -> Result<Credential> {
+    let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
+    let fresh = oauth::refresh(&http, cred)?;
+    store.save_credential(name, fresh.clone())?;
+    Ok(fresh)
+}
+
 fn env_token(var: &str) -> Result<String> {
     std::env::var(var).ok().filter(|t| !t.is_empty()).ok_or_else(|| {
         Error::usage(format!(
@@ -125,13 +137,9 @@ fn select_token(store: &Store, r: &Resolved, opts: &Options) -> Result<(Option<S
         return Ok((None, AuthUsed::None));
     };
     if cred.is_expired() && cred.can_refresh() {
-        cred = oauth::refresh(
-            &oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())),
-            &cred,
-        )?;
-        store.save_credential(&r.name, cred.clone())?;
+        cred = refresh_and_save(store, &r.name, &cred, opts)?;
     }
-    Ok((cred.access_token.filter(|t| !t.is_empty()), AuthUsed::Saved))
+    Ok((cred.access_token, AuthUsed::Saved))
 }
 
 fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTransport {
@@ -149,6 +157,21 @@ fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTr
         b = b.log(log);
     }
     b.build()
+}
+
+fn handshake(
+    r: &Resolved,
+    transport: impl Transport + 'static,
+    auth: AuthUsed,
+) -> Result<Connection> {
+    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>);
+    let server_info = session.initialize()?.clone();
+    Ok(Connection {
+        name: r.name.clone(),
+        session,
+        server_info,
+        auth,
+    })
 }
 
 /// Open a session and complete the `initialize` handshake.
@@ -173,50 +196,20 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
             opts.verbose,
             opts.logger(),
         )?;
-        let mut session = Session::new(Box::new(t) as Box<dyn Transport>);
-        let info = session.initialize()?.clone();
-        return Ok(Connection {
-            name: r.name.clone(),
-            session,
-            server_info: info,
-            auth: AuthUsed::None,
-        });
+        return handshake(r, t, AuthUsed::None);
     }
 
     let (token, auth) = select_token(store, r, opts)?;
-    let mut session = Session::new(Box::new(http_transport(r, token, opts)) as Box<dyn Transport>);
-    match session.initialize() {
-        Ok(info) => {
-            let info = info.clone();
-            Ok(Connection {
-                name: r.name.clone(),
-                session,
-                server_info: info,
-                auth,
-            })
-        }
+    match handshake(r, http_transport(r, token, opts), auth) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
                 return Err(e);
             }
-            let cred = oauth::refresh(
-                &oauth::Http::new(opts.timeout, Some(opts.user_agent.clone())),
-                &cred,
-            )?;
-            store.save_credential(&r.name, cred.clone())?;
-            let mut session = Session::new(
-                Box::new(http_transport(r, cred.access_token, opts)) as Box<dyn Transport>
-            );
-            let info = session.initialize()?.clone();
-            Ok(Connection {
-                name: r.name.clone(),
-                session,
-                server_info: info,
-                auth,
-            })
+            let cred = refresh_and_save(store, &r.name, &cred, opts)?;
+            handshake(r, http_transport(r, cred.access_token, opts), auth)
         }
-        Err(e) => Err(e),
+        outcome => outcome,
     }
 }
 
@@ -345,24 +338,24 @@ fn classify(e: &Error, had_credential: bool) -> Status {
 /// Probe the given servers concurrently, keeping the order they were given in.
 fn probe_each(
     store: &Store,
-    servers: &[(String, ServerConfig)],
+    servers: Vec<(String, ServerConfig)>,
     opts: &Options,
     with_tools: bool,
 ) -> Vec<Probe> {
+    let quiet = Options {
+        verbose: false,
+        ..opts.clone()
+    };
+    let opts = &quiet;
     let mut results: Vec<Option<Probe>> = vec![None; servers.len()];
     std::thread::scope(|scope| {
-        for (slot, (name, cfg)) in results.iter_mut().zip(servers.iter()) {
+        for (slot, (name, config)) in results.iter_mut().zip(servers) {
             let r = Resolved {
-                name: name.clone(),
-                config: cfg.clone(),
+                name,
+                config,
                 saved: true,
             };
-            let store = store.clone();
-            let opts = Options {
-                verbose: false,
-                ..opts.clone()
-            };
-            scope.spawn(move || *slot = Some(probe(&store, &r, &opts, with_tools)));
+            scope.spawn(move || *slot = Some(probe(store, &r, opts, with_tools)));
         }
     });
     results.into_iter().flatten().collect()
@@ -370,8 +363,12 @@ fn probe_each(
 
 /// Probe every configured server concurrently, in config order.
 pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<Probe>> {
-    let servers: Vec<(String, ServerConfig)> = store.servers()?.into_iter().collect();
-    Ok(probe_each(store, &servers, opts, with_tools))
+    Ok(probe_each(
+        store,
+        store.servers()?.into_iter().collect(),
+        opts,
+        with_tools,
+    ))
 }
 
 // -- listing ------------------------------------------------------------------------
@@ -408,14 +405,14 @@ pub struct Listing {
 }
 
 impl Listing {
-    fn probed(p: &Probe, checked_at: u64) -> Self {
+    fn probed(p: Probe, checked_at: u64) -> Self {
         Self {
-            name: p.name.clone(),
+            name: p.name,
             kind: p.kind,
-            location: p.location.clone(),
-            status: p.status.clone(),
+            location: p.location,
+            status: p.status,
             auth: p.auth,
-            server: p.server.clone(),
+            server: p.server,
             tools: p.tools.as_ref().map(Vec::len),
             checked_at,
             age_seconds: 0,
@@ -500,8 +497,8 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
         }
     }
 
-    let fresh: Vec<Listing> = probe_each(store, &cold, opts, true)
-        .iter()
+    let fresh: Vec<Listing> = probe_each(store, cold, opts, true)
+        .into_iter()
         .map(|p| Listing::probed(p, now))
         .collect();
     if !fresh.is_empty() {
@@ -702,7 +699,7 @@ mod tests {
     fn a_remembered_status_round_trips_and_an_unreadable_one_is_a_miss() {
         let cfg = ServerConfig::http("https://x/mcp");
         let taken = Listing::probed(
-            &Probe {
+            Probe {
                 name: "x".into(),
                 kind: cfg.kind(),
                 location: cfg.location().to_string(),

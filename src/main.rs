@@ -235,10 +235,7 @@ fn main() -> ExitCode {
             if json {
                 eprintln!("{}", f.to_json());
             } else {
-                eprintln!("error: {}", f.error);
-                if let Some(hint) = &f.hint {
-                    eprintln!("{hint}");
-                }
+                f.eprint();
             }
             ExitCode::from(match f.error {
                 Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
@@ -264,6 +261,13 @@ impl Failure {
         }
     }
 
+    fn eprint(&self) {
+        eprintln!("error: {}", self.error);
+        if let Some(hint) = &self.hint {
+            eprintln!("{hint}");
+        }
+    }
+
     fn to_json(&self) -> Value {
         let mut v = error_json(&self.error);
         if let Some(hint) = &self.hint {
@@ -278,6 +282,47 @@ impl From<Error> for Failure {
         Self { error, hint: None }
     }
 }
+
+fn print_json(v: &impl serde::Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(v).expect("a JSON value is serializable")
+    );
+}
+
+fn print_value(v: &Value, compact: bool) {
+    if compact {
+        println!("{v}");
+    } else {
+        print_json(v);
+    }
+}
+
+fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connection, Failure> {
+    let r = client::resolve(store, target)?;
+    Ok(client::connect(store, &r, opts)?)
+}
+
+fn info_hint(target: &str) -> String {
+    format!("`mcpdial info {}`", shell_word(target))
+}
+
+fn credential_key(store: &Store, target: String) -> String {
+    client::resolve(store, &target)
+        .map(|r| r.name)
+        .unwrap_or(target)
+}
+
+fn name_and_args(rest: &str) -> (&str, &str) {
+    let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+    match args.trim() {
+        "" => (name, "{}"),
+        args => (name, args),
+    }
+}
+
+const NO_SERVERS: &str =
+    "no servers saved yet. Try: mcpdial add wiki --http https://mcp.deepwiki.com/mcp";
 
 /// One JSON object per error, so a program can branch on `kind` without parsing prose.
 fn error_json(e: &Error) -> Value {
@@ -925,8 +970,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             cfg.cwd = cwd;
             cfg.headers = opts.extra_headers.iter().cloned().collect();
             cfg.token_env = opts.token_env.clone();
-            store.add_server(&name, cfg.clone())?;
-            eprintln!("saved {name} ({} {})", cfg.kind(), cfg.location());
+            let summary = format!("{} {}", cfg.kind(), cfg.location());
+            store.add_server(&name, cfg)?;
+            eprintln!("saved {name} ({summary})");
             Ok(0)
         }
 
@@ -964,14 +1010,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         );
                         continue;
                     }
-                    match store.add_server(&f.name, f.config.clone()) {
+                    let summary = format!("{} {}", f.config.kind(), f.config.location());
+                    match store.add_server(&f.name, f.config) {
                         Ok(()) => {
                             added += 1;
                             eprintln!(
-                                "  add  {:<16} {} {}  [{} in {}]",
+                                "  add  {:<16} {summary}  [{} in {}]",
                                 f.name,
-                                f.config.kind(),
-                                f.config.location(),
                                 f.scope,
                                 path.display()
                             );
@@ -1008,8 +1053,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             } else {
                 si["name"]
                     .as_str()
-                    .map(String::from)
-                    .unwrap_or_else(|| truncate_at(&r.name, 24))
+                    .map_or_else(|| truncate_at(&r.name, 24), String::from)
             };
             let mut input = Input::open(&store, &r, &label, interactive)?;
             let mut failures = 0u32;
@@ -1067,24 +1111,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         let tools = shell_tools(&mut cache, &mut conn);
                         match find_tool(tools, rest) {
                             Some(t) => {
-                                println!(
-                                    "{}",
-                                    if cli.json {
-                                        t.to_string()
-                                    } else {
-                                        serde_json::to_string_pretty(t).unwrap()
-                                    }
-                                );
+                                print_value(t, cli.json);
                                 Ok(())
                             }
                             None => Err(no_such_tool(tools, rest)),
                         }
                     }
                     "info" => {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&conn.server_info).unwrap()
-                        );
+                        print_json(&conn.server_info);
                         Ok(())
                     }
                     "tools" => conn
@@ -1156,12 +1190,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         }
                     },
                     "prompt" => {
-                        let (name, args) =
-                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
-                        let args = match args.trim() {
-                            "" => "{}",
-                            a => a,
-                        };
+                        let (name, args) = name_and_args(rest);
                         if name.is_empty() {
                             Err(Failure::hinted(
                                 Error::usage("prompt needs a name"),
@@ -1184,12 +1213,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         }
                     }
                     "call" => {
-                        let (tool, args) =
-                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
-                        let args = match args.trim() {
-                            "" => "{}",
-                            a => a,
-                        };
+                        let (tool, args) = name_and_args(rest);
                         if tool.is_empty() {
                             Err(Failure::hinted(
                                 Error::usage("call needs a tool name"),
@@ -1238,27 +1262,17 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         }
                     }
                     "raw" => {
-                        let (method, params) =
-                            rest.split_once(char::is_whitespace).unwrap_or((rest, "{}"));
+                        let (method, params) = name_and_args(rest);
                         if method.is_empty() {
                             Err(Failure::hinted(
                                 Error::usage("raw needs a method"),
                                 "usage: raw METHOD {\"json\": \"params\"}   e.g. raw tools/list",
                             ))
                         } else {
-                            parse_object(params.trim(), "params")
+                            parse_object(params, "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
                                 .map_err(Failure::from)
-                                .map(|result| {
-                                    println!(
-                                        "{}",
-                                        if cli.json {
-                                            result.to_string()
-                                        } else {
-                                            serde_json::to_string_pretty(&result).unwrap()
-                                        }
-                                    )
-                                })
+                                .map(|result| print_value(&result, cli.json))
                         }
                     }
                     // Only reachable when line editing is off, since a terminal
@@ -1305,10 +1319,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     if cli.json {
                         println!("{}", f.to_json());
                     } else {
-                        eprintln!("error: {}", f.error);
-                        if let Some(hint) = &f.hint {
-                            eprintln!("{hint}");
-                        }
+                        f.eprint();
                     }
                 }
             }
@@ -1321,8 +1332,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Schema { target, tool } => {
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
+            let mut conn = dial(&store, &opts, &target)?;
             let tools = conn.session.list_tools()?;
             let Some(t) = find_tool(&tools, &tool) else {
                 let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -1336,7 +1346,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         .map(|near| format!("did you mean {near}?")),
                 });
             };
-            println!("{}", serde_json::to_string_pretty(t).unwrap());
+            print_json(t);
             if t.get("outputSchema").is_some() {
                 eprintln!("this tool declares an outputSchema: results carry structuredContent");
             }
@@ -1344,19 +1354,16 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Resources { target, long } => {
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
-            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let mut conn = dial(&store, &opts, &target)?;
             let resources = conn
                 .session
                 .list_resources()
-                .map_err(|e| missing_capability(e, "resources", &info_cmd))?;
+                .map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
             // Templates are optional even where resources are not, so a server with
             // none of them must not turn the whole listing into an error.
             let templates = conn.session.list_resource_templates().unwrap_or_default();
             if cli.json {
-                let both = json!({ "resources": resources, "resourceTemplates": templates });
-                println!("{}", serde_json::to_string_pretty(&both).unwrap());
+                print_json(&json!({ "resources": resources, "resourceTemplates": templates }));
             } else {
                 println!("{} resource(s):\n", resources.len());
                 print_resources(&resources, long);
@@ -1369,15 +1376,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Read { target, uri } => {
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
-            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let mut conn = dial(&store, &opts, &target)?;
             let result = conn
                 .session
                 .read_resource(&uri)
-                .map_err(|e| missing_capability(e, "resources", &info_cmd))?;
+                .map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                print_json(&result);
                 return Ok(0);
             }
             let redirect = format!("mcpdial read {} {}", shell_word(&target), shell_word(&uri));
@@ -1386,18 +1391,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Prompts { target, long } => {
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
-            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let mut conn = dial(&store, &opts, &target)?;
             let prompts = conn
                 .session
                 .list_prompts()
-                .map_err(|e| missing_capability(e, "prompts", &info_cmd))?;
+                .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({ "prompts": prompts })).unwrap()
-                );
+                print_json(&json!({ "prompts": prompts }));
             } else {
                 println!("{} prompt(s):\n", prompts.len());
                 print_prompts(&prompts, long);
@@ -1423,15 +1423,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     ),
                 )
             })?;
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
-            let info_cmd = format!("`mcpdial info {}`", shell_word(&target));
+            let mut conn = dial(&store, &opts, &target)?;
             let result = conn
                 .session
                 .get_prompt(&name, arguments)
-                .map_err(|e| missing_capability(e, "prompts", &info_cmd))?;
+                .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                print_json(&result);
             } else {
                 if let Some(d) = result["description"].as_str() {
                     eprintln!("{d}");
@@ -1476,18 +1474,18 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             json!({
                                 "name": n, "kind": c.kind(), "location": c.location(),
                                 "headers": c.headers, "token_env": c.token_env,
-                                "credential": creds.get(n).map(|c| c.has_token()).unwrap_or(false),
+                                "credential": creds.get(n).is_some_and(Credential::has_token),
                             })
                         })
                         .collect();
-                    println!("{}", serde_json::to_string_pretty(&rows).unwrap());
+                    print_json(&rows);
                 } else {
                     let rows: Vec<Vec<String>> = servers
                         .iter()
                         .map(|(n, c)| {
-                            let auth = if c.token_env.is_some() {
-                                format!("${}", c.token_env.as_deref().unwrap())
-                            } else if creds.get(n).is_some_and(|c| c.has_token()) {
+                            let auth = if let Some(var) = &c.token_env {
+                                format!("${var}")
+                            } else if creds.get(n).is_some_and(Credential::has_token) {
                                 "saved".into()
                             } else {
                                 "-".into()
@@ -1506,9 +1504,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             };
             let listing = client::listing(&store, &opts, freshness)?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&listing).unwrap());
+                print_json(&listing);
             } else if listing.is_empty() {
-                eprintln!("no servers saved yet. Try: mcpdial add wiki --http https://mcp.deepwiki.com/mcp");
+                eprintln!("{NO_SERVERS}");
             } else {
                 let rows: Vec<Vec<String>> = listing
                     .iter()
@@ -1538,11 +1536,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         Cmd::Tools { target: None, long } => {
             let probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&probes).unwrap());
+                print_json(&probes);
                 return Ok(0);
             }
             if probes.is_empty() {
-                eprintln!("no servers saved yet. Try: mcpdial add wiki --http https://mcp.deepwiki.com/mcp");
+                eprintln!("{NO_SERVERS}");
                 return Ok(0);
             }
             for (i, p) in probes.iter().enumerate() {
@@ -1577,14 +1575,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             target: Some(target),
             long,
         } => {
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
+            let mut conn = dial(&store, &opts, &target)?;
             let tools = conn.session.list_tools()?;
             if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({ "tools": tools })).unwrap()
-                );
+                print_json(&json!({ "tools": tools }));
             } else {
                 println!("{} tool(s):\n", tools.len());
                 print_tools(&tools, long);
@@ -1593,11 +1587,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Info { target } => {
-            let r = client::resolve(&store, &target)?;
-            let conn = client::connect(&store, &r, &opts)?;
+            let conn = dial(&store, &opts, &target)?;
             let init = &conn.server_info;
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(init).unwrap());
+                print_json(init);
             } else {
                 let si = &init["serverInfo"];
                 println!(
@@ -1646,44 +1639,36 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     ),
                 )
             })?;
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
+            let mut conn = dial(&store, &opts, &target)?;
+            let usage = |conn: &mut client::Connection| {
+                let tools = conn.session.list_tools().unwrap_or_default();
+                call_hint(
+                    &tools,
+                    &tool,
+                    &format!("mcpdial call {}", shell_word(&target)),
+                    "'",
+                    &format!("`mcpdial tools {}`", shell_word(&target)),
+                )
+            };
             let result = match conn.session.call_tool(&tool, arguments) {
                 Ok(result) => result,
                 // The server rejected the arguments; say what it wanted instead.
                 Err(e) => {
-                    let hint = is_argument_error(&e)
-                        .then(|| conn.session.list_tools().unwrap_or_default())
-                        .and_then(|tools| {
-                            call_hint(
-                                &tools,
-                                &tool,
-                                &format!("mcpdial call {}", shell_word(&target)),
-                                "'",
-                                &format!("`mcpdial tools {}`", shell_word(&target)),
-                            )
-                        });
+                    let hint = is_argument_error(&e).then(|| usage(&mut conn)).flatten();
                     return Err(Failure { error: e, hint });
                 }
             };
             let is_error = result["isError"].as_bool().unwrap_or(false);
             let text = mcpdial::render_content(&result);
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                print_json(&result);
             } else if !text.is_empty() {
                 print_text(&text);
             }
             // A failed result that is really a schema complaint gets the same
             // answer as the JSON-RPC error other servers would have sent.
             if is_error && reads_as_argument_error(&text) {
-                let tools = conn.session.list_tools().unwrap_or_default();
-                if let Some(hint) = call_hint(
-                    &tools,
-                    &tool,
-                    &format!("mcpdial call {}", shell_word(&target)),
-                    "'",
-                    &format!("`mcpdial tools {}`", shell_word(&target)),
-                ) {
+                if let Some(hint) = usage(&mut conn) {
                     eprintln!("{hint}");
                 }
             }
@@ -1696,10 +1681,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             params,
         } => {
             let params = read_json_arg(&params, "params")?;
-            let r = client::resolve(&store, &target)?;
-            let mut conn = client::connect(&store, &r, &opts)?;
+            let mut conn = dial(&store, &opts, &target)?;
             let result = conn.session.request(&method, Some(params))?;
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            print_json(&result);
             Ok(0)
         }
 
@@ -1752,9 +1736,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Logout { target } | Cmd::Token(TokenCmd::Rm { name: target }) => {
-            let name = client::resolve(&store, &target)
-                .map(|r| r.name)
-                .unwrap_or(target);
+            let name = credential_key(&store, target);
             if store.remove_credential(&name)? {
                 eprintln!("removed credential for {name}");
             } else {
@@ -1764,9 +1746,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Token(TokenCmd::Set { name, env }) => {
-            let key = client::resolve(&store, &name)
-                .map(|r| r.name)
-                .unwrap_or(name);
+            let key = credential_key(&store, name);
             let token = read_secret(env.as_deref(), "token")?;
             let mut cred = store.credential(&key)?.unwrap_or_default();
             cred.access_token = Some(token);
@@ -1778,31 +1758,25 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Token(TokenCmd::Show { name }) => {
-            let key = client::resolve(&store, &name)
-                .map(|r| r.name)
-                .unwrap_or(name);
+            let key = credential_key(&store, name);
             let Some(cred) = store.credential(&key)? else {
                 eprintln!("no credential saved for {key}");
                 return Ok(EXIT_ERROR);
             };
             if cli.json {
                 // Metadata only. The secrets never leave the file through this path.
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "name": key,
-                        "has_access_token": cred.has_token(),
-                        "has_refresh_token": cred.refresh_token.is_some(),
-                        "expires_at": cred.expires_at,
-                        "expired": cred.is_expired(),
-                        "scope": cred.scope,
-                        "source": cred.source,
-                        "client_id": cred.client_id,
-                        "has_client_secret": cred.client_secret.is_some(),
-                        "token_endpoint": cred.token_endpoint,
-                    }))
-                    .unwrap()
-                );
+                print_json(&json!({
+                    "name": key,
+                    "has_access_token": cred.has_token(),
+                    "has_refresh_token": cred.refresh_token.is_some(),
+                    "expires_at": cred.expires_at,
+                    "expired": cred.is_expired(),
+                    "scope": cred.scope,
+                    "source": cred.source,
+                    "client_id": cred.client_id,
+                    "has_client_secret": cred.client_secret.is_some(),
+                    "token_endpoint": cred.token_endpoint,
+                }));
             } else {
                 println!("{key}");
                 println!(
@@ -1904,12 +1878,7 @@ fn expiry_label(cred: &Credential) -> String {
 }
 
 fn truncate(s: &str) -> String {
-    let first = s.lines().next().unwrap_or("");
-    if first.chars().count() > 60 {
-        format!("{}...", first.chars().take(57).collect::<String>())
-    } else {
-        first.to_string()
-    }
+    truncate_at(s.lines().next().unwrap_or(""), 60)
 }
 
 fn print_tools(tools: &[Value], long: bool) {

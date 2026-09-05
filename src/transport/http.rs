@@ -95,10 +95,7 @@ impl HttpTransport {
         let Ok(mut resp) = req.call() else {
             return false;
         };
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
+        let content_type = header(&resp, "content-type")
             .unwrap_or_default()
             .to_ascii_lowercase();
         (self.log)(&format!(
@@ -110,6 +107,13 @@ impl HttpTransport {
             && content_type.contains("text/event-stream")
             && names_a_post_endpoint(&mut resp.body_mut().as_reader())
     }
+}
+
+pub(crate) fn header<B>(resp: &ureq::http::Response<B>, name: &str) -> Option<String> {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 pub struct HttpTransportBuilder {
@@ -265,16 +269,10 @@ impl Transport for HttpTransport {
         })?;
 
         let status = resp.status().as_u16();
-        let header = |name: &str| {
-            resp.headers()
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
-        let content_type = header("content-type").unwrap_or_default();
-        let www_authenticate = header("www-authenticate");
-        let session_id = header("mcp-session-id");
-        let location = header("location");
+        let content_type = header(&resp, "content-type").unwrap_or_default();
+        let www_authenticate = header(&resp, "www-authenticate");
+        let session_id = header(&resp, "mcp-session-id");
+        let location = header(&resp, "location");
 
         let text = resp
             .body_mut()
