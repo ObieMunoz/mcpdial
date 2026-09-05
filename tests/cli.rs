@@ -386,7 +386,7 @@ fn saved_servers_and_status_listing() {
         "{}",
         o.stdout
     );
-    assert!(o.stdout.contains("## local  echo-server 0.0.1  (4 tools)"));
+    assert!(o.stdout.contains("## local  echo-server 0.0.1  (5 tools)"));
     assert!(o.stdout.contains("## locked  auth required"));
     assert!(o.stdout.contains("## dead  unreachable:"));
 
@@ -795,7 +795,7 @@ fn shell_keeps_one_session_alive() {
         "same process throughout: {stdout}"
     );
     assert!(!stdout.contains("count=4"), "quit stops reading: {stdout}");
-    assert!(stdout.contains("4 tool(s):"), "{stdout}");
+    assert!(stdout.contains("5 tool(s):"), "{stdout}");
     assert!(
         stdout.contains("\"name\": \"count\""),
         "raw output: {stdout}"
@@ -911,7 +911,7 @@ fn shell_explains_the_shape_it_expected() {
         lines[1]["error"]["hint"]
             .as_str()
             .unwrap()
-            .contains("lists all 4"),
+            .contains("lists all 5"),
         "{stdout}"
     );
 }
@@ -1707,13 +1707,13 @@ fn a_warm_listing_spawns_no_stdio_server() {
     let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(listed(&o.stdout, "local")["status"]["state"], "connected");
-    assert_eq!(listed(&o.stdout, "local")["tools"], 4);
+    assert_eq!(listed(&o.stdout, "local")["tools"], 5);
     assert_eq!(spawned(), 1);
 
     let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(listed(&o.stdout, "local")["status"]["state"], "connected");
-    assert_eq!(listed(&o.stdout, "local")["tools"], 4);
+    assert_eq!(listed(&o.stdout, "local")["tools"], 5);
     assert_eq!(spawned(), 1, "listing again ran the command again");
 
     assert_eq!(run(mcpdial(&home).args(["ls", "--no-probe"])).code, 0);

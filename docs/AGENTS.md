@@ -50,6 +50,19 @@ echo '{"path":"/tmp/x"}' | mcpdial call fs read_text_file -   # from stdin
 
 Use a file or stdin for anything large or containing quotes.
 
+## Media
+
+A tool that returns an image or audio block (a screenshot, say) hands back base64 that is
+no use in a context window. Without `--json` such a block prints as one line,
+`[image image/png, 4 KB]`, and the text blocks around it print as they are. Pass
+`--save-dir DIR` to any `call`, `prompt` or `read` that can return media, or before
+`shell` so every command in it honours it: each block is written to
+`DIR/<tool>-<n>.<ext>`, the extension taken from its mime type, and the line names the
+file: `[image saved to shots/take_screenshot-1.png, 4 KB]`. With `--json` alone the
+result is the server's object, base64 included; with `--json --save-dir DIR` each media
+block's `data` (or an embedded resource's `blob`) is replaced by `"path"` and a `"bytes"`
+count, so the object is small and the file is where it says.
+
 ## Resources and prompts
 
 Tools are one third of MCP. `mcpdial info TARGET --json` reports which of the three a

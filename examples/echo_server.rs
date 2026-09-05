@@ -1,5 +1,5 @@
 //! The smallest MCP server that is still a real one: newline-delimited JSON-RPC on
-//! stdio, three methods, three tools. Used by the integration tests and handy as a
+//! stdio, five methods, five tools. Used by the integration tests and handy as a
 //! reference for what a stdio server has to do.
 //!
 //!     cargo run --example echo_server
@@ -13,14 +13,27 @@
 //! server checking a slow connection does to a client that only listens for its
 //! own id.
 //! The `count` tool returns how many times it has been called in this process,
-//! which is how the tests tell one long session from several short ones.
+//! which is how the tests tell one long session from several short ones. The
+//! `shot` tool answers with a 4 KB image block, the way a screenshot tool does.
+//! Set `ECHO_SERVER_PROMPTS=1` to add a `poster` prompt that does the same; without
+//! it the server implements no prompts, which other tests count on.
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Lines, StdinLock, Write};
+
+/// A PNG signature padded to 4096 bytes: enough to be a nuisance on stdout.
+fn image_block() -> Value {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.resize(4096, 0);
+    json!({"type": "image", "data": STANDARD.encode(png), "mimeType": "image/png"})
+}
 
 fn main() {
     let hang = std::env::var_os("ECHO_SERVER_HANG").is_some();
     let ping = std::env::var_os("ECHO_SERVER_PING").is_some();
+    let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let mut count = 0u32;
     let stdout = io::stdout();
@@ -84,6 +97,9 @@ fn main() {
                 if let Some(t) = &tag {
                     result["instructions"] = json!(format!("tag={t}"));
                 }
+                if prompts {
+                    result["capabilities"]["prompts"] = json!({});
+                }
                 ok(id, result)
             }
             "tools/list" => ok(
@@ -97,8 +113,26 @@ fn main() {
                      "inputSchema": {"type": "object", "properties": {}}},
                     {"name": "strict", "description": "Rejects bad arguments in a failed result.",
                      "inputSchema": {"type": "object", "properties": {"pageId": {"type": "number"}}, "required": ["pageId"]}},
+                    {"name": "shot", "description": "A text block, then a 4 KB image block.",
+                     "inputSchema": {"type": "object", "properties": {}}},
                 ]}),
             ),
+            "prompts/list" if prompts => ok(
+                id,
+                json!({"prompts": [
+                    {"name": "poster", "description": "A caption and a 4 KB image."},
+                ]}),
+            ),
+            "prompts/get" if prompts => match params["name"].as_str().unwrap_or("") {
+                "poster" => ok(
+                    id,
+                    json!({"description": "A caption and a 4 KB image.", "messages": [
+                        {"role": "user", "content": {"type": "text", "text": "Caption this."}},
+                        {"role": "user", "content": image_block()},
+                    ]}),
+                ),
+                other => err(id, -32602, &format!("Prompt {other} not found")),
+            },
             "tools/call" => match params["name"].as_str().unwrap_or("") {
                 // Real servers validate against the schema before running anything.
                 "echo" if params["arguments"]["message"].as_str().is_none() => err(
@@ -125,6 +159,10 @@ fn main() {
                 "fail" => ok(
                     id,
                     json!({"content": [{"type": "text", "text": "it failed"}], "isError": true}),
+                ),
+                "shot" => ok(
+                    id,
+                    json!({"content": [{"type": "text", "text": "done"}, image_block()]}),
                 ),
                 "count" => {
                     count += 1;

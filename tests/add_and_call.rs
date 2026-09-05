@@ -117,7 +117,7 @@ fn add_dials_the_server_and_prints_the_row_ls_would() {
     assert_eq!(v["saved"]["location"], echo);
     assert_eq!(v["saved"]["status"]["state"], "connected");
     assert_eq!(v["saved"]["server"], "echo-server 0.0.1");
-    assert_eq!(v["saved"]["tools"], 4);
+    assert_eq!(v["saved"]["tools"], 5);
 
     // --no-probe saves without dialing: the receipt is the config alone.
     let o = run(mcpdial(&home).args(["--json", "add", "echo3", "--stdio", &echo, "--no-probe"]));
