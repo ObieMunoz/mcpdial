@@ -388,20 +388,7 @@ mod sys {
     /// also why the disposition is `CREATE_NEW`: `CREATE_ALWAYS` would silently
     /// ignore the descriptor and keep whatever a file already sitting there had.
     pub fn create_owner_only(path: &Path) -> io::Result<File> {
-        let sddl = wide(format!("D:P(A;;FA;;;{})", current_user_sid()?));
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        let built = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                ptr::null_mut(),
-            )
-        };
-        if built == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let descriptor = LocalBuffer(descriptor);
+        let descriptor = descriptor(&format!("D:P(A;;FA;;;{})", current_user_sid()?))?;
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -457,18 +444,33 @@ mod sys {
         Ok(unsafe { from_wide(text.0.cast()) })
     }
 
-    /// The file's discretionary access list in SDDL form: the flags, then one
-    /// parenthesised entry per trustee.
+    /// Build a security descriptor on the local heap from its SDDL form.
+    fn descriptor(sddl: &str) -> io::Result<LocalBuffer> {
+        let sddl = wide(sddl);
+        let mut built: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut built,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LocalBuffer(built))
+    }
+
+    /// The discretionary access list on `path`, in SDDL form: the list's own
+    /// flags, then one parenthesised entry per trustee.
     #[cfg(test)]
     pub fn dacl(path: &Path) -> io::Result<String> {
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
-            SE_FILE_OBJECT,
-        };
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
         use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
         let name = wide(path);
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let mut found: PSECURITY_DESCRIPTOR = ptr::null_mut();
         let status = unsafe {
             GetNamedSecurityInfoW(
                 name.as_ptr(),
@@ -478,13 +480,29 @@ mod sys {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
-                &mut descriptor,
+                &mut found,
             )
         };
         if status != 0 {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
-        let descriptor = LocalBuffer(descriptor);
+        dacl_of(&LocalBuffer(found))
+    }
+
+    /// `sddl` as Windows hands an access list back. SDDL abbreviates well-known
+    /// accounts, so a list naming the built-in administrator returns `LA` where
+    /// it went in as a SID; an expected list has to make the same trip before it
+    /// can be compared with one read off a file.
+    #[cfg(test)]
+    pub fn rendered(sddl: &str) -> io::Result<String> {
+        dacl_of(&descriptor(sddl)?)
+    }
+
+    #[cfg(test)]
+    fn dacl_of(descriptor: &LocalBuffer) -> io::Result<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+
         let mut text = ptr::null_mut();
         let converted = unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
@@ -704,15 +722,18 @@ mod tests {
 
         #[cfg(windows)]
         {
+            let owner_only =
+                sys::rendered(&format!("D:(A;;FA;;;{})", sys::current_user_sid().unwrap()))
+                    .unwrap();
             let dacl = sys::dacl(&s.credentials_path()).unwrap();
             let (flags, entries) = dacl.split_once('(').expect("a discretionary list");
+            let (_, expected) = owner_only.split_once('(').expect("a discretionary list");
             assert!(
                 flags.contains('P'),
                 "inherited entries must not apply: {dacl}"
             );
             assert_eq!(
-                entries,
-                format!("A;;FA;;;{})", sys::current_user_sid().unwrap()),
+                entries, expected,
                 "credentials must name their owner and nobody else"
             );
         }
