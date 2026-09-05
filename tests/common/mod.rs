@@ -30,10 +30,13 @@ pub enum Mode {
     Blocked,
     /// Hands back the same `nextCursor` on every `tools/list`.
     StuckCursor,
+    /// Stateful, but answers `405` to the session-terminating `DELETE`.
+    StatefulNoDelete,
 }
 
 #[derive(Clone, Debug)]
 pub struct Recorded {
+    pub method: String,
     pub path: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
@@ -105,6 +108,7 @@ pub fn start(mode: Mode) -> FakeServer {
                 let mut body = String::new();
                 let _ = req.as_reader().read_to_string(&mut body);
                 let rec = Recorded {
+                    method: req.method().as_str().to_string(),
                     path: req.url().to_string(),
                     headers: req
                         .headers()
@@ -304,6 +308,22 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
+    let stateful = matches!(mode, Mode::Stateful | Mode::StatefulNoDelete);
+
+    if rec.method == "DELETE" {
+        if matches!(mode, Mode::StatefulNoDelete) {
+            return Response::from_string("").with_status_code(405);
+        }
+        if stateful && rec.header("mcp-session-id") != Some("sess-1") {
+            return json_resp(
+                400,
+                &json!({"jsonrpc":"2.0","error":{"code":-32000,"message":"Bad Request: No valid session ID provided"},"id":null}),
+            );
+        }
+        state.lock().unwrap().initialized = false;
+        return Response::from_string("").with_status_code(204);
+    }
+
     let msg = rec.json();
     let Some(id) = msg.get("id").cloned() else {
         // A notification. Remember that the client finished the handshake.
@@ -313,7 +333,6 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("").with_status_code(202);
     };
     let method = msg["method"].as_str().unwrap_or("");
-    let stateful = matches!(mode, Mode::Stateful);
 
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
