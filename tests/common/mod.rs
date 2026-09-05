@@ -420,30 +420,73 @@ pub fn catalog_entries(base: &str) -> Value {
     ])
 }
 
-/// The two registry routes mcpdial uses: the list with `search`, `limit` and
-/// `version=latest`, and one server's latest version by percent-encoded name.
+/// When the fake registry's listings were published, and when the one that
+/// changes afterwards did.
+pub const REGISTRY_UPDATED: &str = "2026-09-01T00:00:00Z";
+pub const REGISTRY_UPDATED_LATER: &str = "2026-09-02T00:00:00Z";
+
+/// How many listings a page of the whole list holds, whatever `limit` asks,
+/// so a client that stops after one page is caught.
+const REGISTRY_PAGE: usize = 3;
+
+fn registry_meta(updated_at: &str) -> Value {
+    json!({"io.modelcontextprotocol.registry/official": {
+        "status": "active", "isLatest": true,
+        "publishedAt": updated_at, "updatedAt": updated_at}})
+}
+
+/// The registry routes mcpdial uses: the list with `search`, the whole list
+/// page by page with `cursor`, the changes since a watermark with
+/// `updated_since`, and one server's latest version by percent-encoded name.
 fn registry(base: &str, path: &str, query: &str) -> Resp {
-    let meta = json!({"io.modelcontextprotocol.registry/official": {"status": "active", "isLatest": true}});
+    let meta = registry_meta(REGISTRY_UPDATED);
     let entries = registry_entries(base);
     if path == "/v0.1/servers" {
         let params = form(query);
         let param = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
-        let needle = param("search").unwrap_or("").to_lowercase();
-        let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(30);
-        let servers: Vec<Value> = entries
-            .into_iter()
-            .filter(|e| {
-                let text = format!("{} {}", e["name"], e["description"]).to_lowercase();
-                text.contains(&needle)
-            })
-            .take(limit)
+        if param("updated_since").is_some() {
+            // One listing changed since any watermark a client could hold.
+            let mut files = entries
+                .into_iter()
+                .find(|e| e["name"] == "io.github.acme/files")
+                .unwrap();
+            files["version"] = json!("1.3.0");
+            files["description"] = json!("Serve one directory over MCP, now with search.");
+            let servers =
+                vec![json!({"server": files, "_meta": registry_meta(REGISTRY_UPDATED_LATER)})];
+            return json_resp(200, &json!({"servers": servers, "metadata": {"count": 1}}));
+        }
+        if let Some(needle) = param("search") {
+            let needle = needle.to_lowercase();
+            let limit: usize = param("limit").and_then(|l| l.parse().ok()).unwrap_or(30);
+            let servers: Vec<Value> = entries
+                .into_iter()
+                .filter(|e| {
+                    let text = format!("{} {}", e["name"], e["description"]).to_lowercase();
+                    text.contains(&needle)
+                })
+                .take(limit)
+                .map(|e| json!({"server": e, "_meta": meta}))
+                .collect();
+            let count = servers.len();
+            return json_resp(
+                200,
+                &json!({"servers": servers, "metadata": {"count": count}}),
+            );
+        }
+        let start = param("cursor")
+            .and_then(|c| entries.iter().position(|e| e["name"] == c))
+            .unwrap_or(0);
+        let page: Vec<Value> = entries[start..]
+            .iter()
+            .take(REGISTRY_PAGE)
             .map(|e| json!({"server": e, "_meta": meta}))
             .collect();
-        let count = servers.len();
-        return json_resp(
-            200,
-            &json!({"servers": servers, "metadata": {"count": count}}),
-        );
+        let mut metadata = json!({"count": page.len()});
+        if let Some(next) = entries.get(start + REGISTRY_PAGE) {
+            metadata["nextCursor"] = next["name"].clone();
+        }
+        return json_resp(200, &json!({"servers": page, "metadata": metadata}));
     }
     let name = path
         .strip_prefix("/v0.1/servers/")

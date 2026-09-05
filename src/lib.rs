@@ -27,6 +27,7 @@ pub mod import_config;
 pub mod oauth;
 pub mod protocol;
 pub mod registry;
+pub mod search;
 pub mod session;
 pub mod transport;
 

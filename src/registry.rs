@@ -1,5 +1,6 @@
-//! The MCP registry (registry.modelcontextprotocol.io): search it, and turn one of
-//! its entries into a [`ServerConfig`] without running anything.
+//! The MCP registry (registry.modelcontextprotocol.io): look entries up, keep a
+//! local copy of the whole list for [`crate::search`], and turn one entry into a
+//! [`ServerConfig`] without running anything.
 //!
 //! An entry lists `remotes` (a URL per transport) and `packages` (something to run
 //! locally: an npm, PyPI or OCI identifier with the arguments and environment
@@ -8,12 +9,14 @@
 //! piece becomes one argv word, joined with the quoting `import` uses, so nothing in
 //! it can grow into a second command.
 
-use crate::config::{ServerConfig, Source};
+use crate::config::{ServerConfig, Source, Store};
 use crate::import_config::shell_join;
 use crate::protocol::{Error, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub const DEFAULT_URL: &str = "https://registry.modelcontextprotocol.io";
@@ -95,6 +98,52 @@ impl Registry {
         }
     }
 
+    /// Every listing the registry has, or only those changed since `since`
+    /// (RFC 3339, as the registry itself reports `updatedAt`). One page of a
+    /// hundred at a time; `progress` hears the running count after each.
+    pub fn list_all(
+        &self,
+        since: Option<&str>,
+        progress: &mut dyn FnMut(usize),
+    ) -> Result<Vec<Value>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut url = format!("{}/v0.1/servers?limit=100&version=latest", self.base);
+            if let Some(since) = since {
+                write!(url, "&updated_since={}", encode(since)).unwrap();
+            }
+            if let Some(c) = &cursor {
+                write!(url, "&cursor={}", encode(c)).unwrap();
+            }
+            let (status, body) = self.get(&url)?;
+            if status != 200 {
+                return Err(self.answered(status, &body));
+            }
+            let mut doc: Value = serde_json::from_str(&body)
+                .map_err(|e| Error::transport(format!("the registry sent malformed JSON: {e}")))?;
+            let page = match doc.get_mut("servers").map(Value::take) {
+                Some(Value::Array(page)) => page,
+                _ => {
+                    return Err(Error::transport(
+                        "the registry's reply has no `servers` list",
+                    ))
+                }
+            };
+            let next = doc["metadata"]["nextCursor"]
+                .as_str()
+                .filter(|c| !c.is_empty())
+                .map(String::from);
+            let done = page.is_empty() || next.is_none() || next == cursor;
+            all.extend(page);
+            progress(all.len());
+            if done {
+                return Ok(all);
+            }
+            cursor = next;
+        }
+    }
+
     fn get(&self, url: &str) -> Result<(u16, String)> {
         let mut resp = self
             .agent
@@ -150,6 +199,152 @@ fn encode(s: &str) -> String {
         }
     }
     out
+}
+
+/// The local copy of the registry that `search` runs over: every listing,
+/// untouched, under `MCPDIAL_HOME/registry/servers.json`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct Index {
+    /// The registry the copy came from. Pointing `MCPDIAL_REGISTRY` elsewhere
+    /// starts a fresh copy rather than mixing two registries.
+    pub registry: String,
+    /// Unix seconds when the copy was last brought up to date.
+    pub synced_at: u64,
+    /// The newest `updatedAt` the registry reported, handed back as
+    /// `updated_since` so the registry's clock, not this machine's, decides
+    /// what counts as changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_through: Option<String>,
+    /// The registry's list objects, one per server: `server` and `_meta`.
+    pub servers: Vec<Value>,
+}
+
+/// A copy older than this is refreshed before it is searched.
+pub const INDEX_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How much of the network a search may use.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Sync {
+    /// Fetch a missing copy, refresh a stale one, otherwise stay off the network.
+    Auto,
+    /// Fetch everything again.
+    Refresh,
+    /// Use the copy as it is, and fail without one.
+    Offline,
+}
+
+pub fn index_path(store: &Store) -> PathBuf {
+    store.dir.join("registry").join("servers.json")
+}
+
+/// The copy to search, brought up to date as `sync` allows. `progress` hears
+/// the running count during a full fetch, the one that takes a while. The
+/// note, when there is one, says why a stale copy is being used anyway.
+pub fn index(
+    store: &Store,
+    registry: &Registry,
+    sync: Sync,
+    progress: &mut dyn FnMut(usize),
+) -> Result<(Index, Option<String>)> {
+    let path = index_path(store);
+    let on_disk = read_index(&path)?.filter(|i| i.registry == registry.base);
+    let now = crate::config::now();
+    match (sync, on_disk) {
+        (Sync::Offline, Some(index)) => Ok((index, None)),
+        (Sync::Offline, None) => Err(Error::config(
+            "no local copy of the registry yet; run once without --offline to fetch it",
+        )),
+        (Sync::Auto, Some(index))
+            if now.saturating_sub(index.synced_at) < INDEX_MAX_AGE.as_secs() =>
+        {
+            Ok((index, None))
+        }
+        (Sync::Auto, Some(mut index)) => {
+            let since = index.updated_through.clone();
+            let changed = match since {
+                Some(since) => registry.list_all(Some(&since), &mut |_| {}),
+                None => registry.list_all(None, progress),
+            };
+            match changed {
+                Ok(changed) => {
+                    index.merge(changed, now);
+                    write_index(&path, &index)?;
+                    Ok((index, None))
+                }
+                Err(e) => {
+                    let hours = now.saturating_sub(index.synced_at) / 3600;
+                    Ok((
+                        index,
+                        Some(format!("{e}; searching the copy from {hours} hours ago")),
+                    ))
+                }
+            }
+        }
+        (Sync::Auto, None) | (Sync::Refresh, _) => {
+            let mut index = Index {
+                registry: registry.base.clone(),
+                ..Index::default()
+            };
+            index.merge(registry.list_all(None, progress)?, now);
+            write_index(&path, &index)?;
+            Ok((index, None))
+        }
+    }
+}
+
+impl Index {
+    /// Fold a page of listings in: a name already present is replaced, a
+    /// deleted one is dropped, and the watermark moves to the newest `updatedAt`.
+    fn merge(&mut self, changed: Vec<Value>, now: u64) {
+        let mut by_name: BTreeMap<String, Value> = self
+            .servers
+            .drain(..)
+            .filter_map(|e| Some((e["server"]["name"].as_str()?.to_string(), e)))
+            .collect();
+        for e in changed {
+            let Some(name) = e["server"]["name"].as_str().map(String::from) else {
+                continue;
+            };
+            let official = &e["_meta"]["io.modelcontextprotocol.registry/official"];
+            if let Some(at) = official["updatedAt"].as_str() {
+                if self.updated_through.as_deref().is_none_or(|w| at > w) {
+                    self.updated_through = Some(at.to_string());
+                }
+            }
+            if official["status"] == "deleted" {
+                by_name.remove(&name);
+            } else {
+                by_name.insert(name, e);
+            }
+        }
+        self.servers = by_name.into_values().collect();
+        self.synced_at = now;
+    }
+}
+
+fn read_index(path: &Path) -> Result<Option<Index>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::config(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::config(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Compact, since the copy runs to tens of megabytes, and through a sibling
+/// file and a rename so a crash never leaves half a copy behind.
+fn write_index(path: &Path, index: &Index) -> Result<()> {
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| Error::config(format!("{}: {e}", dir.display())))?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let text = serde_json::to_string(index).expect("an index is serializable");
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::config(format!("{}: {e}", path.display())));
+    }
+    Ok(())
 }
 
 /// Which part of an entry to save.
