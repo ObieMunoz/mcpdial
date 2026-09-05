@@ -18,6 +18,9 @@ carries its section from here as its release notes.
   command line are read from the environment when the server is dialed, so
   `servers.json` can name a secret without holding it. `$$` is a literal `$`.
   A variable that is unset, with no default, is exit 2 before anything is sent.
+- `servers.json` records where a server came from: `add --registry` writes the
+  entry's registry name and version under `source`, `ls --no-probe` shows it in a
+  `SOURCE` column once any server has one, and `--json` carries the object.
 
 ## [0.1.0] - 2026-09-05
 

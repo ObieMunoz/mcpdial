@@ -43,6 +43,48 @@ pub struct ServerConfig {
     /// Working directory for a stdio server's process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Where the entry came from, when it was added from the catalog or the
+    /// registry. Nothing dials with it; `browse` and a later `update` read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// The catalog id, registry name and version a server was added from. Either
+/// of the ids may be absent: a catalog entry the registry lacks has no registry
+/// name, and one added straight from the registry has no catalog id.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Source {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+impl Source {
+    /// The one id to show for it: the catalog id, else the registry name.
+    pub fn label(&self) -> &str {
+        self.catalog
+            .as_deref()
+            .or(self.registry.as_deref())
+            .unwrap_or("")
+    }
+}
+
+/// The name a catalog entry is already saved under, if any.
+pub fn saved_from_catalog<'a>(
+    servers: &'a BTreeMap<String, ServerConfig>,
+    id: &str,
+) -> Option<&'a str> {
+    servers
+        .iter()
+        .find(|(_, c)| {
+            c.source
+                .as_ref()
+                .is_some_and(|s| s.catalog.as_deref() == Some(id))
+        })
+        .map(|(name, _)| name.as_str())
 }
 
 impl ServerConfig {
@@ -101,6 +143,7 @@ impl ServerConfig {
             token_env: self.token_env.clone(),
             env,
             cwd: self.cwd.as_deref().map(|d| fill("cwd", d)).transpose()?,
+            source: self.source.clone(),
         })
     }
 }
@@ -904,6 +947,63 @@ mod tests {
             "removing a server drops its token"
         );
         assert!(!s.remove_server("wiki").unwrap());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn source_round_trips_and_is_optional() {
+        let s = temp_store();
+        let mut from_registry = ServerConfig::http("https://api.example/mcp");
+        from_registry.source = Some(Source {
+            registry: Some("io.github.acme/remote".into()),
+            version: Some("2.0.0".into()),
+            ..Default::default()
+        });
+        s.add_server("web", from_registry.clone()).unwrap();
+        s.add_server("plain", ServerConfig::http("https://plain.example/mcp"))
+            .unwrap();
+
+        let all = s.servers().unwrap();
+        assert_eq!(all["web"], from_registry);
+        assert_eq!(all["plain"].source, None);
+        let text = fs::read_to_string(s.servers_path()).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            file["servers"]["web"]["source"],
+            serde_json::json!({"registry": "io.github.acme/remote", "version": "2.0.0"}),
+            "absent ids are left out, not written as null"
+        );
+        assert!(
+            file["servers"]["plain"].get("source").is_none(),
+            "a server with no provenance has no key: {text}"
+        );
+        assert_eq!(
+            all["web"].source.as_ref().unwrap().label(),
+            "io.github.acme/remote"
+        );
+        assert_eq!(saved_from_catalog(&all, "acme"), None);
+
+        // A file written before `source` existed reads as it always did.
+        fs::write(
+            s.servers_path(),
+            r#"{"servers": {"old": {"stdio": "npx -y old"}}}"#,
+        )
+        .unwrap();
+        let old = s.server("old").unwrap().unwrap();
+        assert_eq!(old.stdio.as_deref(), Some("npx -y old"));
+        assert_eq!(old.source, None);
+
+        let mut from_catalog = ServerConfig::http("https://gh.example/mcp");
+        from_catalog.source = Some(Source {
+            catalog: Some("github".into()),
+            registry: Some("io.github.github/github-mcp-server".into()),
+            version: Some("0.14.0".into()),
+        });
+        s.add_server("gh", from_catalog).unwrap();
+        let all = s.servers().unwrap();
+        assert_eq!(all["gh"].source.as_ref().unwrap().label(), "github");
+        assert_eq!(saved_from_catalog(&all, "github"), Some("gh"));
+        assert_eq!(saved_from_catalog(&all, "gitlab"), None);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 

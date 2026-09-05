@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
+use mcpdial::config::Source;
 use mcpdial::protocol::METHOD_NOT_FOUND;
 use mcpdial::registry::{Pick, Registry};
 use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
@@ -1569,11 +1570,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 "name": n, "kind": c.kind(), "location": c.location(),
                                 "headers": c.headers, "token_env": c.token_env,
                                 "credential": creds.get(n).is_some_and(Credential::has_token),
+                                "source": c.source,
                             })
                         })
                         .collect();
                     print_json(&rows);
                 } else {
+                    // The column earns its place only once a server has a source.
+                    let with_source = servers.values().any(|c| c.source.is_some());
                     let rows: Vec<Vec<String>> = servers
                         .iter()
                         .map(|(n, c)| {
@@ -1584,10 +1588,19 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             } else {
                                 "-".into()
                             };
-                            vec![n.clone(), c.kind().into(), auth, c.location().into()]
+                            let mut row = vec![n.clone(), c.kind().into(), auth];
+                            if with_source {
+                                row.push(c.source.as_ref().map_or("-", Source::label).into());
+                            }
+                            row.push(c.location().into());
+                            row
                         })
                         .collect();
-                    print_table(&["NAME", "TYPE", "AUTH", "LOCATION"], &rows);
+                    if with_source {
+                        print_table(&["NAME", "TYPE", "AUTH", "SOURCE", "LOCATION"], &rows);
+                    } else {
+                        print_table(&["NAME", "TYPE", "AUTH", "LOCATION"], &rows);
+                    }
                 }
                 return Ok(0);
             }
