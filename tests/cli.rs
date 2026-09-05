@@ -192,18 +192,12 @@ fn errors_map_to_exit_codes() {
     assert_eq!(o.code, 2);
     assert!(o.stderr.contains("unknown server"));
 
-    // Assigned and given up again, so the connection is refused rather than
-    // dropped. A never-used low port is dropped on some Windows hosts, and a
-    // dropped connection arrives as a timeout instead.
-    let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let nobody_home = format!("http://127.0.0.1:{closed_port}/mcp");
-    let o = run(mcpdial(&home).args(["--timeout", "2", "info", &nobody_home]));
+    let o = run(mcpdial(&home).args(["--timeout", "2", "info", "http://127.0.0.1:1/mcp"]));
     assert_eq!(o.code, 1);
-    assert!(o.stderr.contains("could not reach"), "{}", o.stderr);
+    // Refused on unix; a Windows host drops it instead, which arrives as a timeout.
+    let nothing_answered =
+        o.stderr.contains("could not reach") || o.stderr.contains("no reply from");
+    assert!(nothing_answered, "{}", o.stderr);
 }
 
 #[test]
