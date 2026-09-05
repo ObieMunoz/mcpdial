@@ -118,7 +118,7 @@ one object on stdout instead, so nothing has to be confirmed by parsing a senten
 mcpdial add NAME ... --json      {"saved":{"name":"x","kind":"http","location":"https://u/mcp",...}}
 mcpdial rm NAME --json           {"removed":"x"}
 mcpdial import FILE --json       {"imported":["a","b"],"skipped":["c"]}
-mcpdial login TARGET --json      {"login":{"name":"x","expires_at":1760000000,"refreshable":true}}
+mcpdial login TARGET --json      {"login":{"name":"x","expires_at":1760000000,"refreshable":true,"registration":"dynamic"}}
 mcpdial logout TARGET --json     {"removed_credential":"x"}     null when none was saved
 mcpdial token set NAME --json    {"saved_credential":"x"}
 mcpdial token rm NAME --json     {"removed_credential":"x"}     null when none was saved
@@ -169,6 +169,9 @@ terminal; piped input is read one line at a time with no editing and no history.
 - `ls --json` says `auth_required` when a server wants a token and none is saved.
 - `mcpdial login TARGET --no-browser` prints an authorization URL and waits up to five
   minutes for the redirect. Relay the URL to a human; do not try to complete it yourself.
+- `login` identifies the client with `--client-id` if given, else with a client ID
+  metadata document when the server advertises support, else by dynamic registration.
+  `--no-client-metadata` forces the last; `token show --json` reports `registration`.
 - If a token already exists in the environment: `mcpdial --token-env VAR ...` or
   `mcpdial token set NAME --env VAR`. Never put a token on the command line.
 - Saved tokens refresh automatically. A `token_rejected` status after that means the

@@ -1,0 +1,48 @@
+name: pages
+
+# Publishes docs/client-metadata.json, the client ID metadata document that
+# `mcpdial login` presents as its client_id, at
+# https://obiemunoz.github.io/mcpdial/client-metadata.json. The repository's Pages
+# source must be "GitHub Actions" (Settings > Pages); the configure step turns that
+# on itself when the workflow token is allowed to.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/client-metadata.json
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}client-metadata.json
+    steps:
+      - uses: actions/checkout@v4
+      - id: pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+      # The document must name the URL it is served from, and src/oauth.rs must agree.
+      - run: |
+          url="${{ steps.pages.outputs.base_url }}/client-metadata.json"
+          test "$(jq -r .client_id docs/client-metadata.json)" = "$url"
+          grep -Fq "\"$url\"" src/oauth.rs
+          mkdir site && cp docs/client-metadata.json site/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

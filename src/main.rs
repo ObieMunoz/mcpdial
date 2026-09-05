@@ -208,9 +208,17 @@ enum Cmd {
         /// Fixed loopback port for the redirect (default: any free port)
         #[arg(long)]
         port: Option<u16>,
-        /// Use a pre-registered client id instead of dynamic registration
+        /// Use a pre-registered client id instead of a client metadata document or
+        /// dynamic registration
         #[arg(long)]
         client_id: Option<String>,
+        /// Present this client ID metadata document as the client id, instead of the
+        /// one the project publishes, whether or not the server advertises support
+        #[arg(long, value_name = "URL", conflicts_with_all = ["client_id", "no_client_metadata"])]
+        client_metadata_url: Option<String>,
+        /// Register dynamically even when the server accepts client metadata documents
+        #[arg(long)]
+        no_client_metadata: bool,
         /// Read that client's secret from stdin. Never from an argument.
         #[arg(long, requires = "client_id")]
         client_secret: bool,
@@ -1884,6 +1892,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             scope,
             port,
             client_id,
+            client_metadata_url,
+            no_client_metadata,
             client_secret,
             client_secret_env,
             redirect_host,
@@ -1901,11 +1911,17 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .transpose()?;
             let existing = store.credential(&r.name)?;
             let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
+            let client_metadata = match client_metadata_url {
+                Some(url) => oauth::ClientMetadata::Url(url),
+                None if no_client_metadata => oauth::ClientMetadata::Never,
+                None => oauth::ClientMetadata::IfAdvertised,
+            };
             let login_opts = oauth::LoginOptions {
                 scope,
                 port,
                 client_id,
                 client_secret,
+                client_metadata,
                 redirect_host,
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
@@ -1922,6 +1938,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         "name": r.name,
                         "expires_at": cred.expires_at,
                         "refreshable": refreshable,
+                        "registration": cred.registration,
                     } })
                 );
             } else {
@@ -1983,6 +2000,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     "scope": cred.scope,
                     "source": cred.source,
                     "client_id": cred.client_id,
+                    "registration": cred.registration,
                     "has_client_secret": cred.client_secret.is_some(),
                     "token_endpoint": cred.token_endpoint,
                 }));
@@ -2007,6 +2025,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 }
                 if let Some(c) = &cred.client_id {
                     println!("  client id:     {c}");
+                }
+                if let Some(r) = cred
+                    .registration
+                    .as_deref()
+                    .and_then(oauth::Registration::parse)
+                {
+                    println!("  registered:    {}", r.describe());
                 }
                 if cred.client_secret.is_some() {
                     println!(
