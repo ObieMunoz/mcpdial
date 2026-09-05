@@ -25,6 +25,12 @@
    content blocks are printed as plain text, one per line.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
    and prints one JSON line per command. Send `quit` or close stdin to finish.
+5. **Add what is missing.** `mcpdial add NAME --registry <registry name>` saves an
+   entry of the MCP registry without running it; the registry name is the entry's
+   own `name`, like `io.github.owner/server`, and must be known already. A required
+   value the entry leaves to the user is exit 2 with a `hint` naming it, and
+   `--arg VALUE` supplies it. Required environment variables are saved as `${VAR}`
+   placeholders and named on stderr; they must be set before the server is dialed.
 
 ## Passing arguments
 

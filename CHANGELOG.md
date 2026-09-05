@@ -7,6 +7,14 @@ carries its section from here as its release notes.
 
 ## [Unreleased]
 
+### Added
+
+- `add NAME --registry <name>` saves an entry of the MCP registry without running it:
+  an HTTP remote as is, an npm, PyPI or OCI package as the `npx`, `uvx` or
+  `docker run` line it needs, required environment variables as `${VAR}`
+  placeholders, and values the entry leaves to the user from `--arg`.
+  `MCPDIAL_REGISTRY` points at a private registry.
+
 ## [0.1.0] - 2026-09-05
 
 ### Added

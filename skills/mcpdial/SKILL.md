@@ -34,3 +34,6 @@ Rules:
   put a token on the command line; use `--token-env VAR`.
 - If a saved server is not there, add it: `mcpdial add NAME --http URL` or
   `mcpdial add NAME --stdio "cmd args"`, or `mcpdial import` to pull from host configs.
+  `mcpdial add NAME --registry io.github.owner/server` saves an MCP registry entry
+  whose name is already known; exit 2 with a hint means it needs `--arg VALUE`, and
+  required `${VAR}` placeholders must be set before dialing.

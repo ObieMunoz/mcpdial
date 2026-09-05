@@ -2,6 +2,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::protocol::METHOD_NOT_FOUND;
+use mcpdial::registry::{Pick, Registry};
 use mcpdial::session::{render_messages, resource_bodies, ResourceBody};
 use mcpdial::{oauth, Credential, Error, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
@@ -24,6 +25,7 @@ const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 examples:
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
   mcpdial add fs --stdio \"npx -y @modelcontextprotocol/server-filesystem /tmp\"
+  mcpdial add ctx7 --registry io.github.upstash/context7   # from the MCP registry
   mcpdial ls                      # every saved server with its status and its age
   mcpdial tools                   # every tool on every server
   mcpdial login work              # one-time browser step; the token is saved
@@ -76,13 +78,31 @@ enum Cmd {
         #[arg(
             long,
             value_name = "URL",
-            conflicts_with = "stdio",
-            required_unless_present = "stdio"
+            conflicts_with_all = ["stdio", "registry"],
+            required_unless_present_any = ["stdio", "registry"]
         )]
         http: Option<String>,
         /// Command that speaks MCP on stdio
-        #[arg(long, value_name = "CMD")]
+        #[arg(long, value_name = "CMD", conflicts_with = "registry")]
         stdio: Option<String>,
+        /// A server in the MCP registry, by its registry name (io.github.owner/server)
+        #[arg(long, value_name = "NAME")]
+        registry: Option<String>,
+        /// Run this package type from the registry entry rather than the first offered
+        #[arg(
+            long,
+            value_name = "TYPE",
+            value_parser = ["npm", "pypi", "oci"],
+            requires = "registry",
+            conflicts_with = "remote"
+        )]
+        package: Option<String>,
+        /// Use the registry entry's remote endpoint rather than a package
+        #[arg(long, requires = "registry")]
+        remote: bool,
+        /// A value the registry entry leaves to you, repeatable, in the order listed
+        #[arg(long, value_name = "VALUE", requires = "registry")]
+        arg: Vec<String>,
         /// Environment variable for the stdio process, repeatable
         #[arg(long, value_name = "KEY=VALUE")]
         env: Vec<String>,
@@ -305,6 +325,56 @@ fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connectio
 
 fn info_hint(target: &str) -> String {
     format!("`mcpdial info {}`", shell_word(target))
+}
+
+/// The config a registry entry describes, with every value it needs in hand.
+/// Nothing is run: the command line is built, not tried.
+fn from_registry(
+    opts: &Options,
+    entry: &str,
+    pick: &Pick,
+    args: &[String],
+) -> Result<mcpdial::registry::Resolved, Failure> {
+    const NAME_HINT: &str =
+        "a registry name is the entry's own `name`, like io.github.owner/server";
+    if !entry.contains('/') {
+        return Err(Failure::hinted(
+            Error::usage(format!("{entry:?} is not a registry name")),
+            NAME_HINT,
+        ));
+    }
+    let registry = Registry::from_env(opts.timeout, &opts.user_agent);
+    let server = registry.latest(entry)?.ok_or_else(|| {
+        Failure::hinted(
+            Error::usage(format!("the registry has no server named {entry}")),
+            NAME_HINT,
+        )
+    })?;
+    let resolved = mcpdial::registry::convert(&server, pick, args)?;
+    if !resolved.missing.is_empty() {
+        return Err(Failure::hinted(
+            Error::usage(format!(
+                "{entry} needs {} value(s) this command was not given",
+                resolved.missing.len()
+            )),
+            format!(
+                "pass each with --arg VALUE, in this order:\n  {}",
+                resolved.missing.join("\n  ")
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// A note on stderr: `note:` before the first line, the rest indented under it.
+fn print_note(note: &str) {
+    let mut lines = note.lines();
+    if let Some(first) = lines.next() {
+        eprintln!("note: {first}");
+    }
+    for line in lines {
+        eprintln!("      {line}");
+    }
 }
 
 fn credential_key(store: &Store, target: String) -> String {
@@ -934,16 +1004,34 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             name,
             http,
             stdio,
+            registry,
+            package,
+            remote,
+            arg,
             env,
             cwd,
         } => {
-            let mut cfg = match (http, stdio) {
-                (Some(url), None) => ServerConfig::http(url),
-                (None, Some(cmd)) => ServerConfig::stdio(cmd),
+            let mut notes = Vec::new();
+            let mut cfg = match (http, stdio, registry) {
+                (Some(url), None, None) => ServerConfig::http(url),
+                (None, Some(cmd), None) => ServerConfig::stdio(cmd),
+                (None, None, Some(entry)) => {
+                    let pick = if remote {
+                        Pick::Remote
+                    } else if let Some(kind) = package {
+                        Pick::Package(kind)
+                    } else {
+                        Pick::Any
+                    };
+                    let resolved = from_registry(&opts, &entry, &pick, &arg)?;
+                    notes = resolved.notes;
+                    resolved.config
+                }
                 _ => {
-                    return Err(
-                        Error::usage("pass exactly one of --http URL or --stdio CMD").into(),
+                    return Err(Error::usage(
+                        "pass exactly one of --http URL, --stdio CMD or --registry NAME",
                     )
+                    .into())
                 }
             };
             if cfg.stdio.is_some() && (!opts.extra_headers.is_empty() || opts.token_env.is_some()) {
@@ -967,12 +1055,17 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     }
                 }
             }
-            cfg.cwd = cwd;
-            cfg.headers = opts.extra_headers.iter().cloned().collect();
+            if cwd.is_some() {
+                cfg.cwd = cwd;
+            }
+            cfg.headers.extend(opts.extra_headers.iter().cloned());
             cfg.token_env = opts.token_env.clone();
             let summary = format!("{} {}", cfg.kind(), cfg.location());
             store.add_server(&name, cfg)?;
             eprintln!("saved {name} ({summary})");
+            for note in &notes {
+                print_note(note);
+            }
             Ok(0)
         }
 

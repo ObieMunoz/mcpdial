@@ -119,6 +119,7 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 ```
 mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR]
 mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR]
+mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
 mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
 mcpdial rm NAME
 
@@ -219,6 +220,43 @@ saves each server under its existing name. With no file argument it scans the us
 locations. `command` plus `args` become one stdio command line, `env` and `cwd` are
 kept, and `url` plus `headers` become an HTTP server. Nothing else in those files is read.
 
+### Adding by registry name
+
+When a server is not in a host config you already have, the
+[official registry](https://registry.modelcontextprotocol.io) may list it, with what
+it runs as and what it needs. `mcpdial add NAME --registry <registry name>` saves
+such an entry without running anything. The registry name is the entry's own `name`,
+like `io.github.upstash/context7`; the registry's website shows it. Its own search
+matches names alone, so this is the escape hatch for a server you already know of,
+not the way to find one:
+
+```
+$ mcpdial add ctx7 --registry io.github.upstash/context7
+saved ctx7 (http https://mcp.context7.com/mcp)
+note: headers this server accepts, not saved:
+        Authorization (secret): API key for authentication. Accepts "Bearer <key>" or the raw key.
+      pass one with -H 'Name: value'; for Authorization, --token-env VAR or `mcpdial login` also serve.
+```
+
+A Streamable HTTP remote is preferred when the entry has one, since there is nothing
+to install; `--package npm|pypi|oci` picks a package instead, and `--remote` insists
+on the remote. An npm package becomes `npx -y <package>@<version>`, a PyPI package
+`uvx <package>==<version>`, and a container image `docker run -i --rm <image>`, each
+with the arguments the entry lists. An SSE-only remote is saved with the same note
+`import` gives.
+
+Environment variables and headers the entry marks as required are saved as `${VAR}`
+placeholders, so the file never holds a secret, and a note on stderr lists every
+variable and header the server reads; the optional ones are not saved, since exported
+in your shell they reach a local server anyway. Values the entry leaves to you, such
+as a directory to serve, come from `--arg VALUE`, repeated in the order the note lists
+them; a required one that is missing is exit 2 and nothing is saved. `--env`, `--cwd`,
+`-H` and `--token-env` apply on top, as they do for `--http` and `--stdio`. Everything
+read from the registry is quoted the way `import` quotes, one word per value, so a
+crafted entry cannot add to the command line. `mcpdial ls` afterwards is the test.
+
+`MCPDIAL_REGISTRY=URL` points at a private registry that serves the same API.
+
 ### Quoting a stdio command line
 
 A `--stdio` string, and the part of a `stdio:` target after the colon, is split into
@@ -299,7 +337,8 @@ environment on every call and beats any saved credential.
 ```
 
 Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
-`rm` also removes its credential.
+`rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry
+`add --registry` consults, when it is not the official one.
 
 "Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
 that ran `login`, applied as the file is created rather than after, so the tokens are
