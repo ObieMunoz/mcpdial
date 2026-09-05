@@ -1435,7 +1435,7 @@ fn prompts_are_listed_paginated_and_expanded() {
 #[test]
 fn a_server_without_the_capability_names_it_instead_of_the_code() {
     let home = temp_home("no-capability");
-    let target = format!("stdio:{}", echo_server().display());
+    let target = format!("stdio:{}", echo_command());
 
     for capability in ["resources", "prompts"] {
         let o = run(mcpdial(&home).args([capability, &target]));
