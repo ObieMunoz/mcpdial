@@ -1,4 +1,5 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use mcpdial::client::{self, describe_params, Options, Probe, Status};
 use mcpdial::{oauth, Credential, Error, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
@@ -134,6 +135,9 @@ enum Cmd {
     },
     /// Print the usage guide written for programs and agents that call mcpdial
     Guide,
+    /// Print a shell completion script for bash, zsh, fish, elvish or powershell
+    #[command(hide = true)]
+    Completions { shell: Shell },
     /// Authorize in the browser once and save the token (HTTP servers)
     Login {
         target: String,
@@ -1012,6 +1016,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Guide => {
             print!("{}", include_str!("../docs/AGENTS.md"));
+            Ok(0)
+        }
+
+        Cmd::Completions { shell } => {
+            let mut command = Cli::command();
+            let name = command.get_name().to_string();
+            clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
             Ok(0)
         }
 

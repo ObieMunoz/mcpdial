@@ -21,6 +21,8 @@ pub enum Mode {
     Stateful,
     /// Plain JSON replies, no session.
     Stateless,
+    /// Stateless, and the initialize result names a version other than the client's.
+    OlderProtocol,
     /// 401 with a challenge unless a valid bearer token is presented.
     Auth { tokens: Vec<String> },
     /// Like `Auth`, but registration refuses http://127.0.0.1 (Doorkeeper's default
@@ -32,6 +34,9 @@ pub enum Mode {
     StuckCursor,
     /// Stateful, but answers `405` to the session-terminating `DELETE`.
     StatefulNoDelete,
+    /// Protocol 2024-11-05: the URL serves `GET` alone, streaming an `endpoint` event
+    /// that names where requests are POSTed.
+    LegacySse,
 }
 
 #[derive(Clone, Debug)]
@@ -286,6 +291,9 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if let Mode::Blocked = mode {
         return Response::from_string("error code: 1010").with_status_code(403);
     }
+    if let Mode::LegacySse = mode {
+        return legacy_sse(base, rec);
+    }
     if matches!(mode, Mode::Auth { .. } | Mode::AuthLocalhostOnly) {
         let bearer = rec
             .header("authorization")
@@ -350,9 +358,13 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     }
 
     let params = &msg["params"];
+    let agreed_version = match mode {
+        Mode::OlderProtocol => "2024-11-05",
+        _ => "2025-06-18",
+    };
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
-            "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+            "protocolVersion":agreed_version,"capabilities":{"tools":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
@@ -403,6 +415,30 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     } else {
         json_resp(200, &reply)
     }
+}
+
+/// The 2024-11-05 handshake, which is a different transport rather than a broken
+/// server: the endpoint is registered for `GET`, so a POST finds no route.
+///
+/// The stream promises a `Content-Length` it never finishes sending, so the client
+/// sees what a real one gives it - an opening `endpoint` event and then a
+/// connection that stays open indefinitely.
+fn legacy_sse(base: &str, rec: &Recorded) -> Resp {
+    if rec.method != "GET" {
+        return Response::from_string("Method Not Allowed").with_status_code(405);
+    }
+    let opening_frame = format!("event: endpoint\ndata: {base}/messages?sessionId=sess-1\n\n");
+    let never_finished = 4096;
+    with_headers(
+        Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            std::io::Cursor::new(opening_frame.into_bytes()),
+            Some(never_finished),
+            None,
+        ),
+        &[("Content-Type", "text/event-stream")],
+    )
 }
 
 /// One tool per page. An unrecognised cursor is an error rather than an empty
