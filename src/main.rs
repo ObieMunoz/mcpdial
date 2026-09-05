@@ -138,12 +138,34 @@ enum Cmd {
         /// Working directory for the stdio process
         #[arg(long, value_name = "DIR")]
         cwd: Option<String>,
+        /// Offer only tools matching this glob (`*`, `?`), repeatable
+        #[arg(long, value_name = "PATTERN")]
+        allow: Vec<String>,
+        /// Hide and refuse tools matching this glob, repeatable; beats --allow
+        #[arg(long, value_name = "PATTERN")]
+        deny: Vec<String>,
         /// Replace a server already saved under this name
         #[arg(long)]
         force: bool,
         /// Save without dialing the server for its status
         #[arg(long)]
         no_probe: bool,
+    },
+    /// Change a saved server's tool allow and deny lists, or show them
+    Set {
+        name: String,
+        /// Replace the allow list with these globs (`*`, `?`), repeatable
+        #[arg(long, value_name = "PATTERN", conflicts_with = "clear_allow")]
+        allow: Vec<String>,
+        /// Replace the deny list with these globs, repeatable; beats --allow
+        #[arg(long, value_name = "PATTERN", conflicts_with = "clear_deny")]
+        deny: Vec<String>,
+        /// Remove the allow list, so every tool not denied is offered
+        #[arg(long)]
+        clear_allow: bool,
+        /// Remove the deny list
+        #[arg(long)]
+        clear_deny: bool,
     },
     /// Search the MCP registry, ranked, over a local copy of its whole list
     Search {
@@ -212,6 +234,9 @@ enum Cmd {
         /// Show full descriptions and parameters
         #[arg(short, long)]
         long: bool,
+        /// Include the tools the server's allow and deny lists hide, marked (denied)
+        #[arg(long, requires = "target")]
+        all: bool,
     },
     /// Initialize and show server identity and capabilities
     Info { target: String },
@@ -249,7 +274,7 @@ enum Cmd {
         #[arg(default_value = "{}")]
         arguments: String,
     },
-    /// Send any JSON-RPC method
+    /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
     Raw {
         target: String,
         method: String,
@@ -363,6 +388,8 @@ fn main() -> ExitCode {
 struct Failure {
     error: Error,
     hint: Option<String>,
+    /// The tool the error is about, as `error.tool` under `--json`.
+    tool: Option<String>,
 }
 
 impl Failure {
@@ -370,6 +397,7 @@ impl Failure {
         Self {
             error,
             hint: Some(hint.into()),
+            tool: None,
         }
     }
 
@@ -385,14 +413,31 @@ impl Failure {
         if let Some(hint) = &self.hint {
             v["error"]["hint"] = json!(hint);
         }
+        if let Some(tool) = &self.tool {
+            v["error"]["tool"] = json!(tool);
+        }
         v
     }
 }
 
 impl From<Error> for Failure {
     fn from(error: Error) -> Self {
-        Self { error, hint: None }
+        Self {
+            error,
+            hint: None,
+            tool: None,
+        }
     }
+}
+
+/// The refusal a saved server's allow and deny lists make before anything is
+/// sent for `tool`; `Ok` when they permit it.
+fn refuse_denied(cfg: &ServerConfig, name: &str, tool: &str) -> Result<(), Failure> {
+    cfg.refuse_denied(name, tool).map_err(|error| Failure {
+        error,
+        hint: None,
+        tool: Some(tool.to_string()),
+    })
 }
 
 fn print_json(v: &impl serde::Serialize) {
@@ -1140,6 +1185,37 @@ fn validate_timeout(secs: f64) -> Result<f64, Error> {
     }
 }
 
+/// `--allow` and `--deny` patterns as saved: trimmed, and none of them empty,
+/// since an empty pattern matches nothing and would only puzzle a later reader.
+fn validate_patterns(patterns: Vec<String>, flag: &str) -> Result<Vec<String>, Error> {
+    patterns
+        .into_iter()
+        .map(|p| match p.trim() {
+            "" => Err(Error::usage(format!(
+                "{flag} needs a tool name or a glob like 'read_*', got \"\""
+            ))),
+            p => Ok(p.to_string()),
+        })
+        .collect()
+}
+
+/// The allow and deny lists a server has, under the keys they are saved as.
+fn tool_lists(cfg: &ServerConfig) -> Vec<(&'static str, Vec<String>)> {
+    [("allow", &cfg.allow), ("deny", &cfg.deny)]
+        .into_iter()
+        .filter(|(_, patterns)| !patterns.is_empty())
+        .map(|(list, patterns)| (list, patterns.clone()))
+        .collect()
+}
+
+/// One line per list that is set, for the receipt a human reads.
+fn tool_lists_lines(lists: &[(&str, Vec<String>)]) -> Vec<String> {
+    lists
+        .iter()
+        .map(|(list, patterns)| format!("{list}: {}", patterns.join(", ")))
+        .collect()
+}
+
 fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
     items
         .iter()
@@ -1180,7 +1256,7 @@ const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   read URI                   one resource's contents
   prompts [--long]           every prompt this server offers
   prompt NAME {"arg": "..."} expand a prompt into its messages
-  raw METHOD {"json": ...}   send any JSON-RPC method
+  raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
   info                       the initialize result
   quit                       close the session
 
@@ -1192,6 +1268,7 @@ fn no_such_tool(tools: &[Value], name: &str) -> Failure {
     Failure {
         error: Error::usage(format!("no tool named {name:?}")),
         hint: suggest_tool(tools, name, "`tools`"),
+        tool: None,
     }
 }
 
@@ -1387,7 +1464,7 @@ fn shell_tools<'a>(
     conn: &mut client::Connection,
 ) -> &'a [Value] {
     cache
-        .get_or_insert_with(|| conn.session.list_tools().unwrap_or_default())
+        .get_or_insert_with(|| conn.list_tools().unwrap_or_default())
         .as_slice()
 }
 
@@ -1430,6 +1507,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             arg,
             env,
             cwd,
+            allow,
+            deny,
             force,
             no_probe,
         } => {
@@ -1493,6 +1572,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             cfg.token_env = opts.token_env.clone();
             cfg.protocol_version = opts.protocol_version.map(|v| v.to_string());
             cfg.timeout = timeout;
+            cfg.allow = validate_patterns(allow, "--allow")?;
+            cfg.deny = validate_patterns(deny, "--deny")?;
             validate_location(&cfg)?;
             if let Some(old) = store.server(&name)?.filter(|_| !force) {
                 return Err(Error::usage(format!(
@@ -1504,6 +1585,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             }
             let summary = format!("{} {}", cfg.kind(), cfg.location());
             let mut saved = json!({ "name": name, "kind": cfg.kind(), "location": cfg.location() });
+            let lists = tool_lists(&cfg);
             store.add_server(&name, cfg)?;
             if force {
                 store.forget_probe(&name)?;
@@ -1518,14 +1600,78 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 if !notes.is_empty() {
                     saved["notes"] = json!(notes);
                 }
+                for (list, patterns) in &lists {
+                    saved[list] = json!(patterns);
+                }
                 println!("{}", json!({ "saved": saved }));
             } else {
                 eprintln!("saved {name} ({summary})");
+                for line in tool_lists_lines(&lists) {
+                    eprintln!("  {line}");
+                }
                 for note in &notes {
                     print_note(note);
                 }
                 if let Some(row) = &row {
                     print_table(&LISTING_HEADERS, &[listing_row(row)]);
+                }
+            }
+            Ok(0)
+        }
+
+        Cmd::Set {
+            name,
+            allow,
+            deny,
+            clear_allow,
+            clear_deny,
+        } => {
+            let Some(mut cfg) = store.server(&name)? else {
+                return Err(Error::usage(format!("no server named {name:?}")).into());
+            };
+            let changing = !allow.is_empty() || !deny.is_empty() || clear_allow || clear_deny;
+            if !changing {
+                if cli.json {
+                    print_json(&json!({ "name": name, "allow": cfg.allow, "deny": cfg.deny }));
+                } else {
+                    let or = |patterns: &[String], none: &str| {
+                        if patterns.is_empty() {
+                            none.to_string()
+                        } else {
+                            patterns.join(", ")
+                        }
+                    };
+                    println!("{name}");
+                    println!("  allow: {}", or(&cfg.allow, "(every tool not denied)"));
+                    println!("  deny:  {}", or(&cfg.deny, "(none)"));
+                }
+                return Ok(0);
+            }
+            if clear_allow {
+                cfg.allow.clear();
+            }
+            if clear_deny {
+                cfg.deny.clear();
+            }
+            if !allow.is_empty() {
+                cfg.allow = validate_patterns(allow, "--allow")?;
+            }
+            if !deny.is_empty() {
+                cfg.deny = validate_patterns(deny, "--deny")?;
+            }
+            let summary = format!("{} {}", cfg.kind(), cfg.location());
+            let saved = json!({
+                "name": name, "kind": cfg.kind(), "location": cfg.location(),
+                "allow": cfg.allow, "deny": cfg.deny,
+            });
+            let lines = tool_lists_lines(&tool_lists(&cfg));
+            store.add_server(&name, cfg)?;
+            if cli.json {
+                println!("{}", json!({ "saved": saved }));
+            } else {
+                eprintln!("saved {name} ({summary})");
+                for line in lines {
+                    eprintln!("  {line}");
                 }
             }
             Ok(0)
@@ -1767,47 +1913,49 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         eprintln!("{SHELL_HELP}");
                         Ok(())
                     }
-                    "help" => {
-                        let tools = shell_tools(&mut cache, &mut conn);
-                        match find_tool(tools, rest) {
-                            Some(t) => {
-                                eprintln!("{}", tool_usage(t, "call", ""));
-                                Ok(())
+                    "help" => match refuse_denied(&r.config, &r.name, rest) {
+                        Err(denied) => Err(denied),
+                        Ok(()) => {
+                            let tools = shell_tools(&mut cache, &mut conn);
+                            match find_tool(tools, rest) {
+                                Some(t) => {
+                                    eprintln!("{}", tool_usage(t, "call", ""));
+                                    Ok(())
+                                }
+                                None => Err(no_such_tool(tools, rest)),
                             }
-                            None => Err(no_such_tool(tools, rest)),
                         }
-                    }
+                    },
                     "schema" if rest.is_empty() => Err(Failure::hinted(
                         Error::usage("schema needs a tool name"),
                         "usage: schema TOOL   (`tools` lists what this server offers)",
                     )),
-                    "schema" => {
-                        let tools = shell_tools(&mut cache, &mut conn);
-                        match find_tool(tools, rest) {
-                            Some(t) => {
-                                print_value(t, cli.json);
-                                Ok(())
+                    "schema" => match refuse_denied(&r.config, &r.name, rest) {
+                        Err(denied) => Err(denied),
+                        Ok(()) => {
+                            let tools = shell_tools(&mut cache, &mut conn);
+                            match find_tool(tools, rest) {
+                                Some(t) => {
+                                    print_value(t, cli.json);
+                                    Ok(())
+                                }
+                                None => Err(no_such_tool(tools, rest)),
                             }
-                            None => Err(no_such_tool(tools, rest)),
                         }
-                    }
+                    },
                     "info" => {
                         print_value(&conn.server_info, cli.json);
                         Ok(())
                     }
-                    "tools" => conn
-                        .session
-                        .list_tools()
-                        .map_err(Failure::from)
-                        .map(|tools| {
-                            if cli.json {
-                                println!("{}", json!({ "tools": tools }));
-                            } else {
-                                println!("{} tool(s):", tools.len());
-                                print_tools(&tools, long);
-                            }
-                            cache = Some(tools);
-                        }),
+                    "tools" => conn.list_tools().map_err(Failure::from).map(|tools| {
+                        if cli.json {
+                            println!("{}", json!({ "tools": tools }));
+                        } else {
+                            println!("{} tool(s):", tools.len());
+                            print_tools(&tools, long);
+                        }
+                        cache = Some(tools);
+                    }),
                     "resources" => match conn.session.list_resources() {
                         Err(e) => Err(missing_capability(e, "resources", info_cmd)),
                         Ok(found) => {
@@ -1885,6 +2033,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 Error::usage("call needs a tool name"),
                                 "usage: call TOOL {\"arg\": \"value\"}   (`tools` lists what this server offers)",
                             ))
+                        } else if let Err(denied) = refuse_denied(&r.config, &r.name, tool) {
+                            Err(denied)
                         } else {
                             // Arguments that do not parse and arguments the server
                             // rejects mean the same thing to whoever typed the line:
@@ -1893,6 +2043,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 Err(e) => Err(Failure {
                                     error: e,
                                     hint: shell_call_hint(&mut cache, &mut conn, tool, true),
+                                    tool: None,
                                 }),
                                 Ok(a) => match conn.session.call_tool(tool, a) {
                                     Ok(mut result) => {
@@ -1931,7 +2082,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                                 )
                                             })
                                             .flatten();
-                                        Err(Failure { error: e, hint })
+                                        Err(Failure {
+                                            error: e,
+                                            hint,
+                                            tool: None,
+                                        })
                                     }
                                 },
                             }
@@ -2042,8 +2197,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Schema { target, tool } => {
-            let mut conn = dial(&store, &opts, &target)?;
-            let tools = conn.session.list_tools()?;
+            let r = client::resolve(&store, &target)?;
+            refuse_denied(&r.config, &r.name, &tool)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
+            let tools = conn.list_tools()?;
             let Some(t) = find_tool(&tools, &tool) else {
                 let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
                 return Err(Failure {
@@ -2054,6 +2211,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     },
                     hint: closest(&tool, names.iter().copied())
                         .map(|near| format!("did you mean {near}?")),
+                    tool: None,
                 });
             };
             print_json(t);
@@ -2210,6 +2368,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 "credential": creds.get(n).is_some_and(Credential::has_token),
                                 "source": c.source, "timeout": c.timeout,
                                 "running": daemon::is_running(&store, n),
+                                "allow": c.allow, "deny": c.deny,
                             })
                         })
                         .collect();
@@ -2278,7 +2437,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Tools { target: None, long } => {
+        Cmd::Tools {
+            target: None, long, ..
+        } => {
             let probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
                 print_json(&probes);
@@ -2319,9 +2480,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         Cmd::Tools {
             target: Some(target),
             long,
+            all,
         } => {
             let mut conn = dial(&store, &opts, &target)?;
-            let tools = conn.session.list_tools()?;
+            let tools = if all {
+                conn.list_all_tools()?
+            } else {
+                conn.list_tools()?
+            };
             if cli.json {
                 print_json(&json!({ "tools": tools }));
             } else {
@@ -2384,9 +2550,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     ),
                 )
             })?;
-            let mut conn = dial(&store, &opts, &target)?;
+            let r = client::resolve(&store, &target)?;
+            refuse_denied(&r.config, &r.name, &tool)?;
+            let mut conn = client::connect(&store, &r, &opts)?;
             let hint = |conn: &mut client::Connection, argument_error: bool| {
-                let tools = conn.session.list_tools().unwrap_or_default();
+                let tools = conn.list_tools().unwrap_or_default();
                 call_hint(
                     &tools,
                     &tool,
@@ -2403,7 +2571,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     let hint = server_refused(&e)
                         .then(|| hint(&mut conn, is_argument_error(&e)))
                         .flatten();
-                    return Err(Failure { error: e, hint });
+                    return Err(Failure {
+                        error: e,
+                        hint,
+                        tool: None,
+                    });
                 }
             };
             let files = MediaFiles {
@@ -2692,7 +2864,13 @@ fn print_prompts(prompts: &[Value], long: bool) {
 /// Tools and prompts list identically; only the word for what they take differs.
 fn print_named(items: &[Value], long: bool, takes: &str, describe: impl Fn(&Value) -> Vec<String>) {
     for item in items {
-        let name = item["name"].as_str().unwrap_or("?");
+        // `tools --all` marks what the allow and deny lists hide.
+        let marker = if item["denied"] == true {
+            " (denied)"
+        } else {
+            ""
+        };
+        let name = format!("{}{marker}", item["name"].as_str().unwrap_or("?"));
         let desc = item["description"].as_str().unwrap_or("").trim();
         if long {
             println!("{name}");
