@@ -35,6 +35,7 @@ examples:
   mcpdial add fs --stdio \"npx -y @modelcontextprotocol/server-filesystem /tmp\"
   mcpdial catalog                 # a reviewed list of servers, by category
   mcpdial add ctx7 --catalog context7                      # one of them
+  mcpdial search browser automation                        # the whole registry, ranked
   mcpdial add ctx7 --registry io.github.upstash/context7   # from the MCP registry
   mcpdial ls                      # every saved server with its status and its age
   mcpdial tools                   # every tool on every server
@@ -138,6 +139,20 @@ enum Cmd {
         /// Save without dialing the server for its status
         #[arg(long)]
         no_probe: bool,
+    },
+    /// Search the MCP registry, ranked, over a local copy of its whole list
+    Search {
+        /// Words that must all appear in an entry's name, title or description
+        query: Vec<String>,
+        /// How many matches to show
+        #[arg(long, default_value_t = 20, value_name = "N")]
+        limit: usize,
+        /// Fetch the whole list again, even if the local copy is recent
+        #[arg(long, conflicts_with = "offline")]
+        refresh: bool,
+        /// Search the local copy as it is, without touching the network
+        #[arg(long)]
+        offline: bool,
     },
     /// Import servers from a host's config (Claude, Cursor, Windsurf, VS Code, Codex, OpenCode)
     Import {
@@ -1464,6 +1479,103 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 if let Some(row) = &row {
                     print_table(&LISTING_HEADERS, &[listing_row(row)]);
                 }
+            }
+            Ok(0)
+        }
+
+        Cmd::Search {
+            query,
+            limit,
+            refresh,
+            offline,
+        } => {
+            let query = query.join(" ");
+            if query.trim().is_empty() {
+                return Err(Failure::hinted(
+                    Error::usage("search needs a query"),
+                    "words that must all appear, like: mcpdial search browser automation",
+                ));
+            }
+            let sync = match (refresh, offline) {
+                (true, _) => mcpdial::registry::Sync::Refresh,
+                (_, true) => mcpdial::registry::Sync::Offline,
+                _ => mcpdial::registry::Sync::Auto,
+            };
+            let registry = Registry::from_env(opts.timeout_or_default(), &opts.user_agent);
+            let at_terminal = std::io::stderr().is_terminal();
+            let mut counting = false;
+            let mut progress = |n: usize| {
+                if at_terminal {
+                    eprint!("\rfetching the registry: {n} servers");
+                    counting = true;
+                }
+            };
+            let indexed = mcpdial::registry::index(&store, &registry, sync, &mut progress);
+            if counting {
+                eprintln!();
+            }
+            let (index, note) = indexed?;
+            if let Some(note) = note {
+                print_note(&note);
+            }
+            let loaded = catalog::load(
+                &store,
+                &catalog::Source::from_env(),
+                offline,
+                opts.timeout_or_default(),
+                &opts.user_agent,
+            )?;
+            if opts.verbose {
+                eprintln!("catalog: {}", loaded.origin);
+            }
+            let catalog: Vec<String> = loaded
+                .entries
+                .iter()
+                .filter_map(|e| e.registry.clone())
+                .collect();
+            let hits = mcpdial::search::rank(&query, &index.servers, &catalog);
+            if hits.is_empty() {
+                if cli.json {
+                    print_json(&hits);
+                } else {
+                    eprintln!("no registry entry matches {query:?}");
+                }
+                return Ok(EXIT_ERROR);
+            }
+            let shown: Vec<&Value> = hits.iter().copied().take(limit).collect();
+            if cli.json {
+                print_json(&shown);
+                return Ok(0);
+            }
+            let rows: Vec<Vec<String>> = shown
+                .iter()
+                .map(|e| {
+                    let server = &e["server"];
+                    let name = server["name"].as_str().unwrap_or("?");
+                    let transports = match mcpdial::registry::transports(server) {
+                        t if t.is_empty() => "-".to_string(),
+                        t => t.join(", "),
+                    };
+                    let source = if catalog.iter().any(|c| c == name) {
+                        "catalog"
+                    } else {
+                        "registry"
+                    };
+                    vec![
+                        name.to_string(),
+                        transports,
+                        source.to_string(),
+                        truncate(server["description"].as_str().unwrap_or("")),
+                    ]
+                })
+                .collect();
+            print_table(&["NAME", "TRANSPORTS", "SOURCE", "DESCRIPTION"], &rows);
+            if hits.len() > shown.len() {
+                eprintln!(
+                    "{} of {} matches; --limit N shows more",
+                    shown.len(),
+                    hits.len()
+                );
             }
             Ok(0)
         }

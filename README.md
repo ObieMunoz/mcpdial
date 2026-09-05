@@ -121,6 +121,7 @@ mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-
 mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--timeout SECS] [--force] [--no-probe]
 mcpdial add NAME --catalog ID    one entry of the reviewed catalog; `mcpdial catalog` lists them
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
+mcpdial search QUERY [--limit N] [--refresh] [--offline]   the MCP registry, ranked, from a local copy
 mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor, Windsurf, VS Code, Codex, OpenCode configs
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
@@ -290,15 +291,45 @@ this repository. To add a server, open a pull request against
 [catalog.json](catalog.json): CI checks the file's shape and that every registry
 name still resolves.
 
-### Adding by registry name
+### The registry, as the escape hatch
 
 When a server is not in the catalog or in a host config you already have, the
 [official registry](https://registry.modelcontextprotocol.io) may list it, with what
-it runs as and what it needs. `mcpdial add NAME --registry <registry name>` saves
-such an entry without running anything. The registry name is the entry's own `name`,
-like `io.github.upstash/context7`; the registry's website shows it. Its own search
-matches names alone, so this is the escape hatch for a server you already know of,
-not the way to find one:
+it runs as and what it needs. It holds the whole ecosystem, some twenty-seven
+thousand entries with no review behind them, so it is where to look for a server
+nothing else lists, not where to start. `mcpdial search` finds one in it:
+
+```
+$ mcpdial search github --limit 3
+NAME                                TRANSPORTS         SOURCE    DESCRIPTION
+io.github.github/github-mcp-server  http, stdio (oci)  registry  Connect AI assistants to GitHub - manage repos, issues, P...
+io.github.Abhishekkumar2021/github  stdio (npm)        registry  GitHub via MCP: search, repos, issues, PRs, files, notifi...
+io.github.pipeworx-io/github        http               registry  GitHub MCP — wraps the GitHub public REST API (no auth re...
+3 of 210 matches; --limit N shows more
+```
+
+The registry's own search matches names alone, alphabetically, which for `github`
+lists an Obsidian vault and three mirrors before GitHub's own server, and for
+`browser automation` finds nothing. So `search` keeps a copy of the whole list under
+`~/.config/mcpdial/registry/`, fetched once (a minute or two, with a progress line
+at a terminal) and brought up to date with the registry's `updated_since` the next
+time it is a day old. `--refresh` fetches it all again, `--offline` searches the copy
+as it is, and a registry that cannot be reached is a note, not a failure, as long as
+there is a copy. Every word of the query must appear in an entry's name, title or
+description, case aside; the `io.github.` prefix on a name is not searched, since it
+says where the code is hosted, not what the server is. Matches are ranked: an exact
+name or title first, then `io.github.<vendor>` where the vendor is a query word, then
+title matches, then name matches, then description matches. Within a rank, entries
+with an HTTP remote or an npm package come before PyPI and container ones, a
+namespace of more than a hundred entries is pushed down, and listings that share a
+repository collapse to the newest. A matching entry the catalog lists goes first of
+all, with `catalog` in the SOURCE column. Under `--json` the registry's own objects
+are printed, untouched, in that order, so a program gets the same ranking. Nothing
+matched is exit 1.
+
+`mcpdial add NAME --registry <registry name>` then saves an entry without running
+anything. The registry name is the entry's own `name`, as `search` prints it, like
+`io.github.upstash/context7`:
 
 ```
 $ mcpdial add ctx7 --registry io.github.upstash/context7
@@ -447,12 +478,14 @@ host config, and `add --registry` writes them for what an entry marks as require
 ~/.config/mcpdial/servers.json       what you configured (safe to share)
 ~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (owner only)
 ~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
+~/.config/mcpdial/registry/          a copy of the registry's list, for `search`
 ```
 
 Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
-`rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry
-`add --registry` consults, when it is not the official one, and `MCPDIAL_CATALOG` a
-URL or file to read the catalog from.
+`rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry `search` and
+`add --registry` consult, when it is not the official one; the copy remembers which
+registry it came from, so pointing at another one starts a fresh copy. `MCPDIAL_CATALOG`
+is a URL or file to read the catalog from.
 
 "Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
 that ran `login`, applied as the file is created rather than after, so the tokens are
