@@ -1437,3 +1437,67 @@ fn a_saved_status_does_not_survive_the_server_it_described() {
     assert_eq!(listed(&o.stdout, "shut")["status"]["state"], "connected");
     assert_eq!(listed(&o.stdout, "shut")["auth"], "saved");
 }
+
+#[test]
+fn a_2024_11_05_server_is_named_rather_than_reported_as_a_bare_status() {
+    let s = start(Mode::LegacySse);
+    let home = temp_home("legacy-sse");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "old", "--http", &s.url])).code,
+        0
+    );
+
+    // No --timeout: a probe that read the stream to its end would sit here for the
+    // default 60s instead, and the server never ends it.
+    let started = std::time::Instant::now();
+    let o = run(mcpdial(&home).args(["info", "old"]));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the probe waited out a stream that never ends"
+    );
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("HTTP+SSE"), "{}", o.stderr);
+    assert!(o.stderr.contains("2024-11-05"), "{}", o.stderr);
+    assert!(!o.stderr.contains("HTTP 405"), "{}", o.stderr);
+
+    let probed = s.requests.lock().unwrap().iter().any(|r| r.method == "GET");
+    assert!(probed, "the failed POST should have been followed by a GET");
+
+    let o = run(mcpdial(&home).args(["ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("legacy sse"), "{}", o.stdout);
+
+    let o = run(mcpdial(&home).args(["--json", "ls"]));
+    let rows: Vec<Value> = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(rows[0]["status"]["state"], "legacy_sse");
+}
+
+#[test]
+fn a_server_that_answers_is_never_probed_for_the_older_transport() {
+    let s = start(Mode::Stateful);
+    let home = temp_home("no-legacy-probe");
+
+    let o = run(mcpdial(&home).args(["call", &s.url, "echo", r#"{"message":"hi"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let requests = s.requests.lock().unwrap();
+    assert!(
+        requests.iter().all(|r| r.method != "GET"),
+        "a healthy server costs no extra round trip: {:?}",
+        requests.iter().map(|r| &r.method).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_url_that_streams_no_endpoint_event_keeps_its_own_error() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("not-legacy");
+
+    let o = run(mcpdial(&home).args(["info", &format!("{}/nope", s.base)]));
+    assert_ne!(o.code, 0);
+    assert!(o.stderr.contains("HTTP 404"), "{}", o.stderr);
+    assert!(!o.stderr.contains("HTTP+SSE"), "{}", o.stderr);
+    assert!(
+        s.requests.lock().unwrap().iter().any(|r| r.method == "GET"),
+        "the 404 should still have been checked"
+    );
+}
