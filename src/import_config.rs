@@ -9,6 +9,10 @@
 //!
 //! Claude Code's `~/.claude.json` nests the same shape under `projects.<path>`; those
 //! are collected too. Nothing else in that file is read.
+//!
+//! A numeric `timeout` on an entry is seconds, as mcpc, Cline and Roo Code write it;
+//! no host puts milliseconds in this field (Claude Code's `MCP_TIMEOUT` is an
+//! environment variable, not part of the entry).
 
 use crate::config::ServerConfig;
 use serde_json::Value;
@@ -62,7 +66,7 @@ fn convert(name: &str, entry: &Value, scope: &str) -> Option<Found> {
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
     let mut note = None;
 
-    let config = if let Some(url) = entry.get("url").and_then(Value::as_str) {
+    let mut config = if let Some(url) = entry.get("url").and_then(Value::as_str) {
         if kind == "sse" {
             note = Some("configured as SSE; mcpdial speaks Streamable HTTP, which most servers also serve at the same URL".into());
         }
@@ -88,6 +92,7 @@ fn convert(name: &str, entry: &Value, scope: &str) -> Option<Found> {
         c.cwd = entry.get("cwd").and_then(Value::as_str).map(str::to_string);
         c
     };
+    config.timeout = entry.get("timeout").and_then(Value::as_f64);
 
     Some(Found {
         name: name.to_string(),
@@ -162,6 +167,32 @@ mod tests {
             argv,
             ["npx", "-y", "fs", "/tmp/my dir"],
             "quoting round-trips"
+        );
+    }
+
+    #[test]
+    fn a_numeric_timeout_is_read_as_seconds() {
+        let doc = json!({
+            "mcpServers": {
+                "slow":   {"command":"npx","args":["-y","slow"],"timeout":120},
+                "remote": {"type":"http","url":"https://x/mcp","timeout":2.5},
+                "words":  {"command":"npx","timeout":"soon"},
+                "plain":  {"command":"npx"}
+            }
+        });
+        let found = extract(&doc);
+        let timeouts: Vec<(&str, Option<f64>)> = found
+            .iter()
+            .map(|f| (f.name.as_str(), f.config.timeout))
+            .collect();
+        assert_eq!(
+            timeouts,
+            [
+                ("plain", None),
+                ("remote", Some(2.5)),
+                ("slow", Some(120.0)),
+                ("words", None),
+            ]
         );
     }
 

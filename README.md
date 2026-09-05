@@ -117,8 +117,8 @@ Saved names are the normal case. The other two exist so a one-off never needs se
 ## Commands
 
 ```
-mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V] [--force] [--no-probe]
-mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--force] [--no-probe]
+mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-version V] [--timeout SECS] [--force] [--no-probe]
+mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--timeout SECS] [--force] [--no-probe]
 mcpdial add NAME --catalog ID    one entry of the reviewed catalog; `mcpdial catalog` lists them
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
 mcpdial import [FILE] [--force]  pull servers from Claude Code, Claude Desktop, Cursor configs
@@ -153,6 +153,11 @@ Global flags: `--json` for machine output, `-v` to trace every message on stderr
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, and
 `--protocol-version VERSION` to offer an older MCP revision at `initialize`.
+
+`--timeout` bounds every wait: the flag on the command line, else the timeout saved
+with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
+installs packages on first launch or runs tools for minutes, `ls --no-probe` shows it,
+and `import` keeps a numeric `timeout` (seconds) it finds in a host's config.
 
 `initialize` offers protocol `2025-11-25` and runs on whichever version the server
 answers with, out of `2025-11-25`, `2025-06-18` and `2025-03-26`; `mcpdial info` shows

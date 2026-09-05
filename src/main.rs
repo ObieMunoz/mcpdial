@@ -45,9 +45,9 @@ examples:
 calling from a program or an agent: pass --json everywhere and run `mcpdial guide`."
 )]
 struct Cli {
-    /// Seconds to wait for a reply
-    #[arg(long, global = true, default_value_t = 60.0, value_name = "SECS")]
-    timeout: f64,
+    /// Seconds to wait for a reply; else the server's saved timeout, else 60. With `add`, saved.
+    #[arg(long, global = true, value_name = "SECS")]
+    timeout: Option<f64>,
 
     /// Emit JSON instead of a readable summary
     #[arg(long, global = true)]
@@ -423,7 +423,7 @@ fn from_registry(
             NAME_HINT,
         ));
     }
-    let registry = Registry::from_env(opts.timeout, &opts.user_agent);
+    let registry = Registry::from_env(opts.timeout_or_default(), &opts.user_agent);
     let server = registry.latest(entry)?.ok_or_else(|| {
         Failure::hinted(
             Error::usage(format!("the registry has no server named {entry}")),
@@ -453,7 +453,7 @@ fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Fai
         store,
         &catalog::Source::from_env(),
         false,
-        opts.timeout,
+        opts.timeout_or_default(),
         &opts.user_agent,
     )?;
     if opts.verbose {
@@ -469,7 +469,7 @@ fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Fai
             },
         ));
     };
-    let registry = Registry::from_env(opts.timeout, &opts.user_agent);
+    let registry = Registry::from_env(opts.timeout_or_default(), &opts.user_agent);
     let resolved = catalog::resolve(entry, &registry)?;
     if !resolved.missing.is_empty() {
         return Err(Failure::hinted(
@@ -1070,6 +1070,18 @@ fn validate_location(cfg: &ServerConfig) -> Result<(), Error> {
     Ok(())
 }
 
+/// The `--timeout` that `add` saves: a number of seconds a wait can be bounded
+/// by, so the file never holds one that dialing would refuse.
+fn validate_timeout(secs: f64) -> Result<f64, Error> {
+    if secs.is_finite() && secs >= 0.0 {
+        Ok(secs)
+    } else {
+        Err(Error::usage(format!(
+            "--timeout must be a non-negative number of seconds, got {secs}"
+        )))
+    }
+}
+
 fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, Error> {
     items
         .iter()
@@ -1316,7 +1328,9 @@ fn shell_tools<'a>(
 fn run(cli: Cli) -> Result<u8, Failure> {
     let store = Store::from_env()?;
     let opts = Options {
-        timeout: Duration::from_secs_f64(cli.timeout.max(0.0)),
+        timeout: cli
+            .timeout
+            .map(|secs| Duration::from_secs_f64(secs.max(0.0))),
         user_agent: cli.user_agent.clone(),
         extra_headers: parse_headers(&cli.headers)?,
         token_env: cli.token_env.clone(),
@@ -1354,6 +1368,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             // A registry entry is saved without being run, as documented: its
             // command usually needs values the user has yet to supply.
             let dial = !no_probe && registry.is_none();
+            let timeout = cli.timeout.map(validate_timeout).transpose()?;
             let mut notes = Vec::new();
             let mut cfg = match (http, stdio, registry) {
                 (None, None, None) if catalog.is_some() => {
@@ -1409,6 +1424,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             cfg.headers.extend(opts.extra_headers.iter().cloned());
             cfg.token_env = opts.token_env.clone();
             cfg.protocol_version = opts.protocol_version.map(|v| v.to_string());
+            cfg.timeout = timeout;
             validate_location(&cfg)?;
             if let Some(old) = store.server(&name)?.filter(|_| !force) {
                 return Err(Error::usage(format!(
@@ -1927,7 +1943,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 &store,
                 &catalog::Source::from_env(),
                 offline,
-                opts.timeout,
+                opts.timeout_or_default(),
                 &opts.user_agent,
             )?;
             if opts.verbose {
@@ -1974,14 +1990,23 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 "name": n, "kind": c.kind(), "location": c.location(),
                                 "headers": c.headers, "token_env": c.token_env,
                                 "credential": creds.get(n).is_some_and(Credential::has_token),
-                                "source": c.source,
+                                "source": c.source, "timeout": c.timeout,
                             })
                         })
                         .collect();
                     print_json(&rows);
                 } else {
-                    // The column earns its place only once a server has a source.
+                    // A column earns its place only once a server has something for it.
                     let with_source = servers.values().any(|c| c.source.is_some());
+                    let with_timeout = servers.values().any(|c| c.timeout.is_some());
+                    let mut headers = vec!["NAME", "TYPE", "AUTH"];
+                    if with_source {
+                        headers.push("SOURCE");
+                    }
+                    if with_timeout {
+                        headers.push("TIMEOUT");
+                    }
+                    headers.push("LOCATION");
                     let rows: Vec<Vec<String>> = servers
                         .iter()
                         .map(|(n, c)| {
@@ -1996,15 +2021,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             if with_source {
                                 row.push(c.source.as_ref().map_or("-", Source::label).into());
                             }
+                            if with_timeout {
+                                row.push(c.timeout.map_or("-".into(), |t| format!("{t}s")));
+                            }
                             row.push(c.location().into());
                             row
                         })
                         .collect();
-                    if with_source {
-                        print_table(&["NAME", "TYPE", "AUTH", "SOURCE", "LOCATION"], &rows);
-                    } else {
-                        print_table(&["NAME", "TYPE", "AUTH", "LOCATION"], &rows);
-                    }
+                    print_table(&headers, &rows);
                 }
                 return Ok(0);
             }
@@ -2203,7 +2227,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .then(|| read_secret(client_secret_env.as_deref(), "client secret"))
                 .transpose()?;
             let existing = store.credential(&r.name)?;
-            let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
+            let http = oauth::Http::new(opts.timeout_for(&r)?, Some(opts.user_agent.clone()));
             let client_metadata = match client_metadata_url {
                 Some(url) => oauth::ClientMetadata::Url(url),
                 None if no_client_metadata => oauth::ClientMetadata::Never,
@@ -2681,6 +2705,16 @@ mod tests {
         assert!(validate_location(&ServerConfig::stdio("npx -y thing /tmp")).is_ok());
         assert!(validate_location(&ServerConfig::stdio("   ")).is_err());
         assert!(validate_location(&ServerConfig::stdio("'unterminated")).is_err());
+    }
+
+    #[test]
+    fn a_timeout_is_checked_before_it_is_saved() {
+        assert_eq!(validate_timeout(0.2).unwrap(), 0.2);
+        assert_eq!(validate_timeout(0.0).unwrap(), 0.0);
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let e = validate_timeout(bad).unwrap_err();
+            assert!(matches!(e, Error::Usage(_)), "{bad}: {e}");
+        }
     }
 
     #[test]

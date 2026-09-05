@@ -16,10 +16,14 @@ use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
+/// What bounds a wait when neither the command line nor the server says.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Per-invocation knobs that apply to any server.
 #[derive(Debug, Clone)]
 pub struct Options {
-    pub timeout: Duration,
+    /// `--timeout` on the command line: beats the one saved for the server.
+    pub timeout: Option<Duration>,
     pub user_agent: String,
     pub extra_headers: Vec<(String, String)>,
     /// `--token-env` on the command line: beats everything else.
@@ -32,7 +36,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            timeout: Duration::from_secs(60),
+            timeout: None,
             user_agent: USER_AGENT.to_string(),
             extra_headers: Vec::new(),
             token_env: None,
@@ -43,6 +47,30 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The wait for anything that is not a saved server: the registry, the
+    /// catalog, a login.
+    pub fn timeout_or_default(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
+    }
+
+    /// The wait for one server: the flag, else its saved timeout, else the
+    /// default. A saved value that is not a number of seconds is a config error,
+    /// since the file was edited to say something that cannot bound a wait.
+    pub fn timeout_for(&self, r: &Resolved) -> Result<Duration> {
+        if let Some(flag) = self.timeout {
+            return Ok(flag);
+        }
+        match r.config.timeout {
+            Some(secs) => Duration::try_from_secs_f64(secs).map_err(|_| {
+                Error::config(format!(
+                    "{}: timeout must be a non-negative number of seconds, not {secs}",
+                    r.name
+                ))
+            }),
+            None => Ok(DEFAULT_TIMEOUT),
+        }
+    }
+
     fn logger(&self) -> Option<Logger> {
         self.verbose
             .then(|| Box::new(|s: &str| eprintln!("{s}")) as Logger)
@@ -116,8 +144,9 @@ fn refresh_and_save(
     name: &str,
     cred: &Credential,
     opts: &Options,
+    timeout: Duration,
 ) -> Result<Credential> {
-    let http = oauth::Http::new(opts.timeout, Some(opts.user_agent.clone()));
+    let http = oauth::Http::new(timeout, Some(opts.user_agent.clone()));
     let fresh = if cred.renews_by_grant() {
         oauth::renew_client_credentials(&http, cred)?
     } else {
@@ -136,7 +165,12 @@ fn env_token(var: &str) -> Result<String> {
 }
 
 /// Pick the bearer token for an HTTP server, refreshing a saved one if it has expired.
-fn select_token(store: &Store, r: &Resolved, opts: &Options) -> Result<(Option<String>, AuthUsed)> {
+fn select_token(
+    store: &Store,
+    r: &Resolved,
+    opts: &Options,
+    timeout: Duration,
+) -> Result<(Option<String>, AuthUsed)> {
     if let Some(var) = opts.token_env.as_deref().or(r.config.token_env.as_deref()) {
         return Ok((Some(env_token(var)?), AuthUsed::Env));
     }
@@ -144,15 +178,20 @@ fn select_token(store: &Store, r: &Resolved, opts: &Options) -> Result<(Option<S
         return Ok((None, AuthUsed::None));
     };
     if cred.is_expired() && cred.can_refresh() {
-        cred = refresh_and_save(store, &r.name, &cred, opts)?;
+        cred = refresh_and_save(store, &r.name, &cred, opts, timeout)?;
     }
     Ok((cred.access_token, AuthUsed::Saved))
 }
 
-fn http_transport(r: &Resolved, token: Option<String>, opts: &Options) -> HttpTransport {
+fn http_transport(
+    r: &Resolved,
+    token: Option<String>,
+    opts: &Options,
+    timeout: Duration,
+) -> HttpTransport {
     let mut b = HttpTransport::builder(r.config.http.clone().unwrap_or_default())
         .token(token)
-        .timeout(opts.timeout)
+        .timeout(timeout)
         .user_agent(opts.user_agent.clone());
     for (k, v) in &r.config.headers {
         b = b.header(k.clone(), v.clone());
@@ -215,6 +254,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
     };
     let r = &dialed;
     let offer = version_to_offer(r, opts)?;
+    let timeout = opts.timeout_for(r)?;
     if let Some(cmd) = &r.config.stdio {
         let argv = crate::transport::stdio::split_command(cmd)?;
         let env: Vec<(String, String)> = r
@@ -227,22 +267,27 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
             &argv,
             &env,
             r.config.cwd.as_deref().map(std::path::Path::new),
-            opts.timeout,
+            timeout,
             opts.verbose,
             opts.logger(),
         )?;
         return handshake(r, t, AuthUsed::None, offer);
     }
 
-    let (token, auth) = select_token(store, r, opts)?;
-    match handshake(r, http_transport(r, token, opts), auth, offer) {
+    let (token, auth) = select_token(store, r, opts, timeout)?;
+    match handshake(r, http_transport(r, token, opts, timeout), auth, offer) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
                 return Err(e);
             }
-            let cred = refresh_and_save(store, &r.name, &cred, opts)?;
-            handshake(r, http_transport(r, cred.access_token, opts), auth, offer)
+            let cred = refresh_and_save(store, &r.name, &cred, opts, timeout)?;
+            handshake(
+                r,
+                http_transport(r, cred.access_token, opts, timeout),
+                auth,
+                offer,
+            )
         }
         outcome => outcome,
     }
