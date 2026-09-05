@@ -1341,6 +1341,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         token_env: cli.token_env.clone(),
         protocol_version: cli.protocol_version,
         verbose: cli.verbose,
+        ..Options::default()
     };
     if let Some(dir) = &cli.save_dir {
         let renders_media = matches!(

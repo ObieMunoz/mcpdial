@@ -202,7 +202,9 @@ terminal; piped input is read one line at a time with no editing and no history.
 - `--timeout SECS` (default 60) bounds every wait. stdio servers that install packages
   on first run (`npx -y ...`) can need more. A saved server can carry its own timeout
   (`add --timeout SECS`; `ls --no-probe --json` reports it under `timeout`), used when
-  the flag is not given; the flag beats it.
+  the flag is not given; the flag beats it. The status probe behind `ls`, and behind
+  `add` on save, waits 10 seconds when neither says: a server that takes longer to
+  answer `initialize` is reported as `unreachable`.
 - A stdio server that exits before replying reports its exit status and last stderr
   lines in the error message. A wrong package name shows up there as an npm 404.
 - Servers are called at their final URL. A redirect is reported, not followed.
