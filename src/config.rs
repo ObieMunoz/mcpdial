@@ -681,7 +681,10 @@ impl FileLock {
         // are short, so the threshold is far above any honest hold.
         const STALE: Duration = Duration::from_secs(30);
         const GIVE_UP: Duration = Duration::from_secs(60);
+        // How long a permission error is allowed to look like a departing holder.
+        const DELETE_PENDING: Duration = Duration::from_secs(2);
         let deadline = Instant::now() + GIVE_UP;
+        let mut denied_since: Option<Instant> = None;
         loop {
             match fs::OpenOptions::new()
                 .write(true)
@@ -693,13 +696,18 @@ impl FileLock {
                         path: lock.to_path_buf(),
                     })
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                // A lock file whose deletion has not finished is still in the
-                // directory, and Windows answers `create_new` on one with a
-                // permission error rather than with "already exists". The
-                // holder is on its way out, so wait for it as usual. The same
-                // error with no lock file there is our own problem, not a race.
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && lock.exists() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => denied_since = None,
+                // Windows answers `create_new` with a permission error both for a
+                // lock file whose deletion has not finished and for a directory we
+                // may not write to. Testing for the file cannot tell them apart: a
+                // delete-pending file refuses GetFileAttributes the same way, so it
+                // reads as absent. Only time separates them - a departing holder is
+                // gone in milliseconds, an unwritable directory never is.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    if denied_since.get_or_insert_with(Instant::now).elapsed() > DELETE_PENDING {
+                        return Err(e);
+                    }
+                }
                 Err(e) => return Err(e),
             }
             let stale = fs::metadata(lock)
