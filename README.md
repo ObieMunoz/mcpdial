@@ -186,6 +186,23 @@ saves each server under its existing name. With no file argument it scans the us
 locations. `command` plus `args` become one stdio command line, `env` and `cwd` are
 kept, and `url` plus `headers` become an HTTP server. Nothing else in those files is read.
 
+### Quoting a stdio command line
+
+A `--stdio` string, and the part of a `stdio:` target after the colon, is split into
+argv by POSIX rules on every platform: whitespace separates, single and double quotes
+group, and a backslash escapes the character after it. Windows is no exception, so a
+native path spends its separators as escapes unless it is quoted or written with
+forward slashes, which Windows accepts too:
+
+```
+mcpdial add fs --stdio "C:\tools\fs-server.exe C:\data"      # wrong: \t and \d are eaten
+mcpdial add fs --stdio "'C:\tools\fs-server.exe' 'C:\data'"  # single quotes keep them
+mcpdial add fs --stdio "C:/tools/fs-server.exe C:/data"      # or sidestep them
+```
+
+`mcpdial import` quotes what it reads, so servers brought over from another host need
+nothing.
+
 ### When a stdio server dies on startup
 
 A stdio server's stderr is captured, and if the process exits before answering, the
@@ -245,11 +262,15 @@ environment on every call and beats any saved credential.
 
 ```
 ~/.config/mcpdial/servers.json       what you configured (safe to share)
-~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (mode 0600)
+~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (owner only)
 ```
 
 Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
 `rm` also removes its credential.
+
+"Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
+that ran `login`, applied as the file is created rather than after, so the tokens are
+never on disk under the permissions the profile directory hands down.
 
 ## Exit codes
 
