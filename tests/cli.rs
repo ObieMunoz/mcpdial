@@ -337,9 +337,11 @@ fn saved_servers_and_status_listing() {
     assert_eq!(by_name("envtok")["status"]["state"], "connected");
     assert_eq!(by_name("envtok")["auth"], "env");
 
-    let o = run(mcpdial(&home)
-        .env("FAKE_TOKEN", "wrong")
-        .args(["--timeout", "3", "ls"]));
+    // A different $FAKE_TOKEN is not something the saved status can know about.
+    let o =
+        run(mcpdial(&home)
+            .env("FAKE_TOKEN", "wrong")
+            .args(["--timeout", "3", "ls", "--refresh"]));
     assert!(o.stdout.contains("token rejected"), "{}", o.stdout);
     assert!(o.stdout.contains("auth required"));
     assert!(o.stdout.contains("blocked (403)"));
@@ -1509,6 +1511,166 @@ fn a_client_secret_reaches_neither_an_argument_nor_the_trace_output() {
         "the secret leaked into -v:\n{}",
         o.stderr
     );
+}
+
+fn listed(json: &str, name: &str) -> Value {
+    let rows: Vec<Value> = serde_json::from_str(json).unwrap();
+    rows.into_iter()
+        .find(|r| r["name"] == name)
+        .unwrap_or_else(|| panic!("no row for {name} in {json}"))
+}
+
+/// Backdate every saved status, so a test can reach a TTL it would otherwise
+/// have to wait out.
+fn backdate_saved_statuses(home: &std::path::Path, seconds: u64) {
+    let path = home.join("probes.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for record in v["probes"].as_object_mut().unwrap().values_mut() {
+        record["checked_at"] = Value::from(now - seconds);
+    }
+    std::fs::write(&path, v.to_string()).unwrap();
+}
+
+/// The configured command appends a byte before handing over to the real
+/// server, so the file's length is the number of times `ls` has run it.
+#[cfg(unix)]
+#[test]
+fn a_warm_listing_spawns_no_stdio_server() {
+    let home = temp_home("warm");
+    let spawns = home.join("spawns");
+    let command = format!(
+        "sh -c 'printf x >> {}; exec {}'",
+        spawns.display(),
+        echo_server().display()
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "local", "--stdio", &command])).code,
+        0
+    );
+    let spawned = || std::fs::read(&spawns).map(|b| b.len()).unwrap_or(0);
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(listed(&o.stdout, "local")["status"]["state"], "connected");
+    assert_eq!(listed(&o.stdout, "local")["tools"], 4);
+    assert_eq!(spawned(), 1);
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(listed(&o.stdout, "local")["status"]["state"], "connected");
+    assert_eq!(listed(&o.stdout, "local")["tools"], 4);
+    assert_eq!(spawned(), 1, "listing again ran the command again");
+
+    assert_eq!(run(mcpdial(&home).args(["ls", "--no-probe"])).code, 0);
+    assert_eq!(spawned(), 1);
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "ls", "--refresh"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(spawned(), 2, "--refresh has to run it");
+}
+
+#[test]
+fn a_remembered_status_shows_its_age_until_the_ttl_runs_out() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("age");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "web", "--http", &s.url])).code,
+        0
+    );
+    let dialed = || s.requests.lock().unwrap().len();
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(listed(&o.stdout, "web")["age_seconds"], 0);
+    let after_the_first_listing = dialed();
+    assert!(after_the_first_listing > 0);
+
+    backdate_saved_statuses(&home, 250);
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    let row = listed(&o.stdout, "web");
+    assert_eq!(row["status"]["state"], "connected");
+    let age = row["age_seconds"].as_u64().unwrap();
+    assert!((250..255).contains(&age), "reported an age of {age}");
+    assert_eq!(
+        dialed(),
+        after_the_first_listing,
+        "a four minute old status was dialed again"
+    );
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "ls"]));
+    assert!(
+        o.stdout.lines().next().unwrap().contains("AGE"),
+        "{}",
+        o.stdout
+    );
+    let row = o.stdout.lines().find(|l| l.starts_with("web")).unwrap();
+    assert!(
+        row.contains("connected") && row.contains("4m"),
+        "{}",
+        o.stdout
+    );
+
+    backdate_saved_statuses(&home, 400);
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(listed(&o.stdout, "web")["age_seconds"], 0, "{}", o.stdout);
+    assert!(
+        dialed() > after_the_first_listing,
+        "an expired status was reused"
+    );
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "ls"]));
+    let row = o.stdout.lines().find(|l| l.starts_with("web")).unwrap();
+    assert!(row.contains("now"), "{}", o.stdout);
+
+    let o = run(mcpdial(&home).args(["ls", "--refresh", "--no-probe"]));
+    assert_eq!(o.code, 2, "{}", o.stdout);
+}
+
+#[test]
+fn a_saved_status_does_not_survive_the_server_it_described() {
+    let first = start(Mode::Stateless);
+    let second = start(Mode::Blocked);
+    let locked = start(Mode::Auth {
+        tokens: vec!["ok".into()],
+    });
+    let home = temp_home("probe-key");
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "web", "--http", &first.url])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "shut", "--http", &locked.url])).code,
+        0
+    );
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(listed(&o.stdout, "web")["status"]["state"], "connected");
+    assert_eq!(
+        listed(&o.stdout, "shut")["status"]["state"],
+        "auth_required"
+    );
+
+    assert_eq!(
+        run(mcpdial(&home).args(["add", "web", "--http", &second.url])).code,
+        0
+    );
+    assert_eq!(
+        run(mcpdial(&home)
+            .env("TOK", "ok")
+            .args(["token", "set", "shut", "--env", "TOK"]))
+        .code,
+        0
+    );
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(listed(&o.stdout, "web")["status"]["state"], "blocked");
+    assert_eq!(listed(&o.stdout, "web")["age_seconds"], 0);
+    assert_eq!(listed(&o.stdout, "shut")["status"]["state"], "connected");
+    assert_eq!(listed(&o.stdout, "shut")["auth"], "saved");
 }
 
 #[test]

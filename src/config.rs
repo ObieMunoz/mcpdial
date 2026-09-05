@@ -5,6 +5,7 @@
 //! ```text
 //! servers.json      what you configured: transport, URL or command, headers
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
+//! probes.json       what `ls` last saw: one status per server, with its timestamp
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
 //! ```
 //!
@@ -120,6 +121,25 @@ impl Credential {
     }
 }
 
+/// One remembered status, so a routine `mcpdial ls` need not dial anything.
+///
+/// `status` and `auth` are kept as the JSON the probe produced rather than as
+/// their enums: a status variant this build has never heard of is then a cache
+/// miss and a fresh probe, not a file this build refuses to read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProbeRecord {
+    /// Unix seconds when the probe ran.
+    pub checked_at: u64,
+    /// What the probe was of; see `client::probe_keys`.
+    pub key: u64,
+    pub status: serde_json::Value,
+    pub auth: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<usize>,
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -139,7 +159,13 @@ struct CredentialsFile {
     credentials: BTreeMap<String, Credential>,
 }
 
-/// The config directory and the two files in it.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ProbesFile {
+    #[serde(default)]
+    probes: BTreeMap<String, ProbeRecord>,
+}
+
+/// The config directory and the files in it.
 #[derive(Debug, Clone)]
 pub struct Store {
     pub dir: PathBuf,
@@ -185,6 +211,9 @@ impl Store {
             Some(name) => self.dir.join(format!("history-{name}")),
             None => self.dir.join("history"),
         }
+    }
+    pub fn probes_path(&self) -> PathBuf {
+        self.dir.join("probes.json")
     }
 
     // -- servers -------------------------------------------------------------
@@ -254,6 +283,24 @@ impl Store {
             write_json(&path, &file, true)?;
         }
         Ok(removed)
+    }
+
+    // -- remembered probes ---------------------------------------------------
+
+    pub fn probes(&self) -> Result<BTreeMap<String, ProbeRecord>> {
+        Ok(read_json::<ProbesFile>(&self.probes_path())?.probes)
+    }
+
+    /// Record the probes just taken, keeping what other servers last reported
+    /// and dropping whatever is left over from a server that no longer exists.
+    pub fn save_probes(&self, taken: BTreeMap<String, ProbeRecord>) -> Result<()> {
+        let saved = self.servers()?;
+        let path = self.probes_path();
+        let _lock = FileLock::acquire(&path)?;
+        let mut file = read_json::<ProbesFile>(&path)?;
+        file.probes.extend(taken);
+        file.probes.retain(|name, _| saved.contains_key(name));
+        write_json(&path, &file, false)
     }
 }
 
@@ -647,6 +694,12 @@ impl FileLock {
                     })
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // A lock file whose deletion has not finished is still in the
+                // directory, and Windows answers `create_new` on one with a
+                // permission error rather than with "already exists". The
+                // holder is on its way out, so wait for it as usual. The same
+                // error with no lock file there is our own problem, not a race.
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && lock.exists() => {}
                 Err(e) => return Err(e),
             }
             let stale = fs::metadata(lock)
