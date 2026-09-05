@@ -21,6 +21,8 @@ pub enum Mode {
     Stateful,
     /// Plain JSON replies, no session.
     Stateless,
+    /// Stateless, and the initialize result names a version other than the client's.
+    OlderProtocol,
     /// 401 with a challenge unless a valid bearer token is presented.
     Auth { tokens: Vec<String> },
     /// Like `Auth`, but registration refuses http://127.0.0.1 (Doorkeeper's default
@@ -350,9 +352,13 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     }
 
     let params = &msg["params"];
+    let agreed_version = match mode {
+        Mode::OlderProtocol => "2024-11-05",
+        _ => "2025-06-18",
+    };
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
-            "protocolVersion":"2025-06-18","capabilities":{"tools":{}},
+            "protocolVersion":agreed_version,"capabilities":{"tools":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
