@@ -11,4 +11,4 @@ exit 1
   "isError": true
 }
 --- stderr
-{"hint":"usage: mcpdial call echo strict '{\"pageId\": <number>}'\n  pageId: number (required)"}
+{"hint":"usage: mcpdial call echo strict '{\"pageId\": <number>}'\n   or: mcpdial call echo strict pageId=<number>\n  pageId: number (required)"}

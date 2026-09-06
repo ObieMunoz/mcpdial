@@ -1,0 +1,7 @@
+$ mcpdial prompt web summarize text=a memo
+exit 0
+--- stdout
+user: Summarize this: a memo
+assistant: Sure.
+--- stderr
+Summarize a document.

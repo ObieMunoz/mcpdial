@@ -23,7 +23,9 @@
 //! `guide` is compared with `docs/AGENTS.md` directly, and `completions` (a
 //! script clap generates from the argument parser, which every new flag
 //! changes) is checked for the registration line alone. Clap's own usage
-//! errors are left out for the same reason.
+//! errors are left out for the same reason, and `serve` because it is a
+//! server: it runs until it is killed, and what it prints comes from the
+//! library rather than the presenter.
 
 mod common;
 
@@ -479,6 +481,12 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("prompts-none", &["prompts", "echo"]),
         // Calling.
         Case::both("call", &["call", "web", "add", r#"{"a":40,"b":2}"#]),
+        Case::both("call-pairs", &["call", "web", "add", "a=40", "b=2"]),
+        Case::both(
+            "call-pairs-json",
+            &["call", "echo", "echo", r#"message:="typed""#],
+        ),
+        Case::both("call-pairs-mixed", &["call", "web", "add", "a=1", "{}"]),
         Case::both(
             "call-stdio",
             &["call", "echo", "echo", r#"{"message":"hi"}"#],
@@ -527,8 +535,9 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
             "prompt-unquoted",
             &["prompt", "web", "summarize", "{text:memo}"],
         ),
+        Case::both("prompt-pairs", &["prompt", "web", "summarize", "text=a memo"]),
         Case::both("shell", &["shell", "web"]).stdin(
-            "tools\ncall add {\"a\":1,\"b\":2}\nnope\ncall nope\ncall add\nresources\n\
+            "tools\ncall add {\"a\":1,\"b\":2}\ncall add a=5 b=6\nnope\ncall nope\ncall add\nresources\n\
              prompts\nprompt greet\nread file:///readme.md\ninfo\nhelp\nhelp add\n\
              schema add\nraw tools/list\nadd\n# a comment\n\nquit\n",
         ),

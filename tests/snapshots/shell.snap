@@ -5,6 +5,7 @@ exit 1
   echo                         Echo a message back.
   add                          Add two numbers.
 The sum of 1 and 2 is 3.
+The sum of 5 and 6 is 11.
 The sum of 0 and 0 is 0.
 2 resource(s):
   file:///readme.md                            The project readme.
@@ -94,6 +95,7 @@ commands (one per line; # starts a comment):
   schema TOOL                one tool's full JSON input schema
   help [TOOL]                this list, or one tool's parameters
   call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
+  call TOOL arg=value        the same, as pairs the tool's schema types
   resources [--long]         every resource, then every URI template
   read URI                   one resource's contents
   prompts [--long]           every prompt this server offers
@@ -105,9 +107,11 @@ commands (one per line; # starts a comment):
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.
 usage: call add {"a": <number>, "b": <number>}
+   or: call add a=<number> b=<number>
   a: number (required)
   b: number (required)
 error: add is a tool, not a command
 usage: call add {"a": <number>, "b": <number>}
+   or: call add a=<number> b=<number>
   a: number (required)
   b: number (required)

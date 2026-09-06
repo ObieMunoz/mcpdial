@@ -1,0 +1,5 @@
+$ mcpdial call echo echo message:="typed"
+exit 0
+--- stdout
+Echo: typed
+--- stderr

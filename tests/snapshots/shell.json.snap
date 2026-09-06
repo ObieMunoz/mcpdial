@@ -3,6 +3,7 @@ exit 1
 --- stdout
 {"tools":[{"description":"Echo a message back.\nSecond line.","inputSchema":{"properties":{"message":{"description":"What to echo","type":"string"}},"required":["message"],"type":"object"},"name":"echo"},{"annotations":{"idempotentHint":true},"description":"Add two numbers.","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"name":"add","outputSchema":{"properties":{"sum":{"type":"number"}},"required":["sum"],"type":"object"}}]}
 {"content":[{"text":"The sum of 1 and 2 is 3.","type":"text"}],"structuredContent":{"sum":3.0}}
+{"content":[{"text":"The sum of 5 and 6 is 11.","type":"text"}],"structuredContent":{"sum":11.0}}
 {"error":{"hint":"commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, resources, read URI, prompts, prompt NAME, raw METHOD, info, help, quit","kind":"usage","message":"unknown command \"nope\""}}
 {"error":{"code":-32602,"hint":"`tools` lists all 2 tools on this server.","kind":"rpc","message":"MCP error -32602: Tool nope not found"}}
 {"content":[{"text":"The sum of 0 and 0 is 0.","type":"text"}],"structuredContent":{"sum":0.0}}
@@ -13,13 +14,14 @@ exit 1
 {"capabilities":{"prompts":{},"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake-mcp","version":"1.0"}}
 {"annotations":{"idempotentHint":true},"description":"Add two numbers.","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"name":"add","outputSchema":{"properties":{"sum":{"type":"number"}},"required":["sum"],"type":"object"}}
 {"nextCursor":"page-2","tools":[{"description":"Echo a message back.\nSecond line.","inputSchema":{"properties":{"message":{"description":"What to echo","type":"string"}},"required":["message"],"type":"object"},"name":"echo"}]}
-{"error":{"hint":"usage: call add {\"a\": <number>, \"b\": <number>}\n  a: number (required)\n  b: number (required)","kind":"usage","message":"add is a tool, not a command"}}
+{"error":{"hint":"usage: call add {\"a\": <number>, \"b\": <number>}\n   or: call add a=<number> b=<number>\n  a: number (required)\n  b: number (required)","kind":"usage","message":"add is a tool, not a command"}}
 --- stderr
 commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
   schema TOOL                one tool's full JSON input schema
   help [TOOL]                this list, or one tool's parameters
   call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
+  call TOOL arg=value        the same, as pairs the tool's schema types
   resources [--long]         every resource, then every URI template
   read URI                   one resource's contents
   prompts [--long]           every prompt this server offers
@@ -31,5 +33,6 @@ commands (one per line; # starts a comment):
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.
 usage: call add {"a": <number>, "b": <number>}
+   or: call add a=<number> b=<number>
   a: number (required)
   b: number (required)

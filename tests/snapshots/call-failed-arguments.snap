@@ -5,4 +5,5 @@ MCP error -32602: Invalid arguments for tool strict: Required at pageId
 --- stderr
 (tool reported an error)
 usage: mcpdial call echo strict '{"pageId": <number>}'
+   or: mcpdial call echo strict pageId=<number>
   pageId: number (required)

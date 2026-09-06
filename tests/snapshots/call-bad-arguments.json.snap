@@ -2,4 +2,4 @@ $ mcpdial --json call echo echo {}
 exit 1
 --- stdout
 --- stderr
-{"error":{"code":-32602,"hint":"usage: mcpdial call echo echo '{\"message\": \"<string>\"}'\n  message: string (required)","kind":"rpc","message":"MCP error -32602: Invalid arguments for tool echo: Required at message"}}
+{"error":{"code":-32602,"hint":"usage: mcpdial call echo echo '{\"message\": \"<string>\"}'\n   or: mcpdial call echo echo message=<string>\n  message: string (required)","kind":"rpc","message":"MCP error -32602: Invalid arguments for tool echo: Required at message"}}

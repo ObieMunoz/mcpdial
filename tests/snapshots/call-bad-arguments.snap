@@ -4,4 +4,5 @@ exit 1
 --- stderr
 error: MCP error -32602: Invalid arguments for tool echo: Required at message
 usage: mcpdial call echo echo '{"message": "<string>"}'
+   or: mcpdial call echo echo message=<string>
   message: string (required)
