@@ -8,7 +8,9 @@
 - A **target** is a saved server name (`mcpdial ls --json` lists them), an `http(s)://`
   URL, or `stdio:<command line>` for a local process.
 - Every invocation is a full session: connect, `initialize`, do one thing, exit. Use
-  `shell` when state must survive between calls (a browser, a database cursor, a REPL).
+  `shell` when state must survive between calls (a browser, a database cursor, a REPL),
+  or `start NAME` to keep a saved stdio server running so that separate invocations
+  share it.
 - The tool never prompts, except `token set` with no stdin and a TTY. `login` opens a
   browser and waits for a human; do not run it unattended without `--no-browser`.
 
@@ -16,7 +18,8 @@
 
 1. **What is available.** `mcpdial ls --json` returns one object per saved server with
    `status.state` (`connected`, `auth_required`, `token_rejected`, `blocked`, `http`,
-   `unreachable`, `error`), `server` (name and version), and `tools` (count).
+   `unreachable`, `error`), `server` (name and version), `tools` (count), and
+   `running` (true while a `start` daemon holds the server open).
 2. **What a server can do.** `mcpdial tools TARGET --json` returns `{"tools": [...]}`
    with each tool's `name`, `description`, and full `inputSchema`. For one tool,
    `mcpdial schema TARGET TOOL` returns just that object.
@@ -25,7 +28,15 @@
    content blocks are printed as plain text, one per line, and a result with `isError`
    set is followed by `(tool reported an error)` on stderr.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
-   and prints one JSON line per command. Send `quit` or close stdin to finish.
+   and prints one JSON line per command. Send `quit` or close stdin to finish. When
+   each command has to be its own invocation, `mcpdial start NAME [--idle SECS]`
+   keeps a saved stdio server running in the background and prints
+   `started NAME (pid N)` (`--json`: `{"name","pid","socket"}`); every later command
+   naming NAME shares that one session until `mcpdial stop NAME`. Requests are
+   served one caller at a time, so concurrent invocations queue rather than fail.
+   `--no-daemon` on a command, or `MCPDIAL_NO_DAEMON=1`, dials a fresh process
+   instead. A daemon that was killed leaves a socket behind; the next command removes
+   it with a `note:` line on stderr and dials. Unix only: on Windows `start` exits 2.
 5. **Add what is missing.** `mcpdial catalog --json` lists a reviewed set of servers,
    each with an `id`, a `category`, a `transport` and an `auth` (`none`, `oauth`,
    `api-key`, `env`); `mcpdial add NAME --catalog ID` saves one. Beyond the catalog,

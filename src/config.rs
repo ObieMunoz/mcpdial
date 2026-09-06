@@ -6,6 +6,7 @@
 //! servers.json      what you configured: transport, URL or command, headers
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
 //! probes.json       what `ls` last saw: one status per server, with its timestamp
+//! run/NAME.sock     where a server kept alive by `start` listens, see [`crate::daemon`]
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
 //! ```
 //!
@@ -373,6 +374,11 @@ impl Store {
     }
     pub fn probes_path(&self) -> PathBuf {
         self.dir.join("probes.json")
+    }
+    /// Where running daemons listen, one socket per server. Created by the
+    /// daemon, and only for its owner to enter.
+    pub fn run_dir(&self) -> PathBuf {
+        self.dir.join("run")
     }
 
     // -- servers -------------------------------------------------------------

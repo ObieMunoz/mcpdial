@@ -8,9 +8,9 @@ use super::{silent, Logger, Transport};
 use crate::protocol::{answer, classify, Error, Incoming, Result};
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -19,14 +19,137 @@ use std::time::Duration;
 /// How many trailing stderr lines to keep for the post-mortem.
 const STDERR_TAIL: usize = 12;
 
-pub struct StdioTransport {
-    child: Child,
-    stdin: Option<ChildStdin>,
+/// Newline-delimited JSON-RPC over a pair of byte streams: what a stdio server
+/// speaks on its pipes, and what a daemon relays over a socket. The reader runs
+/// on its own thread so a hung peer honours the timeout instead of blocking a
+/// `read_line` forever; the channel closes when the peer does.
+pub(crate) struct Framed {
+    writer: Option<Box<dyn Write + Send>>,
     lines: Receiver<String>,
-    /// The server's most recent stderr lines, shown when it dies without replying.
-    stderr_tail: Arc<Mutex<VecDeque<String>>>,
     timeout: Duration,
     log: Logger,
+    /// What the two directions are called in trace output.
+    to: &'static str,
+    from: &'static str,
+}
+
+impl Framed {
+    pub(crate) fn new(
+        writer: impl Write + Send + 'static,
+        reader: impl Read + Send + 'static,
+        (to, from): (&'static str, &'static str),
+        timeout: Duration,
+        log: Logger,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(reader)
+                .lines()
+                .map_while(std::result::Result::ok)
+            {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            writer: Some(Box::new(writer)),
+            lines: rx,
+            timeout,
+            log,
+            to,
+            from,
+        }
+    }
+
+    fn write_line(&mut self, body: &str) -> io::Result<()> {
+        let Some(w) = self.writer.as_mut() else {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "already closed"));
+        };
+        writeln!(w, "{body}")?;
+        w.flush()
+    }
+
+    /// Send EOF. What the peer does with it is its own affair.
+    pub(crate) fn close_writer(&mut self) {
+        self.writer = None;
+    }
+
+    /// Put one message on the wire and, for a request, wait for its answer.
+    ///
+    /// `gone` says what it means that the peer closed the stream or refused the
+    /// write; whoever owns the peer knows that better than this loop does.
+    /// `forward` sees every request and notification the peer sends on the way,
+    /// and may supply the reply to a request; otherwise [`answer`] does. The
+    /// peer may well be blocked on that reply, so waiting quietly for our own id
+    /// would deadlock both ends.
+    pub(crate) fn exchange(
+        &mut self,
+        payload: &Value,
+        gone: &mut dyn FnMut() -> Error,
+        forward: &mut dyn FnMut(&Value) -> Option<Value>,
+    ) -> Result<Option<Value>> {
+        let body = payload.to_string();
+        (self.log)(&format!("-> {}\n   {body}", self.to));
+        if self.write_line(&body).is_err() {
+            return Err(gone());
+        }
+        let id = match payload.get("id") {
+            Some(id) if payload.get("method").is_some() => id,
+            // A notification, or our reply to something the peer asked: nothing comes back.
+            _ => return Ok(None),
+        };
+
+        loop {
+            let line = match self.lines.recv_timeout(self.timeout) {
+                Ok(l) => l,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(Error::transport(format!(
+                        "no reply after {}s",
+                        self.timeout.as_secs_f64()
+                    )))
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err(gone()),
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let from = self.from;
+            let Ok(msg) = serde_json::from_str::<Value>(line) else {
+                (self.log)(&format!("<- {from} (ignored, not JSON)\n   {line}"));
+                continue;
+            };
+            match classify(&msg, Some(id)) {
+                Incoming::Response => {
+                    (self.log)(&format!("<- {from}\n   {line}"));
+                    return Ok(Some(msg));
+                }
+                Incoming::ServerRequest { id: theirs, method } => {
+                    (self.log)(&format!("<- {from} (server request)\n   {line}"));
+                    let reply = forward(&msg)
+                        .unwrap_or_else(|| answer(theirs, method))
+                        .to_string();
+                    (self.log)(&format!("-> {}\n   {reply}", self.to));
+                    if self.write_line(&reply).is_err() {
+                        return Err(gone());
+                    }
+                }
+                Incoming::Notification { .. } => {
+                    (self.log)(&format!("<- {from} (other message)\n   {line}"));
+                    forward(&msg);
+                }
+                Incoming::Foreign => (self.log)(&format!("<- {from} (other message)\n   {line}")),
+            }
+        }
+    }
+}
+
+pub struct StdioTransport {
+    child: Child,
+    framed: Framed,
+    /// The server's most recent stderr lines, shown when it dies without replying.
+    stderr_tail: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl StdioTransport {
@@ -65,7 +188,7 @@ impl StdioTransport {
             .spawn()
             .map_err(|e| Error::transport(format!("could not start {program:?}: {e}")))?;
 
-        let stdin = child.stdin.take();
+        let stdin = child.stdin.take().expect("stdin is piped");
         let stdout = child.stdout.take().expect("stdout is piped");
         let stderr = child.stderr.take().expect("stderr is piped");
 
@@ -91,27 +214,16 @@ impl StdioTransport {
             });
         }
 
-        // Read stdout on a thread so a hung server honours the timeout instead of
-        // blocking forever on read_line. The channel closes when the server exits.
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stdout)
-                .lines()
-                .map_while(std::result::Result::ok)
-            {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
         Ok(Self {
             child,
-            stdin,
-            lines: rx,
+            framed: Framed::new(
+                stdin,
+                stdout,
+                ("stdin", "stdout"),
+                timeout,
+                log.unwrap_or_else(silent),
+            ),
             stderr_tail,
-            timeout,
-            log: log.unwrap_or_else(silent),
         })
     }
 
@@ -125,49 +237,51 @@ impl StdioTransport {
         let argv = split_command(command)?;
         Self::spawn(&argv, timeout, forward_stderr, log)
     }
+
+    /// [`Transport::send`], except that a request the server makes on the way is
+    /// offered to `forward` before being answered here. A relay with a foreground
+    /// process to hand it to wants that; nothing else does.
+    pub fn exchange(
+        &mut self,
+        payload: &Value,
+        forward: &mut dyn FnMut(&Value) -> Option<Value>,
+    ) -> Result<Option<Value>> {
+        let Self {
+            child,
+            framed,
+            stderr_tail,
+        } = self;
+        framed.exchange(payload, &mut || post_mortem(child, stderr_tail), forward)
+    }
+
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
 }
 
-impl StdioTransport {
-    /// Put one JSON-RPC message on the child's stdin, newline-framed.
-    fn write_line(&mut self, body: &str) -> Result<()> {
-        let Some(stdin) = self.stdin.as_mut() else {
-            return Err(Error::transport("stdin already closed"));
-        };
-        if writeln!(stdin, "{body}")
-            .and_then(|_| stdin.flush())
-            .is_ok()
-        {
-            return Ok(());
+/// The server went away before answering. Say how it exited and what it said.
+fn post_mortem(child: &mut Child, stderr_tail: &Mutex<VecDeque<String>>) -> Error {
+    // Give the stderr reader a moment to drain what the process wrote on its way out.
+    let status = match wait_up_to(child, Duration::from_millis(500)) {
+        Some(st) => match st.code() {
+            Some(c) => format!("exited with status {c}"),
+            None => "was killed by a signal".to_string(),
+        },
+        None => "closed stdout but is still running".to_string(),
+    };
+    thread::sleep(Duration::from_millis(50));
+    let tail = stderr_tail.lock().unwrap();
+    let mut msg = format!("server {status} before replying");
+    if tail.is_empty() {
+        msg.push_str(" (it wrote nothing to stderr)");
+    } else {
+        msg.push_str(". Its last stderr lines:");
+        for line in tail.iter() {
+            msg.push_str("\n  | ");
+            msg.push_str(line);
         }
-        // A server that died on startup gets the write refused rather than the read,
-        // and its exit status and stderr say far more than the broken pipe does.
-        Err(self.post_mortem())
     }
-
-    /// The server went away before answering. Say how it exited and what it said.
-    fn post_mortem(&mut self) -> Error {
-        // Give the stderr reader a moment to drain what the process wrote on its way out.
-        let status = match wait_up_to(&mut self.child, Duration::from_millis(500)) {
-            Some(st) => match st.code() {
-                Some(c) => format!("exited with status {c}"),
-                None => "was killed by a signal".to_string(),
-            },
-            None => "closed stdout but is still running".to_string(),
-        };
-        thread::sleep(Duration::from_millis(50));
-        let tail = self.stderr_tail.lock().unwrap();
-        let mut msg = format!("server {status} before replying");
-        if tail.is_empty() {
-            msg.push_str(" (it wrote nothing to stderr)");
-        } else {
-            msg.push_str(". Its last stderr lines:");
-            for line in tail.iter() {
-                msg.push_str("\n  | ");
-                msg.push_str(line);
-            }
-        }
-        Error::transport(msg)
-    }
+    Error::transport(msg)
 }
 
 fn wait_up_to(child: &mut Child, dur: Duration) -> Option<std::process::ExitStatus> {
@@ -185,56 +299,11 @@ fn wait_up_to(child: &mut Child, dur: Duration) -> Option<std::process::ExitStat
 
 impl Transport for StdioTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
-        let body = payload.to_string();
-        (self.log)(&format!("-> stdin\n   {body}"));
-        self.write_line(&body)?;
-
-        let Some(id) = payload.get("id") else {
-            return Ok(None); // notification: nothing comes back
-        };
-
-        // Skip log lines and unrelated notifications until our id lands - but
-        // answer anything the server asks on the way. It may well be blocked on
-        // that answer, in which case waiting quietly deadlocks both ends.
-        loop {
-            let line = match self.lines.recv_timeout(self.timeout) {
-                Ok(l) => l,
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(Error::transport(format!(
-                        "no reply after {}s",
-                        self.timeout.as_secs_f64()
-                    )))
-                }
-                Err(RecvTimeoutError::Disconnected) => return Err(self.post_mortem()),
-            };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(msg) = serde_json::from_str::<Value>(line) else {
-                (self.log)(&format!("<- stdout (ignored, not JSON)\n   {line}"));
-                continue;
-            };
-            match classify(&msg, Some(id)) {
-                Incoming::Response => {
-                    (self.log)(&format!("<- stdout\n   {line}"));
-                    return Ok(Some(msg));
-                }
-                Incoming::ServerRequest { id: theirs, method } => {
-                    (self.log)(&format!("<- stdout (server request)\n   {line}"));
-                    let reply = answer(theirs, method).to_string();
-                    (self.log)(&format!("-> stdin\n   {reply}"));
-                    self.write_line(&reply)?;
-                }
-                Incoming::Notification { .. } | Incoming::Foreign => {
-                    (self.log)(&format!("<- stdout (other message)\n   {line}"))
-                }
-            }
-        }
+        self.exchange(payload, &mut |_| None)
     }
 
     fn close(&mut self) {
-        drop(self.stdin.take());
+        self.framed.close_writer();
         // Give a well-behaved server a moment to exit on EOF, then insist.
         for _ in 0..50 {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
