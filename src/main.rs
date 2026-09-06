@@ -16,6 +16,7 @@ use mcpdial::{
 };
 use notices::Notices;
 use output::{As, Output, Payload};
+use present::style::ColorMode;
 use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -79,6 +80,11 @@ struct Cli {
     /// (MCPDIAL_PAGER= does the same everywhere)
     #[arg(long, global = true)]
     no_pager: bool,
+
+    /// Colour the terminal output: `always` (for `less -R`), `never`, or `auto`
+    /// (at a terminal, unless NO_COLOR is set)
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
+    color: ColorMode,
 
     /// Trace every message on stderr (and pass a stdio server's stderr through)
     #[arg(short, long, global = true)]

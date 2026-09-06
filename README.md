@@ -172,8 +172,10 @@ request once more, `--progress` to print a line on stderr for every progress
 notification a server sends during a call, `--log-level LEVEL` to move the line a
 server's own log messages print from, `--max-chars N` (or `MCPDIAL_MAX_CHARS=N`) and
 `--output FILE` (`-o`) to keep a large result out of a context window, `--plain` (or
-`MCPDIAL_PLAIN=1`) to print at a terminal exactly what a pipe would get, and
-`--no-pager` to print long output straight to the terminal.
+`MCPDIAL_PLAIN=1`) to print at a terminal exactly what a pipe would get, `--no-pager`
+to print long output straight to the terminal, and `--color always|never|auto` to say
+when to colour: `auto`, the default, colours at a terminal unless `NO_COLOR` is set,
+and `always` colours into a pipe for `less -R`.
 
 `--max-chars` and `--output` apply to `call`, `prompt`, `read`, `raw` and `shell`.
 A result over the bound is cut between characters, never inside one; under `--json`
@@ -188,9 +190,11 @@ detail.
 What a pipe gets is frozen. Everything mcpdial prints goes through one of two
 presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
 `MCPDIAL_PLAIN` and for `TERM=dumb`, is the same bytes release after release, and
-`Rich`, chosen only for a person at a terminal, is the one place the output may
-differ: JSON (`schema`, `info`, `raw`, a tool's `structuredContent`) comes with its
-keys, strings, numbers, booleans and null in colour, which `NO_COLOR` turns off. A
+`Rich`, chosen for a person at a terminal and for the pipe that asked for colour
+with `--color always`, is the one place the output may differ: the `STATUS` column
+of `ls` and the `error:` prefix carry their meaning in colour, and JSON (`schema`,
+`info`, `raw`, a tool's `structuredContent`) comes with its keys, strings, numbers,
+booleans and null in colour. `NO_COLOR`, and `--color never`, turn all of it off. A
 snapshot test holds `Plain` to its word; see Development below.
 
 At a terminal, the output of `call`, `read`, `prompt`, `raw`, `schema`, `tools

@@ -694,6 +694,7 @@ fn under_pty(home: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Vec<u8>)
         .env_remove("MCPDIAL_JSON")
         .env_remove("MCPDIAL_TIMEOUT")
         .env_remove("MCPDIAL_USER_AGENT")
+        .env_remove("NO_COLOR")
         .env("TERM", "xterm")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -731,9 +732,9 @@ fn snapshot_stdout(name: &str) -> String {
 
 /// `MCPDIAL_PLAIN=1` at a terminal is the pipe, byte for byte; so is `--plain`
 /// and so is `TERM=dumb`. Without any of them a terminal gets `Rich`, which is
-/// only observable so far where it refuses to put a binary resource on the
-/// screen, and only in a build with the `rich` feature. The `script` that
-/// makes the terminal is a unix tool, so Windows skips this.
+/// observable where it refuses to put a binary resource on the screen, with
+/// the `error:` prefix in colour, and only in a build with the `rich` feature.
+/// The `script` that makes the terminal is a unix tool, so Windows skips this.
 #[test]
 fn a_terminal_asked_for_plain_output_gets_the_piped_bytes() {
     if !cfg!(unix) {
@@ -801,7 +802,9 @@ fn a_terminal_asked_for_plain_output_gets_the_piped_bytes() {
     if cfg!(feature = "rich") {
         assert_eq!(code, 2, "{shown}");
         assert!(
-            shown.contains("error: this resource is binary and stdout is a terminal"),
+            shown.contains(
+                "\x1b[1;31merror:\x1b[0m this resource is binary and stdout is a terminal"
+            ),
             "{shown}"
         );
         assert!(
