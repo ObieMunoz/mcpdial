@@ -1,6 +1,7 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use complete::ShellHelper;
+use history::{History, Keep, Origin, Recorded};
 use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
@@ -25,7 +26,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 mod args;
@@ -34,6 +35,7 @@ mod browse;
 mod complete;
 mod env_defaults;
 mod grep;
+mod history;
 mod notices;
 mod output;
 mod pick;
@@ -1370,20 +1372,34 @@ fn emit(
     render: Render,
 ) -> Result<(), Failure> {
     let text = rendered(ui, result, json, files, render)?;
+    emit_rendered(ui, out, result, &text, json, compact)
+}
+
+/// The tail of [`emit`]: a result and the text already made of it, on stdout.
+/// `show` takes this way too, with the text the result was first printed as,
+/// so that reprinting one costs neither a request nor a second file of media.
+fn emit_rendered(
+    ui: &dyn Presenter,
+    out: &Output,
+    result: &Value,
+    text: &str,
+    json: bool,
+    compact: bool,
+) -> Result<(), Failure> {
     let payload = if json {
         Payload::Json {
             value: result,
             one_line: compact,
         }
     } else {
-        Payload::Text(&text)
+        Payload::Text(text)
     };
     let sent = out.deliver(payload, false)?;
     output::show(ui, sent, shape(json), json, || {
         if json {
             print_value(ui, result, compact);
         } else if !text.is_empty() {
-            ui.text(&text);
+            ui.text(text);
         }
     });
     Ok(())
@@ -1525,6 +1541,10 @@ const SHELL_COMMANDS: &[&str] = &[
     "prompt",
     "raw",
     "elicit",
+    "show",
+    "save",
+    "retry",
+    "edit",
     "info",
     "help",
     "quit",
@@ -1596,6 +1616,245 @@ fn shell_fill(
     let schema =
         find_tool(shell_tools(cache, conn), tool).map_or(Value::Null, |t| t["inputSchema"].clone());
     prompt::fill(ui, &schema, arguments, &format!("call {tool}"))
+}
+
+/// What a `save` line calls itself in the errors it makes, where `--output`
+/// names the flag.
+const SAVE: &str = "save";
+
+const SHOW_USAGE: &str = "usage: show N   (_ is the last result, $3 and 3 the third)";
+const SAVE_USAGE: &str =
+    "usage: save N [FILE]   (without a file, one named after the tool and its media type)";
+const RETRY_USAGE: &str =
+    "usage: retry [TOOL] [key=value ...]   (the last call, with those arguments changed)";
+const EDIT_USAGE: &str =
+    "usage: edit [N]   (opens a call's arguments in $EDITOR and runs it again on save)";
+
+/// The first word of what follows a command, and the rest of the line, both
+/// trimmed. Unlike [`name_and_args`] nothing stands in for a part that is not
+/// there: these commands take a bare word, not a JSON object.
+fn split_word(rest: &str) -> (&str, &str) {
+    rest.split_once(char::is_whitespace)
+        .map_or((rest, ""), |(word, more)| (word, more.trim()))
+}
+
+/// The parts of a `shell` session one line changes: the connection, what the
+/// session has learned about the server, and what it has printed.
+struct Live<'a, 'b> {
+    conn: &'a mut client::Connection,
+    notices: &'a mut Notices<'b>,
+    /// tools/list, fetched at most once per session, so a mistake can be
+    /// answered with the shape the server actually wants.
+    tools: &'a mut Option<Vec<Value>>,
+    results: &'a mut History,
+}
+
+/// One `call` at the shell, from the arguments it settled on to the result filed
+/// under the number printed before it. The tool list travels with it because a
+/// tool that refuses a call is answered with the shape it wanted instead.
+fn shell_call(
+    ui: &dyn Presenter,
+    out: &Output,
+    live: &mut Live<'_, '_>,
+    tool: &str,
+    arguments: Value,
+    json: bool,
+    save_dir: Option<&Path>,
+) -> Result<(), Failure> {
+    // What went out, kept before the answer comes back: a call that failed is
+    // the one most worth running again.
+    live.results.sending(tool, &arguments);
+    let sent = arguments.clone();
+    let mut result = match watched(live.notices, |w| {
+        live.conn.session.call_tool_watching(tool, arguments, w)
+    }) {
+        Ok(result) => result,
+        Err(e) => {
+            let hint = server_refused(&e)
+                .then(|| shell_call_hint(live.tools, live.conn, tool, is_argument_error(&e)))
+                .flatten();
+            return Err(Failure {
+                error: e,
+                hint,
+                tool: None,
+            });
+        }
+    };
+    let files = MediaFiles {
+        dir: save_dir,
+        stem: file_stem(tool),
+    };
+    let text = rendered(ui, &mut result, json, &files, render_content)?;
+    ui.numbered(live.results.next_number());
+    let outcome = match ui.paged(|| print_tool_result(ui, out, &result, &text, json, true)) {
+        Err(f) => Err(f),
+        Ok(failed) => {
+            if failed {
+                let argument_error = reads_as_argument_error(&text);
+                if let Some(hint) = shell_call_hint(live.tools, live.conn, tool, argument_error) {
+                    print_hint(ui, &hint, json);
+                }
+            }
+            Ok(())
+        }
+    };
+    live.results.record(
+        Origin::Call {
+            tool: tool.to_string(),
+            arguments: sent,
+        },
+        result,
+        text,
+    );
+    outcome
+}
+
+/// A recorded result printed again, the way the line that first printed it did:
+/// the same text, the same object, the same bytes. Nothing is re-rendered, so a
+/// `--save-dir` gains no second copy of an image already filed.
+fn shell_show(
+    ui: &dyn Presenter,
+    out: &Output,
+    rec: &Recorded,
+    json: bool,
+    target: &str,
+) -> Result<(), Failure> {
+    match &rec.origin {
+        Origin::Call { .. } => {
+            print_tool_result(ui, out, &rec.result, &rec.text, json, true).map(|_| ())
+        }
+        Origin::Prompt { .. } => emit_rendered(ui, out, &rec.result, &rec.text, json, true),
+        Origin::Raw { .. } => {
+            print_value(ui, &rec.result, json);
+            Ok(())
+        }
+        Origin::Read { .. } if json => emit_rendered(ui, out, &rec.result, &rec.text, json, true),
+        Origin::Read { uri } => {
+            let bodies = resource_bodies(&rec.result)?;
+            let sent = out.deliver_resource(&bodies)?;
+            let redirect = format!("mcpdial read {} {}", shell_word(target), uri);
+            let mut refused = Ok(());
+            output::show(ui, sent, As::Raw, json, || {
+                refused = ui.resource(&bodies, &redirect);
+            });
+            refused
+        }
+    }
+}
+
+/// One recorded result in a file, written through the sink `--output` writes
+/// through: a file already there, a path that is a directory and a directory
+/// that cannot be written are refused in the same words, and the line left
+/// behind counts the same units. An empty `file` names one after the tool and
+/// the media type instead.
+fn shell_save(ui: &dyn Presenter, rec: &Recorded, file: &str, json: bool) -> Result<(), Failure> {
+    let keep = rec.keep(json)?;
+    let path = match file.is_empty() {
+        true => PathBuf::from(rec.filename(&keep)),
+        false => PathBuf::from(file),
+    };
+    output::reserve(SAVE, &path)?;
+    let sink = Output::to_path(SAVE, path, json);
+    let sent = match &keep {
+        Keep::Document => sink.deliver(
+            Payload::Json {
+                value: &rec.result,
+                one_line: true,
+            },
+            rec.failed(),
+        )?,
+        Keep::Text => sink.deliver(Payload::Text(&rec.text), rec.failed())?,
+        Keep::Bytes { bytes, .. } => sink.deliver(Payload::Bytes(bytes), rec.failed())?,
+        Keep::Bodies { bodies, .. } => sink.deliver_resource(bodies)?,
+    };
+    output::show(ui, sent, As::Text, json, || {});
+    Ok(())
+}
+
+/// The line a `retry` or an `edit` is about to run, said the way it would have
+/// been typed, so that what went out is on the screen beside what comes back.
+fn print_rerun(ui: &dyn Presenter, line: &str, json: bool) {
+    if json {
+        ui.err_line(&json!({ "rerun": line }).to_string());
+    } else {
+        ui.aside(line);
+    }
+}
+
+/// The call an `edit` line names: the one that made result N, or the last call
+/// of the session where it names nothing.
+fn edit_target(results: &History, named: &str) -> Result<(String, Value), Error> {
+    if named.is_empty() {
+        return results
+            .last_call(None)
+            .map(|(tool, arguments)| (tool.to_string(), arguments.clone()))
+            .ok_or_else(|| Error::usage("no call in this session yet to edit"));
+    }
+    let rec = results.find(named)?;
+    match &rec.origin {
+        Origin::Call { tool, arguments } => Ok((tool.clone(), arguments.clone())),
+        other => Err(Error::usage(format!(
+            "result {} came from {}, and edit re-runs a call",
+            rec.number,
+            other.command()
+        ))),
+    }
+}
+
+/// The arguments of a call as `$VISUAL` or `$EDITOR` leaves them. The file is
+/// this process's own, made where it cannot already exist and removed however
+/// the editor goes; an editor that exits badly, or leaves nothing behind, sends
+/// no call at all.
+fn edit_arguments(tool: &str, arguments: &Value) -> Result<Value, Error> {
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
+        .ok_or_else(|| {
+            Error::usage("edit needs an editor: set $EDITOR (or $VISUAL) to the one you use")
+        })?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let path = std::env::temp_dir().join(format!(
+        "mcpdial-edit-{}-{}-{unique}.json",
+        file_stem(tool),
+        std::process::id()
+    ));
+    let document = output::document(arguments, false);
+    output::create("edit", &path, document.as_bytes())?;
+    let edited = run_editor(&editor, &path).and_then(|()| read_arguments(&path));
+    std::fs::remove_file(&path).ok();
+    edited
+}
+
+fn run_editor(editor: &str, path: &Path) -> Result<(), Error> {
+    let mut words = mcpdial::transport::stdio::split_command(editor)?;
+    if words.is_empty() {
+        return Err(Error::usage(format!("edit: {editor:?} is not a command")));
+    }
+    let program = words.remove(0);
+    let status = Command::new(&program)
+        .args(&words)
+        .arg(path)
+        .status()
+        .map_err(|e| Error::usage(format!("edit: cannot run {program}: {e}")))?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(Error::usage(format!(
+        "edit: {program} exited without saving; nothing was sent"
+    )))
+}
+
+fn read_arguments(path: &Path) -> Result<Value, Error> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| Error::usage(format!("edit {}: {e}", path.display())))?;
+    if text.trim().is_empty() {
+        return Err(Error::usage(
+            "edit: the file was left empty; nothing was sent",
+        ));
+    }
+    parse_object(&text, "arguments")
 }
 
 /// Where shell input comes from. A terminal gets line editing, history and
@@ -2205,7 +2464,20 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 );
             }
             let info_cmd = "`info`";
-            while let Some(raw) = input.next(ui)? {
+            // Every result this session prints, numbered, so a later line can
+            // name one instead of running it again.
+            let mut results = History::default();
+            // The line a `retry` or an `edit` made, which stands in for one
+            // nobody typed: the loop reads it before asking for another.
+            let mut pending: Option<String> = None;
+            loop {
+                let raw = match pending.take() {
+                    Some(line) => line,
+                    None => match input.next(ui)? {
+                        Some(line) => line,
+                        None => break,
+                    },
+                };
                 let text = raw.trim();
                 if text.is_empty() || text.starts_with('#') {
                     continue;
@@ -2303,7 +2575,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 dir: save_dir,
                                 stem: resource_stem(rest),
                             };
-                            ui.paged(|| {
+                            ui.numbered(results.next_number());
+                            let shown = ui.paged(|| {
                                 emit_resource(
                                     ui,
                                     &out,
@@ -2313,7 +2586,18 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     &files,
                                     &redirect,
                                 )
-                            })
+                            });
+                            // Recorded however it printed: a presenter that
+                            // refuses bytes at a terminal leaves `save` as the
+                            // way to have them.
+                            results.record(
+                                Origin::Read {
+                                    uri: rest.to_string(),
+                                },
+                                result,
+                                String::new(),
+                            );
+                            shown
                         }
                     },
                     "prompts" => match conn.session.list_prompts() {
@@ -2355,17 +2639,25 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         dir: save_dir,
                                         stem: file_stem(name),
                                     };
-                                    ui.paged(|| {
-                                        emit(
-                                            ui,
-                                            &out,
-                                            &mut result,
-                                            cli.json,
-                                            true,
-                                            &files,
-                                            render_messages,
-                                        )
-                                    })
+                                    let text = rendered(
+                                        ui,
+                                        &mut result,
+                                        cli.json,
+                                        &files,
+                                        render_messages,
+                                    )?;
+                                    ui.numbered(results.next_number());
+                                    let shown = ui.paged(|| {
+                                        emit_rendered(ui, &out, &result, &text, cli.json, true)
+                                    });
+                                    results.record(
+                                        Origin::Prompt {
+                                            name: name.to_string(),
+                                        },
+                                        result,
+                                        text,
+                                    );
+                                    shown
                                 })
                         }
                     }
@@ -2394,57 +2686,95 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     hint: shell_call_hint(&mut cache, &mut conn, tool, true),
                                     tool: None,
                                 }),
-                                Ok(a) => match watched(&mut notices, |w| {
-                                    conn.session.call_tool_watching(tool, a, w)
-                                }) {
-                                    Ok(mut result) => {
-                                        let files = MediaFiles {
-                                            dir: save_dir,
-                                            stem: file_stem(tool),
-                                        };
-                                        rendered(ui, &mut result, cli.json, &files, render_content)
-                                            .and_then(|text| {
-                                                let failed = ui.paged(|| {
-                                                    print_tool_result(
-                                                        ui, &out, &result, &text, cli.json, true,
-                                                    )
-                                                })?;
-                                                if failed {
-                                                    let argument_error =
-                                                        reads_as_argument_error(&text);
-                                                    if let Some(hint) = shell_call_hint(
-                                                        &mut cache,
-                                                        &mut conn,
-                                                        tool,
-                                                        argument_error,
-                                                    ) {
-                                                        print_hint(ui, &hint, cli.json);
-                                                    }
-                                                }
-                                                Ok(())
-                                            })
-                                    }
-                                    Err(e) => {
-                                        let hint = server_refused(&e)
-                                            .then(|| {
-                                                shell_call_hint(
-                                                    &mut cache,
-                                                    &mut conn,
-                                                    tool,
-                                                    is_argument_error(&e),
-                                                )
-                                            })
-                                            .flatten();
-                                        Err(Failure {
-                                            error: e,
-                                            hint,
-                                            tool: None,
-                                        })
-                                    }
-                                },
+                                Ok(a) => {
+                                    let mut live = Live {
+                                        conn: &mut conn,
+                                        notices: &mut notices,
+                                        tools: &mut cache,
+                                        results: &mut results,
+                                    };
+                                    shell_call(ui, &out, &mut live, tool, a, cli.json, save_dir)
+                                }
                             }
                         }
                     }
+                    // The numbered results of this session. A pipe never sees
+                    // the numbers, but a script that counted its own calls can
+                    // name them just the same.
+                    "show" => {
+                        let named = if rest.is_empty() { "_" } else { rest };
+                        match results.find(named) {
+                            Err(e) => Err(Failure::hinted(e, SHOW_USAGE)),
+                            Ok(rec) => {
+                                // The number it already had: showing a result
+                                // again does not make a new one.
+                                ui.numbered(rec.number);
+                                ui.paged(|| shell_show(ui, &out, rec, cli.json, &target))
+                            }
+                        }
+                    }
+                    "save" => {
+                        let (named, file) = split_word(rest);
+                        let named = if named.is_empty() { "_" } else { named };
+                        match results.find(named) {
+                            Err(e) => Err(Failure::hinted(e, SAVE_USAGE)),
+                            Ok(rec) => shell_save(ui, rec, file, cli.json),
+                        }
+                    }
+                    "retry" => {
+                        let (head, tail) = split_word(rest);
+                        // `retry key=value` changes the last call; a first word
+                        // that is no pair names the tool to look back for.
+                        let named = (!head.is_empty() && !args::looks_like_pair(head))
+                            .then_some(head);
+                        let pairs = if named.is_some() { tail } else { rest };
+                        let previous = results.last_call(named);
+                        match named.or(previous.map(|(tool, _)| tool)) {
+                            None => Err(Failure::hinted(
+                                Error::usage("no call in this session yet to retry"),
+                                RETRY_USAGE,
+                            )),
+                            Some(tool) => {
+                                let base = previous
+                                    .map_or_else(history::no_arguments, |(_, a)| a.clone());
+                                let changes = if pairs.is_empty() {
+                                    Ok(history::no_arguments())
+                                } else {
+                                    args::shell_arguments(pairs, || {
+                                        find_tool(shell_tools(&mut cache, &mut conn), tool)
+                                            .map_or(Value::Null, |t| t["inputSchema"].clone())
+                                    })
+                                };
+                                match changes {
+                                    Err(e) => Err(Failure {
+                                        error: e,
+                                        hint: shell_call_hint(&mut cache, &mut conn, tool, true),
+                                        tool: None,
+                                    }),
+                                    Ok(changes) => {
+                                        let line = format!(
+                                            "call {tool} {}",
+                                            history::merged(&base, &changes)
+                                        );
+                                        print_rerun(ui, &line, cli.json);
+                                        pending = Some(line);
+                                        Ok(())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "edit" => match edit_target(&results, rest).and_then(|(tool, was)| {
+                        edit_arguments(&tool, &was).map(|edited| (tool, edited))
+                    }) {
+                        Err(e) => Err(Failure::hinted(e, EDIT_USAGE)),
+                        Ok((tool, edited)) => {
+                            let line = format!("call {tool} {edited}");
+                            print_rerun(ui, &line, cli.json);
+                            pending = Some(line);
+                            Ok(())
+                        }
+                    },
                     "elicit" if rest.is_empty() => Err(Failure::hinted(
                         Error::usage("elicit needs a JSON object of answers"),
                         "usage: elicit {\"confirm\": true}   (used for every elicitation from here on)",
@@ -2471,7 +2801,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             parse_object(params, "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
                                 .map_err(Failure::from)
-                                .map(|result| ui.paged(|| print_value(ui, &result, cli.json)))
+                                .map(|result| {
+                                    ui.numbered(results.next_number());
+                                    ui.paged(|| print_value(ui, &result, cli.json));
+                                    results.record(
+                                        Origin::Raw {
+                                            method: method.to_string(),
+                                        },
+                                        result,
+                                        String::new(),
+                                    );
+                                })
                         }
                     }
                     // Only reachable when line editing is off, since a terminal
@@ -2763,7 +3103,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         ),
 
         Cmd::Pick => {
-            opts.elicit = elicitation(None, false, cli.json, false)?;
+            opts.elicit = elicitation(ui, None, false, cli.json, false)?;
             pick::run(ui, &store, &opts, &out, &mut notices, save_dir)
         }
 

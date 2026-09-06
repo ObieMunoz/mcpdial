@@ -529,10 +529,10 @@ chrome> quit
 ```
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
-`resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `info`, `help`, and `quit`
-(`exit` ends the session too); a `#` starts a comment. With `--json` each result is one
-line of JSON. In a script, any failed command makes the exit code 1 after the script
-finishes.
+`resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `show`, `save`, `retry`,
+`edit`, `info`, `help`, and `quit` (`exit` ends the session too); a `#` starts a
+comment. With `--json` each result is one line of JSON. In a script, any failed command
+makes the exit code 1 after the script finishes.
 
 Arguments are one JSON object, or the same `key=value` pairs the command line takes.
 When a line does not work, the answer says what the tool actually takes, in both forms,
@@ -573,6 +573,45 @@ chrome> call navigate_page {"url": "x", "<TAB>
 History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped input is
 read plainly, exactly as before, with no editing, no history and no completion, so
 scripts are unaffected.
+
+### The shell remembers what it printed
+
+Every `call`, `read`, `prompt` and `raw` result is numbered as it goes out - a dim
+`[3]` before it at a terminal, nothing at all under a pipe, where the bytes are the
+contract. A later line names one instead of running it again:
+
+```
+chrome> call take_screenshot
+[1] [image image/png, 84 KB]
+chrome> save 1 home.png
+wrote 86,016 bytes to home.png
+chrome> call navigate_page url=https://example.com
+[2] Successfully navigated to https://example.com.
+chrome> retry url=https://example.com/about
+call navigate_page {"url":"https://example.com/about"}
+[3] Successfully navigated to https://example.com/about.
+```
+
+- `show N` prints result N again, exactly as it printed the first time. `_` names the
+  last result and `$3` the third, and a bare `show` means `_`.
+- `save N FILE` writes it: text as text, a binary block as its bytes, a resource as the
+  bodies it arrived as, and the whole result object under `--json`. `save N` with no
+  file names one after the tool and the media type - `take_screenshot.png`,
+  `tools_list.json`. It refuses to write over a file that is already there, to write to
+  a directory, or to write where it cannot, in the same words `--output` uses.
+- `retry` sends the last call again. `retry key=value ...` sends it with those
+  arguments changed, typed by the tool's schema exactly as a `call` line is;
+  `retry TOOL key=value ...` looks back for the last call of that tool instead. A call
+  that failed is remembered too, which is usually the one worth running again.
+- `edit N` opens the arguments of the call that made result N in `$EDITOR` (or
+  `$VISUAL`) and sends them when it exits; a bare `edit` takes the last call. An editor
+  that exits badly, or that leaves the file empty, sends nothing.
+
+The numbers themselves only appear at a terminal, but the commands work under a pipe
+too: a script that counted its own calls can `show 2` or `save 2 out.txt` just the
+same. A session holds its last 50 results, or 8 MiB of them, whichever runs out first,
+and drops the oldest past that; the newest is always kept. Nothing is written to disk
+and nothing outlives the process.
 
 ### When the server has a question
 

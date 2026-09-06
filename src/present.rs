@@ -196,6 +196,12 @@ pub trait Presenter {
         self.err_line(line);
     }
 
+    /// The number the shell filed a result under, before the result itself, so
+    /// that `show`, `save` and `retry` have something to name. A program is
+    /// told nothing: its bytes are the contract, and a number among them would
+    /// change it.
+    fn numbered(&self, _n: usize) {}
+
     /// A note on stderr: `note:` before the first line, the rest indented under it.
     fn note(&self, note: &str) {
         let mut lines = note.lines();
@@ -439,6 +445,10 @@ impl Presenter for Rich {
     fn aside(&self, line: &str) {
         let dim = style::Style::new().dim().when(self.color_err);
         self.err_line(&dim.paint(line));
+    }
+
+    fn numbered(&self, n: usize) {
+        self.aside(&format!("[{n}]"));
     }
 
     fn page_start(&self) {

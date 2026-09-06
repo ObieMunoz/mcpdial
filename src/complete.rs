@@ -71,7 +71,7 @@ impl ShellHelper {
         let (before, word) = head.split_at(start);
         let pool: Vec<String> = match before.split_whitespace().collect::<Vec<_>>()[..] {
             [] => SHELL_COMMANDS.iter().map(|c| c.to_string()).collect(),
-            ["call" | "schema" | "help"] => self.tool_names(),
+            ["call" | "retry" | "schema" | "help"] => self.tool_names(),
             ["read"] => self.resources.clone(),
             ["prompt"] => self.prompts.clone(),
             _ => Vec::new(),

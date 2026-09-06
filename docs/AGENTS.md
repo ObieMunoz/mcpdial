@@ -86,7 +86,14 @@ once and every command carries it.
    set is followed by `(tool reported an error)` on stderr.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
    and prints one JSON line per command. Send `quit` (or `exit`) or close stdin to
-   finish. When each command has to be its own invocation,
+   finish. The session numbers every `call`, `read`, `prompt` and `raw` result from 1
+   in the order it printed them, without saying so on either stream, so a script that
+   counted its own can name one afterwards: `show N` prints it again, `save N FILE`
+   writes it (the whole object under `--json`, and one line of receipt,
+   `{"output","chars"|"bytes","isError"}`), `retry [TOOL] [key=value ...]` sends the
+   last call again with those arguments changed, and `_` names the last result where
+   `$3` and `3` name the third. A session holds its last 50 results, or 8 MiB of them,
+   whichever runs out first. When each command has to be its own invocation,
    `mcpdial start NAME [--idle SECS]`
    keeps a saved stdio server running in the background and prints
    `started NAME (pid N)` (`--json`: `{"name","pid","socket"}`); every later command
