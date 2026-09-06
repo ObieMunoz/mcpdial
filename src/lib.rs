@@ -29,6 +29,7 @@ pub mod import_config;
 pub mod oauth;
 pub mod protocol;
 pub mod registry;
+pub mod schema;
 pub mod search;
 pub mod serve;
 pub mod session;

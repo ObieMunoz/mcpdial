@@ -7,6 +7,7 @@
 //! the value as written, which is how arrays, objects and a forced string arrive.
 
 use crate::{closest, parse_object};
+use mcpdial::schema;
 use mcpdial::transport::stdio::split_command;
 use mcpdial::{Error, Result};
 use serde_json::{Map, Number, Value};
@@ -138,10 +139,10 @@ pub fn example_pairs(tool: &Value) -> String {
         .filter_map(Value::as_str)
         .map(|name| {
             let spec = props.and_then(|p| p.get(name)).unwrap_or(&Value::Null);
-            match spec["type"].as_str() {
+            match schema::example_type(spec) {
                 Some("array") => format!("{name}:=[...]"),
                 Some("object") => format!("{name}:={{...}}"),
-                _ => format!("{name}={}", pair_placeholder(spec)),
+                _ => format!("{name}={}", schema::pair_placeholder(spec)),
             }
         })
         .collect::<Vec<_>>()
@@ -270,25 +271,6 @@ fn needs_json_form(key: &str, shape: &str, example: &str) -> Error {
     Error::usage(format!(
         "{key} takes {shape}; write it as JSON after :=, like {key}:='{example}'"
     ))
-}
-
-/// What stands in for one value in [`example_pairs`]: the skeleton the JSON form
-/// shows, without the quotes that only JSON needs.
-fn pair_placeholder(spec: &Value) -> String {
-    if let Some(values) = spec["enum"].as_array().filter(|v| !v.is_empty()) {
-        return values
-            .iter()
-            .take(4)
-            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
-            .collect::<Vec<_>>()
-            .join("|");
-    }
-    match spec["type"].as_str() {
-        Some("integer" | "number") => "<number>".into(),
-        Some("boolean") => "true|false".into(),
-        Some("string") => "<string>".into(),
-        _ => "<value>".into(),
-    }
 }
 
 /// The REPL has no shell in front of it, so a quoted value still carries its
