@@ -1,6 +1,7 @@
 //! Streamable HTTP: POST JSON-RPC to one URL, read back JSON or a one-shot SSE frame.
 
 use super::retry::{self, Failed, Failure, Retry};
+use super::trace::{Kind, TraceEvent, Wire};
 use super::{silent, Logger, Transport};
 use crate::protocol::{decode_body, Error, KnownVersion, Result, META_PROTOCOL_VERSION};
 use base64::engine::general_purpose::STANDARD;
@@ -8,7 +9,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Always send a real browser User-Agent. This is a correctness requirement, not
 /// politeness: bot mitigation in front of a server routes default agent strings
@@ -106,17 +107,36 @@ impl HttpTransport {
             )
             .header("Accept", "text/event-stream");
 
-        (self.log)(&format!("-> GET {} (legacy transport probe)", self.url));
-        let Ok(mut resp) = req.call() else {
-            return false;
+        let wire = Wire::Http(&self.url);
+        (self.log)(&TraceEvent::HttpRequest {
+            wire,
+            method: "GET",
+            purpose: "legacy transport probe".into(),
+        });
+        let started = Instant::now();
+        let mut resp = match req.call() {
+            Ok(resp) => resp,
+            Err(e) => {
+                (self.log)(&TraceEvent::HttpFailed {
+                    wire,
+                    method: "GET",
+                    error: e.to_string(),
+                    elapsed: started.elapsed(),
+                });
+                return false;
+            }
         };
         let content_type = header(&resp, "content-type")
             .unwrap_or_default()
             .to_ascii_lowercase();
-        (self.log)(&format!(
-            "<- HTTP {} {content_type}",
-            resp.status().as_u16()
-        ));
+        (self.log)(&TraceEvent::HttpReply {
+            wire,
+            method: "GET",
+            status: resp.status().as_u16(),
+            content_type: Some(content_type.clone()),
+            body: None,
+            elapsed: started.elapsed(),
+        });
 
         resp.status().is_success()
             && content_type.contains("text/event-stream")
@@ -326,7 +346,20 @@ impl HttpTransport {
         payload: &Value,
         body: &str,
     ) -> std::result::Result<Option<Value>, Failed> {
-        (self.log)(&format!("-> POST {}\n   {}", self.url, body));
+        let wire = Wire::Http(&self.url);
+        (self.log)(&TraceEvent::Sent {
+            wire,
+            message: payload,
+        });
+        let started = Instant::now();
+        let failed = |error: String| {
+            (self.log)(&TraceEvent::HttpFailed {
+                wire,
+                method: "POST",
+                error,
+                elapsed: started.elapsed(),
+            });
+        };
 
         let mut req = self.identify(
             self.agent
@@ -339,14 +372,17 @@ impl HttpTransport {
             req = req.header(name, &value);
         }
 
-        let mut resp = req.send(body).map_err(|e| Failed {
-            failure: retry::before_any_reply(&e),
-            error: match e {
-                ureq::Error::Timeout(_) => {
-                    Error::transport(format!("no reply from {} in time", self.url))
-                }
-                other => Error::transport(format!("could not reach {}: {other}", self.url)),
-            },
+        let mut resp = req.send(body).map_err(|e| {
+            failed(e.to_string());
+            Failed {
+                failure: retry::before_any_reply(&e),
+                error: match e {
+                    ureq::Error::Timeout(_) => {
+                        Error::transport(format!("no reply from {} in time", self.url))
+                    }
+                    other => Error::transport(format!("could not reach {}: {other}", self.url)),
+                },
+            }
         })?;
 
         let status = resp.status().as_u16();
@@ -356,19 +392,26 @@ impl HttpTransport {
         let location = header(&resp, "location");
         let retry_after = retry::retry_after(header(&resp, "retry-after").as_deref());
 
-        let text = resp.body_mut().read_to_string().map_err(|e| Failed {
-            error: Error::transport(format!("could not read response body: {e}")),
-            // A session named on the broken reply is state the server now holds;
-            // a retried `initialize` would open a second one beside it.
-            failure: match session_id {
-                Some(_) => Failure::Final,
-                None => Failure::Interrupted,
-            },
+        let text = resp.body_mut().read_to_string().map_err(|e| {
+            failed(format!("could not read response body: {e}"));
+            Failed {
+                error: Error::transport(format!("could not read response body: {e}")),
+                // A session named on the broken reply is state the server now holds;
+                // a retried `initialize` would open a second one beside it.
+                failure: match session_id {
+                    Some(_) => Failure::Final,
+                    None => Failure::Interrupted,
+                },
+            }
         })?;
-        (self.log)(&format!(
-            "<- HTTP {status} {content_type}\n   {}",
-            text.trim()
-        ));
+        (self.log)(&TraceEvent::HttpReply {
+            wire,
+            method: "POST",
+            status,
+            content_type: Some(content_type.clone()),
+            body: Some(&text),
+            elapsed: started.elapsed(),
+        });
 
         if (300..400).contains(&status) {
             return Err(Failed::final_(redirect_error(
@@ -405,6 +448,13 @@ impl HttpTransport {
             self.session_id = Some(sid);
         }
         let reply = decode_body(&text, &content_type).map_err(Failed::final_)?;
+        if let Some(message) = &reply {
+            (self.log)(&TraceEvent::Received {
+                wire: Wire::Http(&self.url),
+                message,
+                kind: Kind::Reply,
+            });
+        }
         if payload["method"] == "tools/list" {
             if let Some(page) = &reply {
                 retry::note_tools(&mut self.idempotent_tools, page);
@@ -428,7 +478,10 @@ impl Transport for HttpTransport {
         else {
             return Err(first.error);
         };
-        (self.log)(&format!("retrying after {} (1 of 1)", first.failure));
+        (self.log)(&TraceEvent::Retrying {
+            wire: Wire::Http(&self.url),
+            after: &first.failure,
+        });
         std::thread::sleep(delay);
         self.attempt(payload, &body).map_err(|second| second.error)
     }
@@ -458,10 +511,28 @@ impl Transport for HttpTransport {
         // out: a second close then finds no session and sends nothing.
         self.session_id = None;
 
-        (self.log)(&format!("-> DELETE {} (session {sid})", self.url));
+        let wire = Wire::Http(&self.url);
+        (self.log)(&TraceEvent::HttpRequest {
+            wire,
+            method: "DELETE",
+            purpose: format!("session {sid}"),
+        });
+        let started = Instant::now();
         match req.call() {
-            Ok(resp) => (self.log)(&format!("<- HTTP {}", resp.status().as_u16())),
-            Err(e) => (self.log)(&format!("<- session {sid} not terminated: {e}")),
+            Ok(resp) => (self.log)(&TraceEvent::HttpReply {
+                wire,
+                method: "DELETE",
+                status: resp.status().as_u16(),
+                content_type: None,
+                body: None,
+                elapsed: started.elapsed(),
+            }),
+            Err(e) => (self.log)(&TraceEvent::HttpFailed {
+                wire,
+                method: "DELETE",
+                error: e.to_string(),
+                elapsed: started.elapsed(),
+            }),
         }
     }
 }

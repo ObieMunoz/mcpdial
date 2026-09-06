@@ -633,6 +633,26 @@ fn write_file(path: &Path, bytes: &[u8], private: bool) -> std::io::Result<()> {
     opts.open(path)?.write_all(bytes)
 }
 
+/// Open `path` for appending, creating it owner-only if it is not there: what
+/// a trace file gets, since a trace can hold private tool output.
+pub(crate) fn open_private_append(path: &Path) -> std::io::Result<fs::File> {
+    #[cfg(windows)]
+    {
+        match sys::create_owner_only(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            created => return created,
+        }
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 /// A sibling of `path` to write into before the rename, unique per call.
 ///
 /// One shared temp name would put two writers in the same file, which is the

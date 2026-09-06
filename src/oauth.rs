@@ -22,6 +22,8 @@ use crate::config::{now, Credential, CLIENT_CREDENTIALS};
 use crate::protocol::{request, Error, Result, CLIENT_NAME, PROTOCOL_VERSION};
 use crate::transport::http::{header, redirect_error, USER_AGENT};
 use crate::transport::retry::{self, Failed, Failure, Retry};
+use crate::transport::trace::{Kind, TraceEvent, Wire};
+use crate::transport::{silent, Logger};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -30,7 +32,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// What discovery found out about how to get a token for one MCP server.
 #[derive(Debug, Clone)]
@@ -55,6 +57,7 @@ pub struct Http {
     agent: ureq::Agent,
     user_agent: String,
     retry: Retry,
+    log: Logger,
 }
 
 impl Http {
@@ -70,12 +73,21 @@ impl Http {
                 enabled: true,
                 timeout,
             },
+            log: silent(),
         }
     }
 
     /// Whether a discovery `GET` that fails transiently is sent once more.
     pub fn retry(mut self, enabled: bool) -> Self {
         self.retry.enabled = enabled;
+        self
+    }
+
+    /// Where every exchange is reported, secrets redacted.
+    pub fn log(mut self, log: Option<Logger>) -> Self {
+        if let Some(log) = log {
+            self.log = log;
+        }
         self
     }
 
@@ -86,6 +98,10 @@ impl Http {
         let mut outcome = self.get_once(url);
         if let Err(failed) = &outcome {
             if let Some(delay) = self.retry.delay(true, false, &failed.failure) {
+                (self.log)(&TraceEvent::Retrying {
+                    wire: Wire::OAuth(url),
+                    after: &failed.failure,
+                });
                 thread::sleep(delay);
                 outcome = self.get_once(url);
             }
@@ -101,18 +117,46 @@ impl Http {
     }
 
     fn get_once(&self, url: &str) -> std::result::Result<Option<Value>, Failed> {
+        let wire = Wire::OAuth(url);
+        (self.log)(&TraceEvent::HttpRequest {
+            wire,
+            method: "GET",
+            purpose: "discovery".into(),
+        });
+        let started = Instant::now();
+        let failed = |error: String| {
+            (self.log)(&TraceEvent::HttpFailed {
+                wire,
+                method: "GET",
+                error,
+                elapsed: started.elapsed(),
+            });
+        };
         let mut resp = self
             .agent
             .get(url)
             .header("Accept", "application/json")
             .header("User-Agent", &self.user_agent)
             .call()
-            .map_err(|e| Failed {
-                failure: retry::before_any_reply(&e),
-                error: Error::auth(format!("GET {url}: {e}")),
+            .map_err(|e| {
+                failed(e.to_string());
+                Failed {
+                    failure: retry::before_any_reply(&e),
+                    error: Error::auth(format!("GET {url}: {e}")),
+                }
             })?;
         let status = resp.status().as_u16();
+        let content_type = header(&resp, "content-type").unwrap_or_default();
+        let reply = |elapsed| TraceEvent::HttpReply {
+            wire,
+            method: "GET",
+            status,
+            content_type: Some(content_type.clone()),
+            body: None,
+            elapsed,
+        };
         if !resp.status().is_success() {
+            (self.log)(&reply(started.elapsed()));
             return Err(Failed {
                 error: Error::auth(format!("GET {url}: HTTP {status}")),
                 failure: Failure::Status {
@@ -121,20 +165,49 @@ impl Http {
                 },
             });
         }
-        let text = resp.body_mut().read_to_string().map_err(|e| Failed {
-            error: Error::auth(format!("GET {url}: {e}")),
-            failure: Failure::Interrupted,
+        let text = resp.body_mut().read_to_string().map_err(|e| {
+            failed(e.to_string());
+            Failed {
+                error: Error::auth(format!("GET {url}: {e}")),
+                failure: Failure::Interrupted,
+            }
         })?;
-        Ok(serde_json::from_str(&text).ok())
+        (self.log)(&reply(started.elapsed()));
+        let document: Option<Value> = serde_json::from_str(&text).ok();
+        if let Some(message) = &document {
+            (self.log)(&TraceEvent::Received {
+                wire,
+                message,
+                kind: Kind::Reply,
+            });
+        }
+        Ok(document)
     }
 
+    /// One POST. `shown` is the body as the trace shows it: the JSON that was
+    /// sent, or a form's fields as an object, either way redacted on the way out.
     fn post(
         &self,
         url: &str,
         content_type: &str,
         body: &str,
+        shown: &Value,
         basic: Option<&str>,
     ) -> Result<(u16, Value, String)> {
+        let wire = Wire::OAuth(url);
+        (self.log)(&TraceEvent::Sent {
+            wire,
+            message: shown,
+        });
+        let started = Instant::now();
+        let failed = |error: String| {
+            (self.log)(&TraceEvent::HttpFailed {
+                wire,
+                method: "POST",
+                error,
+                elapsed: started.elapsed(),
+            });
+        };
         let mut req = self
             .agent
             .post(url)
@@ -144,20 +217,37 @@ impl Http {
         if let Some(credentials) = basic {
             req = req.header("Authorization", &format!("Basic {credentials}"));
         }
-        let mut resp = req
-            .send(body)
-            .map_err(|e| Error::auth(format!("POST {url}: {e}")))?;
+        let mut resp = req.send(body).map_err(|e| {
+            failed(e.to_string());
+            Error::auth(format!("POST {url}: {e}"))
+        })?;
         let status = resp.status().as_u16();
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| Error::auth(format!("POST {url}: {e}")))?;
+        let reply_content_type = header(&resp, "content-type").unwrap_or_default();
+        let text = resp.body_mut().read_to_string().map_err(|e| {
+            failed(e.to_string());
+            Error::auth(format!("POST {url}: {e}"))
+        })?;
+        (self.log)(&TraceEvent::HttpReply {
+            wire,
+            method: "POST",
+            status,
+            content_type: Some(reply_content_type),
+            body: None,
+            elapsed: started.elapsed(),
+        });
         let value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if !value.is_null() {
+            (self.log)(&TraceEvent::Received {
+                wire,
+                message: &value,
+                kind: Kind::Reply,
+            });
+        }
         Ok((status, value, text))
     }
 
     fn post_json(&self, url: &str, body: &Value) -> Result<(u16, Value, String)> {
-        self.post(url, "application/json", &body.to_string(), None)
+        self.post(url, "application/json", &body.to_string(), body, None)
     }
 
     fn post_form(
@@ -171,7 +261,19 @@ impl Http {
             .map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v)))
             .collect::<Vec<_>>()
             .join("&");
-        self.post(url, "application/x-www-form-urlencoded", &body, basic)
+        let fields = Value::Object(
+            params
+                .iter()
+                .map(|(k, v)| (k.to_string(), json!(v)))
+                .collect(),
+        );
+        self.post(
+            url,
+            "application/x-www-form-urlencoded",
+            &body,
+            &fields,
+            basic,
+        )
     }
 }
 
@@ -197,14 +299,36 @@ pub fn challenge(http: &Http, mcp_url: &str) -> Result<Option<String>> {
             .max_redirects(0)
             .build(),
     );
+    let wire = Wire::Http(mcp_url);
+    (http.log)(&TraceEvent::Sent {
+        wire,
+        message: &init,
+    });
+    let started = Instant::now();
     let mut resp = no_redirect
         .post(mcp_url)
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .header("User-Agent", &http.user_agent)
         .send(&init.to_string())
-        .map_err(|e| Error::auth(format!("could not reach {mcp_url}: {e}")))?;
+        .map_err(|e| {
+            (http.log)(&TraceEvent::HttpFailed {
+                wire,
+                method: "POST",
+                error: e.to_string(),
+                elapsed: started.elapsed(),
+            });
+            Error::auth(format!("could not reach {mcp_url}: {e}"))
+        })?;
     let status = resp.status().as_u16();
+    (http.log)(&TraceEvent::HttpReply {
+        wire,
+        method: "POST",
+        status,
+        content_type: Some(header(&resp, "content-type").unwrap_or_default()),
+        body: None,
+        elapsed: started.elapsed(),
+    });
     if (300..400).contains(&status) {
         let to = header(&resp, "location");
         return Err(redirect_error(mcp_url, status, to.as_deref()));

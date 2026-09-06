@@ -98,6 +98,7 @@ mod unix {
     use crate::config::Store;
     use crate::protocol::{check, classify, reply, reply_error, request, Error, Incoming, Result};
     use crate::transport::stdio::{Framed, StdioTransport};
+    use crate::transport::trace::Wire;
     use crate::transport::{silent, Logger, Transport};
     use serde_json::{json, Value};
     use std::fs;
@@ -173,7 +174,7 @@ mod unix {
             let framed = Framed::new(
                 clone("writing")?,
                 clone("reading")?,
-                ("socket", "socket"),
+                Wire::Socket,
                 timeout,
                 log.unwrap_or_else(silent),
             );
