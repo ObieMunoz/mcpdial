@@ -357,3 +357,47 @@ fn a_terminal_is_shown_what_the_server_reports_and_a_pipe_is_not() {
     let piped = run(talkative(&home, 2).args(["call", &target, "echo", r#"{"message":"hi"}"#]));
     assert!(!piped.stderr.contains("step 2"), "{}", piped.stderr);
 }
+
+/// A question from the server never lands on the updating line.
+///
+/// `Presenter::progress` leaves the cursor mid-line, and `elicit` writes its
+/// question straight to stderr: it is a library module, with no presenter to
+/// go through. Both happen in one call, so the line has to be told to get out
+/// of the way. `--log-level error` drops the closing warning the echo server
+/// sends, which would otherwise finish the line and hide the collision.
+#[test]
+fn a_question_from_the_server_starts_on_a_line_of_its_own() {
+    if !cfg!(unix) || !cfg!(feature = "rich") {
+        eprintln!("skipped: needs `script` and the rich presenter");
+        return;
+    }
+    let home = temp_home("progress-elicit-tty");
+    let target = echo_target();
+    let shown = String::from_utf8_lossy(&common::under_pty(
+        &home,
+        &[
+            "--log-level",
+            "error",
+            "call",
+            &target,
+            "echo",
+            "{}",
+            "--elicit",
+            r#"{"confirm":true,"region":"eu"}"#,
+        ],
+        &[
+            ("ECHO_SERVER_PROGRESS", "3"),
+            ("ECHO_SERVER_ELICIT", "form"),
+        ],
+    ))
+    .into_owned();
+    assert!(shown.contains("step 3"), "the line was drawn: {shown}");
+    assert!(
+        shown.contains("server asked: confirm before running"),
+        "{shown}"
+    );
+    let shared = shown
+        .lines()
+        .find(|l| l.contains("working...") && l.contains("server asked:"));
+    assert_eq!(shared, None, "the question shares the line:\n{shown}");
+}

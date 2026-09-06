@@ -3,9 +3,9 @@
 
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    check, is_modern_error, negotiate, notification, request, rpc_error, with_client_meta,
-    with_progress_token, Error, KnownVersion, Result, CLIENT_NAME, CLIENT_VERSION,
-    META_SERVER_INFO, UNSUPPORTED_PROTOCOL_VERSION,
+    check, classify, is_modern_error, negotiate, notification, request, rpc_error,
+    with_client_meta, with_progress_token, Error, Incoming, KnownVersion, Result, CLIENT_NAME,
+    CLIENT_VERSION, META_SERVER_INFO, PING, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
@@ -34,6 +34,15 @@ pub trait Watcher {
     }
 
     fn notice(&mut self, notice: &Notice<'_>);
+
+    /// The server has asked us something mid-request, and whatever the client
+    /// installed to answer it may need the screen: an elicitation puts its
+    /// question and its prompts on stderr, where a watcher's updating line is.
+    /// A watcher drawing one finishes it here, so the question starts clean.
+    ///
+    /// `ping` is not one of these: [`crate::protocol::answer_with`] replies to
+    /// it before any responder sees it, so it interrupts nobody.
+    fn interrupted(&mut self) {}
 }
 
 /// The watcher for a request nobody is watching: no token goes out, and
@@ -136,8 +145,15 @@ impl<T: Transport> Session<T> {
         };
         let sent = request(method, id, params);
         let reply = self.transport.send_watching(&sent, &mut |from_server| {
-            if let Some(notice) = notify::read(from_server, token.as_ref()) {
-                watch.notice(&notice);
+            // `awaiting` only sorts a response from a stranger's, and neither is
+            // what is being looked for here.
+            match classify(from_server, None) {
+                Incoming::ServerRequest { method, .. } if method != PING => watch.interrupted(),
+                _ => {
+                    if let Some(notice) = notify::read(from_server, token.as_ref()) {
+                        watch.notice(&notice);
+                    }
+                }
             }
         })?;
         let msg = check(reply)?;
@@ -1310,6 +1326,7 @@ mod tests {
     struct Kept {
         listening: bool,
         heard: Vec<String>,
+        interruptions: usize,
     }
 
     impl Watcher for Kept {
@@ -1318,6 +1335,9 @@ mod tests {
         }
         fn notice(&mut self, notice: &Notice<'_>) {
             self.heard.push(notice.summary());
+        }
+        fn interrupted(&mut self) {
+            self.interruptions += 1;
         }
     }
 
@@ -1368,5 +1388,28 @@ mod tests {
         let result = s.call_tool_watching("echo", json!({}), &mut kept).unwrap();
         assert_eq!(result["ok"], true, "the answer is untouched");
         assert_eq!(kept.heard, ["1/2 half", "server [warning] careful"]);
+        assert_eq!(kept.interruptions, 0, "a ping is answered without a word");
+    }
+
+    /// A server that asks us something mid-call warns the watcher before the
+    /// answer is worked out: whatever serves the request may put a question on
+    /// the same stderr the updating line is on, and it has no other way to know.
+    #[test]
+    fn a_request_from_the_server_interrupts_the_watcher_and_a_ping_does_not() {
+        let says = vec![
+            json!({"jsonrpc":"2.0","method":"notifications/progress",
+                   "params":{"progressToken":1,"progress":1,"total":2,"message":"half"}}),
+            json!({"jsonrpc":"2.0","id":"srv-ping","method":"ping"}),
+            json!({"jsonrpc":"2.0","id":"srv-elicit","method":"elicitation/create",
+                   "params":{"message":"confirm before running"}}),
+        ];
+        let mut s = talkative(says);
+        let mut kept = Kept {
+            listening: true,
+            ..Kept::default()
+        };
+        s.call_tool_watching("echo", json!({}), &mut kept).unwrap();
+        assert_eq!(kept.interruptions, 1, "the elicitation, and not the ping");
+        assert_eq!(kept.heard, ["1/2 half"], "neither request is a notice");
     }
 }
