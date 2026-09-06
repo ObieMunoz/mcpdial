@@ -411,6 +411,78 @@ fn saved_servers_and_status_listing() {
     assert!(!o.stdout.contains("dead"));
 }
 
+/// A program reading `ls --json` must not have to know which flag produced it,
+/// and every `--json` document is an object.
+#[test]
+fn both_ls_shapes_carry_the_configuration_and_tools_prints_an_object() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("json-shapes");
+    assert_eq!(
+        run(mcpdial(&home).args([
+            "add",
+            "web",
+            "--http",
+            &s.url,
+            "--deny",
+            "add",
+            "--no-probe"
+        ]))
+        .code,
+        0
+    );
+    let configuration = [
+        "name",
+        "kind",
+        "location",
+        "headers",
+        "token_env",
+        "credential",
+        "source",
+        "timeout",
+        "running",
+        "allow",
+        "deny",
+    ];
+
+    let o = run(mcpdial(&home).args(["--json", "ls", "--no-probe"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let saved: Vec<Value> = serde_json::from_str(&o.stdout).unwrap();
+    for key in configuration {
+        assert!(
+            saved[0].get(key).is_some(),
+            "{key} is missing: {}",
+            o.stdout
+        );
+    }
+    for key in ["status", "auth", "server", "checked_at", "age_seconds"] {
+        assert!(
+            saved[0].get(key).is_none(),
+            "--no-probe omits the status fields rather than swapping the shape: {}",
+            o.stdout
+        );
+    }
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "ls"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let probed: Vec<Value> = serde_json::from_str(&o.stdout).unwrap();
+    for key in configuration {
+        assert_eq!(probed[0][key], saved[0][key], "{key}: {}", o.stdout);
+    }
+    assert_eq!(probed[0]["status"]["state"], "connected", "{}", o.stdout);
+    assert_eq!(
+        probed[0]["tools"], 1,
+        "the deny list hides add: {}",
+        o.stdout
+    );
+
+    let o = run(mcpdial(&home).args(["--timeout", "5", "--json", "tools"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let every: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(every["servers"][0]["name"], "web", "{}", o.stdout);
+    assert_eq!(every["servers"][0]["tools"][0]["name"], "echo");
+    assert_eq!(every["servers"].as_array().unwrap().len(), 1);
+}
+
 /// Run `login` with no browser, scrape the auth URL from stderr, and play the browser
 /// ourselves: the fake authorization server 302s straight back to the loopback callback.
 fn drive_login(home: &std::path::Path, target: &str, extra: &[&str]) -> String {
@@ -1128,9 +1200,19 @@ fn agent_surface_json_errors_file_args_schema_and_guide() {
     let v: Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(v["name"], "add");
     assert_eq!(v["inputSchema"]["required"][0], "a");
+    // A name this server does not have is the caller's mistake, not the server's:
+    // `tools/list` succeeded and nothing was sent for the tool itself.
     let o = run(mcpdial(&home).args(["schema", &s.url, "nah"]));
-    assert_eq!(o.code, 1);
+    assert_eq!(o.code, 2, "{}", o.stderr);
     assert!(o.stderr.contains("available: echo, add"), "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["--json", "schema", &s.url, "nah"]));
+    assert_eq!(o.code, 2, "{}", o.stderr);
+    let err: Value = serde_json::from_str(&o.stderr).unwrap();
+    assert_eq!(err["error"]["kind"], "usage", "{}", o.stderr);
+    assert!(err["error"].get("code").is_none(), "{}", o.stderr);
+    let o = run(mcpdial(&home).args(["--json", "schema", &s.url, "ad"]));
+    let err: Value = serde_json::from_str(&o.stderr).unwrap();
+    assert_eq!(err["error"]["hint"], "did you mean add?", "{}", o.stderr);
 
     // The guide is embedded in the binary.
     let o = run(mcpdial(&home).args(["guide"]));

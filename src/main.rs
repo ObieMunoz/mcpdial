@@ -2177,14 +2177,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             refuse_denied(&r.config, &r.name, &tool)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let tools = conn.list_tools()?;
+            // The `tools/list` this name was looked up in succeeded, and nothing
+            // was ever sent for the tool itself: the mistake is the caller's, and
+            // saying so as the shell's own `schema` does costs no invented -32602.
             let Some(t) = find_tool(&tools, &tool) else {
                 let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
                 return Err(Failure {
-                    error: Error::Rpc {
-                        code: -32602,
-                        message: format!("Tool {tool} not found; available: {}", names.join(", ")),
-                        data: None,
-                    },
+                    error: Error::usage(format!(
+                        "no tool named {tool:?}; available: {}",
+                        names.join(", ")
+                    )),
                     hint: closest(&tool, names.iter().copied())
                         .map(|near| format!("did you mean {near}?")),
                     tool: None,
@@ -2346,14 +2348,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     let rows: Vec<Value> = servers
                         .iter()
                         .map(|(n, c)| {
-                            json!({
-                                "name": n, "kind": c.kind(), "location": c.location(),
-                                "headers": c.headers, "token_env": c.token_env,
-                                "credential": creds.get(n).is_some_and(Credential::has_token),
-                                "source": c.source, "timeout": c.timeout,
-                                "running": daemon::is_running(&store, n),
-                                "allow": c.allow, "deny": c.deny,
-                            })
+                            saved_row(
+                                n,
+                                c,
+                                creds.get(n).is_some_and(Credential::has_token),
+                                daemon::is_running(&store, n),
+                            )
                         })
                         .collect();
                     print_json(ui, &rows);
@@ -2411,7 +2411,29 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             };
             let listing = client::listing(&store, &opts, freshness)?;
             if cli.json {
-                print_json(ui, &listing);
+                let servers = store.servers()?;
+                let creds = store.credentials()?;
+                let rows: Vec<Value> = listing
+                    .iter()
+                    .map(|row| {
+                        let mut out = match servers.get(&row.name) {
+                            Some(cfg) => saved_row(
+                                &row.name,
+                                cfg,
+                                creds.get(&row.name).is_some_and(Credential::has_token),
+                                row.running,
+                            ),
+                            None => json!({}),
+                        };
+                        let probed = serde_json::to_value(row).expect("a listing is serializable");
+                        if let (Some(fields), Value::Object(status)) = (out.as_object_mut(), probed)
+                        {
+                            fields.extend(status);
+                        }
+                        out
+                    })
+                    .collect();
+                print_json(ui, &rows);
             } else if listing.is_empty() {
                 ui.err_line(NO_SERVERS);
             } else {
@@ -2426,7 +2448,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         } => {
             let probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
-                print_json(ui, &probes);
+                print_json(ui, &Servers { servers: &probes });
                 return Ok(0);
             }
             if probes.is_empty() {
@@ -2813,6 +2835,27 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
 const LISTING_HEADERS: [&str; 8] = [
     "NAME", "TYPE", "STATUS", "AGE", "AUTH", "DAEMON", "SERVER", "TOOLS",
 ];
+
+/// `tools` with no target: the probes under a key, as `tools TARGET` puts its
+/// own list under `tools`. A bare array could never grow a field beside them.
+#[derive(serde::Serialize)]
+struct Servers<'a> {
+    servers: &'a [client::Probe],
+}
+
+/// What was saved about one server, as every `ls --json` row carries it. A probe
+/// adds its status fields on top of these rather than in place of them, so a
+/// program reading a row never has to know whether `--no-probe` was passed.
+fn saved_row(name: &str, cfg: &ServerConfig, credential: bool, running: bool) -> Value {
+    json!({
+        "name": name, "kind": cfg.kind(), "location": cfg.location(),
+        "headers": cfg.headers, "token_env": cfg.token_env,
+        "credential": credential,
+        "source": cfg.source, "timeout": cfg.timeout,
+        "running": running,
+        "allow": cfg.allow, "deny": cfg.deny,
+    })
+}
 
 /// One server as `ls` shows it, which is also what `add` shows after dialing.
 fn listing_row(l: &Listing) -> Vec<String> {

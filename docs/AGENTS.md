@@ -21,15 +21,22 @@
 ## Workflow
 
 1. **What is available.** `mcpdial ls --json` returns one object per saved server with
-   `status.state` (`connected`, `auth_required`, `token_rejected`, `blocked`, `http`,
-   `unreachable`, `error`), `server` (name and version), `tools` (count), and
-   `running` (true while a `start` daemon holds the server open).
+   what was saved — `kind`, `location`, `headers`, `token_env`, `credential`, `source`,
+   `timeout`, `allow`, `deny` — and `running` (true while a `start` daemon holds the
+   server open), followed by what the dial found: `status.state` (`connected`,
+   `auth_required`, `token_rejected`, `blocked`, `http`, `unreachable`, `error`),
+   `auth`, `server` (name and version), `tools` (count), `checked_at` and
+   `age_seconds`. `--no-probe` leaves those last ones out rather than putting other
+   keys in their place, so a row means the same thing whichever flag produced it.
 2. **What a server can do.** `mcpdial tools TARGET --json` returns `{"tools": [...]}`
-   with each tool's `name`, `description`, and full `inputSchema`. For one tool,
-   `mcpdial schema TARGET TOOL` returns just that object. A saved server may carry
-   `allow` and `deny` lists of glob patterns (`mcpdial set NAME --json` shows them);
-   `tools` and `ls` then list and count only the permitted tools, and `tools NAME
-   --all` adds the hidden ones with `"denied": true`.
+   with each tool's `name`, `description`, and full `inputSchema`; with no target it
+   returns `{"servers": [...]}`, one probe per saved server, each carrying its own
+   `tools`. For one tool, `mcpdial schema TARGET TOOL` returns just that object, and a
+   name the server does not have is a usage error (exit 2) listing what it does have,
+   since the `tools/list` behind it succeeded and nothing was sent for that tool. A
+   saved server may carry `allow` and `deny` lists of glob patterns (`mcpdial set NAME
+   --json` shows them); `tools` and `ls` then list and count only the permitted tools,
+   and `tools NAME --all` adds the hidden ones with `"denied": true`.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json`, or
    `mcpdial call TARGET TOOL key=value ... --json`, prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text
@@ -313,7 +320,7 @@ goes to stdout in that mode, so there is no receipt.
 
 - `--timeout SECS` (default 60) bounds every wait. stdio servers that install packages
   on first run (`npx -y ...`) can need more. A saved server can carry its own timeout
-  (`add --timeout SECS`; `ls --no-probe --json` reports it under `timeout`), used when
+  (`add --timeout SECS`; `ls --json` reports it under `timeout`), used when
   the flag is not given; the flag beats it. The status probe behind `ls`, and behind
   `add` on save, waits 10 seconds when neither says: a server that takes longer to
   answer `initialize` is reported as `unreachable`.
