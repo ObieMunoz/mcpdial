@@ -71,6 +71,10 @@ pub enum Mode {
     DualEra,
     /// Accepts every request and answers none of them, until the server is dropped.
     BlackHole,
+    /// Revision 2026-07-28 in every respect but one: a `subscriptions/listen`
+    /// is accepted and then never answered, the way a server with nothing to
+    /// report and no manners about saying so leaves a stream hanging.
+    SilentSubscription,
     /// Stateless, but the first request to `/mcp` gets a 503, like a load balancer
     /// whose backend is still coming up.
     UnavailableOnce,
@@ -212,7 +216,9 @@ pub fn start(mode: Mode) -> FakeServer {
                     body,
                 };
                 requests.lock().unwrap().push(rec.clone());
-                if matches!(mode, Mode::BlackHole) || swallowed(&mode, &rec) {
+                let listening = matches!(mode, Mode::SilentSubscription)
+                    && rec.json()["method"] == "subscriptions/listen";
+                if matches!(mode, Mode::BlackHole) || listening || swallowed(&mode, &rec) {
                     held.push(req);
                     continue;
                 }
@@ -680,7 +686,10 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
-    if matches!(mode, Mode::Modern | Mode::ModernInput { .. }) {
+    if matches!(
+        mode,
+        Mode::Modern | Mode::ModernInput { .. } | Mode::SilentSubscription
+    ) {
         return modern(mode, rec, state);
     }
 
@@ -835,6 +844,10 @@ fn modern(mode: &Mode, rec: &Recorded, state: &Mutex<State>) -> Resp {
         );
     }
 
+    if method == "subscriptions/listen" {
+        return subscription_stream(&id, &params["notifications"]);
+    }
+
     let reply = match method {
         "server/discover" => json!({"jsonrpc":"2.0","id":id,"result":{
             "resultType":"complete",
@@ -882,6 +895,46 @@ fn demand_or_answer(insatiable: bool, id: &Value, params: &Value, meta: &Value) 
     );
     json!({"jsonrpc":"2.0","id":id,"result":{
         "resultType":"complete","content":[{"type":"text","text":text}]}})
+}
+
+/// The 2026-07-28 subscription stream: the acknowledgement the spec requires
+/// first, one notification of each kind the filter asked for, and then the
+/// graceful closure that ends the subscription.
+///
+/// It closes on its own so a test is bounded by the server rather than by the
+/// client's patience. Every message carries the subscription id, which is the
+/// JSON-RPC id of the request that opened it.
+fn subscription_stream(id: &Value, filter: &Value) -> Resp {
+    let tag = json!({"io.modelcontextprotocol/subscriptionId": id});
+    let mut messages = vec![json!({"jsonrpc":"2.0",
+        "method":"notifications/subscriptions/acknowledged",
+        "params":{"_meta":tag,"notifications":filter}})];
+    for uri in filter["resourceSubscriptions"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        messages.push(
+            json!({"jsonrpc":"2.0","method":"notifications/resources/updated",
+            "params":{"_meta":tag,"uri":uri}}),
+        );
+    }
+    if filter["toolsListChanged"] == json!(true) {
+        messages.push(
+            json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed",
+            "params":{"_meta":tag}}),
+        );
+    }
+    messages.push(json!({"jsonrpc":"2.0","id":id,
+        "result":{"resultType":"complete","_meta":tag}}));
+    let sse: String = messages
+        .iter()
+        .map(|m| format!("event: message\ndata: {m}\n\n"))
+        .collect();
+    with_headers(
+        Response::from_string(sse),
+        &[("Content-Type", "text/event-stream")],
+    )
 }
 
 /// What `Mcp-Name` must carry for a request, if anything.

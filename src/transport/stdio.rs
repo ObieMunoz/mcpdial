@@ -10,15 +10,24 @@ use crate::protocol::{answer_with, classify, Error, Incoming, Responder, Result}
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 /// How many trailing stderr lines to keep for the post-mortem.
 const STDERR_TAIL: usize = 12;
+
+/// How much of what a peer said unprompted one [`Framed::poll`] will take
+/// before handing control back.
+///
+/// The buffer behind a reader thread has no bound of its own, so a server that
+/// talks without being asked could otherwise keep a poll running for as long as
+/// it cared to talk. Whatever is left stays buffered for the next poll.
+const MOST_LINES_PER_POLL: usize = 4096;
 
 /// Newline-delimited JSON-RPC over a pair of byte streams: what a stdio server
 /// speaks on its pipes, and what a daemon relays over a socket. The reader runs
@@ -147,48 +156,149 @@ impl Framed {
                 }
                 Err(RecvTimeoutError::Disconnected) => return Err(gone()),
             };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(msg) = serde_json::from_str::<Value>(line) else {
-                (self.log)(&TraceEvent::NotJson { wire, line });
-                continue;
-            };
-            let received = |kind| TraceEvent::Received {
-                wire,
-                message: &msg,
-                kind,
-            };
-            match classify(&msg, Some(id)) {
-                Incoming::Response => {
-                    (self.log)(&received(Kind::Reply));
-                    return Ok(Some(msg));
-                }
-                Incoming::ServerRequest { id: theirs, method } => {
-                    (self.log)(&received(Kind::ServerRequest));
-                    let reply = match forward(&msg) {
-                        Some(from_elsewhere) => from_elsewhere,
-                        None => {
-                            answer_with(theirs, method, &msg["params"], self.responder.as_mut())
-                        }
-                    };
-                    (self.log)(&TraceEvent::Sent {
-                        wire,
-                        message: &reply,
-                    });
-                    if self.write_line(&reply.to_string()).is_err() {
-                        return Err(gone());
-                    }
-                }
-                Incoming::Notification { .. } => {
-                    (self.log)(&received(Kind::Other));
-                    forward(&msg);
-                }
-                Incoming::Foreign => (self.log)(&received(Kind::Other)),
+            match self.take(&line, Some(id), forward) {
+                Taken::Reply(msg) => return Ok(Some(msg)),
+                Taken::Broken => return Err(gone()),
+                Taken::Nothing => {}
             }
         }
     }
+
+    /// Hand every message already buffered to `forward` and answer anything the
+    /// peer asked, without waiting for one more byte.
+    ///
+    /// A reply to a request nobody is waiting for can only be a stray, and is
+    /// traced and dropped like any other message that is not ours.
+    pub(crate) fn poll(&mut self, forward: &mut dyn FnMut(&Value)) {
+        for _ in 0..MOST_LINES_PER_POLL {
+            let line = match self.lines.try_recv() {
+                Ok(line) => line,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+            };
+            let mut answered = |msg: &Value| {
+                forward(msg);
+                None
+            };
+            if let Taken::Broken = self.take(&line, None, &mut answered) {
+                return;
+            }
+        }
+    }
+
+    /// Send one request and read what comes back for at most `bound`, handing
+    /// every message to `watch` as it lands and stopping when `watch` says so.
+    ///
+    /// The bound running out is the ordinary end of a subscription rather than
+    /// a failure: everything the server said before it has already been
+    /// delivered, so there is nothing to report and nothing lost.
+    pub(crate) fn listen(
+        &mut self,
+        payload: &Value,
+        bound: Duration,
+        gone: &mut dyn FnMut() -> Error,
+        watch: &mut dyn FnMut(&Value) -> ControlFlow<()>,
+    ) -> Result<Option<Value>> {
+        (self.log)(&TraceEvent::Sent {
+            wire: self.wire,
+            message: payload,
+        });
+        if self.write_line(&payload.to_string()).is_err() {
+            return Err(gone());
+        }
+        let id = payload.get("id").cloned().unwrap_or(Value::Null);
+        let deadline = Instant::now() + bound;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            let line = match self.lines.recv_timeout(left) {
+                Ok(line) => line,
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => return Err(gone()),
+            };
+            let mut heard_enough = false;
+            let mut listening = |msg: &Value| {
+                heard_enough |= watch(msg).is_break();
+                None
+            };
+            match self.take(&line, Some(&id), &mut listening) {
+                Taken::Reply(msg) => return Ok(Some(msg)),
+                Taken::Broken => return Err(gone()),
+                Taken::Nothing if heard_enough => return Ok(None),
+                Taken::Nothing => {}
+            }
+        }
+    }
+
+    /// What one line off the wire turns out to be, with `awaiting` naming the
+    /// request in flight when there is one.
+    ///
+    /// A request the peer makes is answered here, because the peer may well be
+    /// blocked on that answer: waiting quietly for our own id would deadlock
+    /// both ends.
+    fn take(
+        &mut self,
+        line: &str,
+        awaiting: Option<&Value>,
+        forward: &mut dyn FnMut(&Value) -> Option<Value>,
+    ) -> Taken {
+        let wire = self.wire;
+        let line = line.trim();
+        if line.is_empty() {
+            return Taken::Nothing;
+        }
+        let Ok(msg) = serde_json::from_str::<Value>(line) else {
+            (self.log)(&TraceEvent::NotJson { wire, line });
+            return Taken::Nothing;
+        };
+        let received = |kind| TraceEvent::Received {
+            wire,
+            message: &msg,
+            kind,
+        };
+        match classify(&msg, awaiting) {
+            Incoming::Response => {
+                (self.log)(&received(Kind::Reply));
+                Taken::Reply(msg)
+            }
+            Incoming::ServerRequest { id: theirs, method } => {
+                (self.log)(&received(Kind::ServerRequest));
+                let reply = match forward(&msg) {
+                    Some(from_elsewhere) => from_elsewhere,
+                    None => answer_with(theirs, method, &msg["params"], self.responder.as_mut()),
+                };
+                (self.log)(&TraceEvent::Sent {
+                    wire,
+                    message: &reply,
+                });
+                match self.write_line(&reply.to_string()) {
+                    Ok(()) => Taken::Nothing,
+                    Err(_) => Taken::Broken,
+                }
+            }
+            Incoming::Notification { .. } => {
+                (self.log)(&received(Kind::Other));
+                forward(&msg);
+                Taken::Nothing
+            }
+            Incoming::Foreign => {
+                (self.log)(&received(Kind::Other));
+                Taken::Nothing
+            }
+        }
+    }
+}
+
+/// What one line off the wire came to.
+enum Taken {
+    /// Nothing the reader was waiting for: a notification, a request that has
+    /// been answered, a stray, or a line that was not JSON at all.
+    Nothing,
+    /// The answer to the request in flight.
+    Reply(Value),
+    /// The peer will not take our reply, so the connection is over.
+    Broken,
 }
 
 pub struct StdioTransport {
@@ -384,6 +494,37 @@ impl Transport for StdioTransport {
             watch(from_server);
             None
         })
+    }
+
+    /// A stdio server writes into a pipe whenever it likes, and the reader
+    /// thread has been buffering it all along, so what it said between two
+    /// commands is already here for the taking.
+    fn poll(&mut self, watch: &mut dyn FnMut(&Value)) {
+        self.framed.poll(watch);
+    }
+
+    fn listen(
+        &mut self,
+        payload: &Value,
+        bound: Duration,
+        watch: &mut dyn FnMut(&Value) -> ControlFlow<()>,
+    ) -> Result<Option<Value>> {
+        let Self {
+            child,
+            framed,
+            stderr_tail,
+            ..
+        } = self;
+        let outcome = framed.listen(
+            payload,
+            bound,
+            &mut || post_mortem(child, stderr_tail),
+            watch,
+        );
+        if outcome.is_err() {
+            self.note_exit();
+        }
+        outcome
     }
 
     fn answer_requests(&mut self, responder: Responder) -> bool {

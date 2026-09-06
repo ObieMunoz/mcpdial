@@ -5,13 +5,15 @@ use history::{History, Keep, Origin, Recorded};
 use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
+use mcpdial::notify::Notice;
 use mcpdial::protocol::{is_not_found, INVALID_PARAMS, METHOD_NOT_FOUND};
 use mcpdial::registry::{Pick, Registry, Resolved};
 use mcpdial::serve;
 use mcpdial::session::{
     extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
-    Media, MediaSink,
+    Media, MediaSink, Watcher,
 };
+use mcpdial::subscribe::{Mechanism, Sink, Subscriptions};
 use mcpdial::transport::trace::Trace;
 use mcpdial::{
     daemon, keychain, oauth, Backend, Credential, Elicit, Error, KnownVersion, Level, ServerConfig,
@@ -820,15 +822,44 @@ fn shape(json: bool) -> As {
     }
 }
 
-/// One request with somebody listening to what the server says on the way, and
-/// the updating line finished before whatever prints next, however it went.
-fn watched<'a, T>(
-    notices: &mut Notices<'a>,
-    request: impl FnOnce(&mut Notices<'a>) -> Result<T, Error>,
+/// One shell request with somebody listening to what the server says on the
+/// way, and the updating line finished before whatever prints next, however it
+/// went.
+///
+/// A `list_changed` or an update to a followed resource arrives in the middle
+/// of a call's output, where acting on it would put a line of ours between two
+/// lines of the server's. So it is put aside here and acted on at the prompt,
+/// where there is nothing to interrupt. Everything else a server says on the
+/// way is drawn exactly as it is drawn everywhere else.
+fn shell_watched<T>(
+    notices: &mut Notices<'_>,
+    subs: &mut Subscriptions,
+    request: impl FnOnce(&mut dyn Watcher) -> Result<T, Error>,
 ) -> Result<T, Error> {
-    let outcome = request(notices);
+    let outcome = request(&mut ShellWatch { notices, subs });
     notices.finish();
     outcome
+}
+
+struct ShellWatch<'a, 'u> {
+    notices: &'a mut Notices<'u>,
+    subs: &'a mut Subscriptions,
+}
+
+impl Watcher for ShellWatch<'_, '_> {
+    fn wants_progress(&self) -> bool {
+        self.notices.wants_progress()
+    }
+
+    fn interrupted(&mut self) {
+        self.notices.interrupted();
+    }
+
+    fn notice(&mut self, notice: &Notice<'_>) {
+        if !self.subs.record(notice) {
+            self.notices.notice(notice);
+        }
+    }
 }
 
 /// What this invocation can answer when a server asks for one more fact.
@@ -1618,6 +1649,10 @@ const SHELL_COMMANDS: &[&str] = &[
     "save",
     "retry",
     "edit",
+    "subscribe",
+    "unsubscribe",
+    "subscriptions",
+    "listen",
     "info",
     "help",
     "quit",
@@ -1720,6 +1755,10 @@ struct Live<'a, 'b> {
     /// answered with the shape the server actually wants.
     tools: &'a mut Option<Vec<Value>>,
     results: &'a mut History,
+    /// What the session is following, so that a `list_changed` or an update to
+    /// a followed resource arriving during this call is put aside for the
+    /// prompt rather than drawn into the middle of the result.
+    subs: &'a mut Subscriptions,
 }
 
 /// One `call` at the shell, from the arguments it settled on to the result filed
@@ -1738,7 +1777,7 @@ fn shell_call(
     // the one most worth running again.
     live.results.sending(tool, &arguments);
     let sent = arguments.clone();
-    let mut result = match watched(live.notices, |w| {
+    let mut result = match shell_watched(live.notices, live.subs, |w| {
         live.conn.session.call_tool_watching(tool, arguments, w)
     }) {
         Ok(result) => result,
@@ -2131,6 +2170,197 @@ fn shell_tools<'a>(
     cache
         .get_or_insert_with(|| conn.list_tools().unwrap_or_default())
         .as_slice()
+}
+
+/// The three lists a shell session holds: for Tab completion, for `help TOOL`,
+/// and for explaining a name the server does not have. A `list_changed`
+/// notification is a server saying one of these is no longer what it was.
+#[derive(Default)]
+struct Lists {
+    tools: Option<Vec<Value>>,
+    resources: Option<Vec<Value>>,
+    templates: Option<Vec<Value>>,
+    prompts: Option<Vec<Value>>,
+}
+
+impl Lists {
+    fn tools(&self) -> &[Value] {
+        self.tools.as_deref().unwrap_or_default()
+    }
+    fn resources(&self) -> &[Value] {
+        self.resources.as_deref().unwrap_or_default()
+    }
+    fn templates(&self) -> &[Value] {
+        self.templates.as_deref().unwrap_or_default()
+    }
+    fn prompts(&self) -> &[Value] {
+        self.prompts.as_deref().unwrap_or_default()
+    }
+}
+
+/// Where a line about something the server did on its own initiative goes.
+///
+/// This is the agent contract applied to asynchronous news. Under `--json` the
+/// fact goes out as an object on stderr, which is exactly what a script waiting
+/// for it reads. In prose it is company for a person watching, so it needs a
+/// terminal on both streams - the rule the progress line already keeps. A pipe
+/// reading plain text gets nothing at all, because its bytes are frozen and a
+/// server it has never heard of does not get to move them.
+#[derive(Clone, Copy)]
+enum Says {
+    Wire,
+    Prose,
+    Nothing,
+}
+
+impl Says {
+    fn choose(json: bool) -> Self {
+        if json {
+            Says::Wire
+        } else if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+            Says::Prose
+        } else {
+            Says::Nothing
+        }
+    }
+
+    fn tell(self, ui: &dyn Presenter, line: &str, wire: &Value) {
+        match self {
+            Says::Wire => ui.err_line(&wire.to_string()),
+            Says::Prose => ui.aside(line),
+            Says::Nothing => {}
+        }
+    }
+}
+
+/// The `subscribe URI [FILE]` line: what to follow, and where its contents go.
+fn subscription_target(rest: &str) -> (&str, Sink) {
+    let (uri, file) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    match file.trim() {
+        "" => (uri, Sink::Shown),
+        path => (uri, Sink::File(PathBuf::from(path))),
+    }
+}
+
+/// Whether this server said it will report a resource changing.
+///
+/// Only the revisions with `resources/subscribe` declare it; 2026-07-28 folded
+/// subscriptions into `subscriptions/listen`, which every server speaking that
+/// revision has, so there is nothing there to declare and nothing to check.
+fn advertises_subscribe(server_info: &Value) -> bool {
+    server_info["capabilities"]["resources"]["subscribe"] == json!(true)
+}
+
+/// Register an interest in a resource with the server, where the revision has
+/// somewhere to register it.
+///
+/// 2026-07-28 has no request for this: the interest travels in the filter of
+/// the next `subscriptions/listen`, so the only thing to do here is remember it.
+fn start_following(
+    conn: &mut client::Connection,
+    mechanism: Mechanism,
+    uri: &str,
+    info_cmd: &str,
+) -> Result<(), Failure> {
+    if let Mechanism::Listen = mechanism {
+        return Ok(());
+    }
+    if !advertises_subscribe(&conn.server_info) {
+        return Err(Failure::hinted(
+            Error::usage("this server does not offer resource subscriptions"),
+            format!("{info_cmd} shows what it does offer; `read URI` fetches a resource once."),
+        ));
+    }
+    conn.session
+        .subscribe_resource(uri)
+        .map(|_| ())
+        .map_err(|e| missing_item(e, "resources", "`resources`", info_cmd))
+}
+
+/// How long one `listen` holds the stream open, when nobody said.
+const LISTEN_FOR: Duration = Duration::from_secs(5);
+
+/// The longest one `listen` will hold it, whatever was typed: a mistyped bound
+/// should cost a wait, not a session.
+const LISTEN_AT_MOST: f64 = 3600.0;
+
+fn listen_bound(rest: &str) -> Result<Duration, Failure> {
+    if rest.is_empty() {
+        return Ok(LISTEN_FOR);
+    }
+    match rest.parse::<f64>() {
+        Ok(secs) if secs > 0.0 => Ok(Duration::from_secs_f64(secs.min(LISTEN_AT_MOST))),
+        _ => Err(Failure::hinted(
+            Error::usage(format!("{rest:?} is not a number of seconds")),
+            format!(
+                "usage: listen [SECONDS]   (default {}s)",
+                LISTEN_FOR.as_secs()
+            ),
+        )),
+    }
+}
+
+/// Everything the server has said since the last prompt, acted on now that
+/// there is nothing to interrupt: whatever a stdio server pushed while nobody
+/// was reading is taken first, then each list it says has changed is re-read
+/// and each followed resource fetched again.
+///
+/// Answers how many of those failed, which counts with the failures of the
+/// commands that were typed: a subscription is something the user asked for,
+/// and one that cannot be kept is worth an exit code.
+fn drain_subscriptions(
+    ui: &dyn Presenter,
+    says: Says,
+    notices: &mut Notices<'_>,
+    conn: &mut client::Connection,
+    subs: &mut Subscriptions,
+    lists: &mut Lists,
+) -> u32 {
+    let _ = shell_watched(notices, subs, |w| {
+        conn.session.poll(w);
+        Ok(())
+    });
+    let mut failures = 0;
+    let reports = subs.apply(
+        &mut conn.session,
+        &mut lists.tools,
+        &mut lists.resources,
+        &mut lists.prompts,
+    );
+    for report in reports {
+        match report {
+            Ok(report) => {
+                says.tell(ui, &report.line, &report.wire);
+                if let Some(result) = report.shown {
+                    show_resource(ui, says, &result);
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                let failure = Failure::hinted(
+                    e,
+                    "`subscriptions` lists what this session is following; \
+                     `unsubscribe URI` stops one.",
+                );
+                match says {
+                    Says::Wire => print_value(ui, &failure.to_json(), true),
+                    _a_person_or_a_pipe => failure.report(ui),
+                }
+            }
+        }
+    }
+    failures
+}
+
+/// A followed resource's new contents, on stdout, because that is what was
+/// asked for: `subscribe URI` with nowhere to put them means show them.
+fn show_resource(ui: &dyn Presenter, says: Says, result: &Value) {
+    if let Says::Wire = says {
+        print_value(ui, result, true);
+        return;
+    }
+    let text = render_resource(result, &mut |_| Ok(None)).unwrap_or_default();
+    ui.text(&text);
 }
 
 fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
@@ -2593,30 +2823,30 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             };
             let mut input = Input::open(&store, &r, &label, interactive)?;
             let mut failures = 0u32;
-            // tools/list, fetched at most once, so a mistake can be answered with
-            // the shape the server actually wants.
-            let mut cache: Option<Vec<Value>> = None;
-            let mut resources: Option<Vec<Value>> = None;
-            let mut templates: Option<Vec<Value>> = None;
-            let mut prompts: Option<Vec<Value>> = None;
+            // Each list is fetched at most once, so a mistake can be answered
+            // with the shape the server actually wants.
+            let mut lists = Lists::default();
             // The session, for the length of a Tab and no longer; see [`Lent`].
             let lent = Lent::default();
+            // What this session is following, and what has changed under it.
+            let mut subs = Subscriptions::new(conn.session.version());
+            let says = Says::choose(cli.json);
             if matches!(input, Input::Tty { .. }) {
                 // One eager fetch: it gives Tab something to complete and warms
                 // the same cache the hints read.
-                let tools = shell_tools(&mut cache, &mut conn).to_vec();
+                let tools = shell_tools(&mut lists.tools, &mut conn).to_vec();
                 if advertises(&conn.server_info, "resources") {
-                    resources = conn.session.list_resources().ok();
-                    templates = conn.session.list_resource_templates().ok();
+                    lists.resources = conn.session.list_resources().ok();
+                    lists.templates = conn.session.list_resource_templates().ok();
                 }
                 if advertises(&conn.server_info, "prompts") {
-                    prompts = conn.session.list_prompts().ok();
+                    lists.prompts = conn.session.list_prompts().ok();
                 }
                 input.set_completions(
                     &tools,
-                    resources.as_deref().unwrap_or_default(),
-                    templates.as_deref().unwrap_or_default(),
-                    prompts.as_deref().unwrap_or_default(),
+                    lists.resources(),
+                    lists.templates(),
+                    lists.prompts(),
                 );
                 if advertises(&conn.server_info, "completions") {
                     input.suggestions_from(Rc::new(lent.clone()));
@@ -2659,7 +2889,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     "help" => match refuse_denied(&r.config, &r.name, rest) {
                         Err(denied) => Err(denied),
                         Ok(()) => {
-                            let tools = shell_tools(&mut cache, &mut conn);
+                            let tools = shell_tools(&mut lists.tools, &mut conn);
                             match find_tool(tools, rest) {
                                 Some(t) => {
                                     ui.err_line(&tool_usage(t, "call", ""));
@@ -2676,7 +2906,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     "schema" => match refuse_denied(&r.config, &r.name, rest) {
                         Err(denied) => Err(denied),
                         Ok(()) => {
-                            let tools = shell_tools(&mut cache, &mut conn);
+                            let tools = shell_tools(&mut lists.tools, &mut conn);
                             match find_tool(tools, rest) {
                                 Some(t) => {
                                     ui.paged(|| print_value(ui, t, cli.json));
@@ -2699,7 +2929,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 print_tools(ui, &tools, long);
                             });
                         }
-                        cache = Some(tools);
+                        lists.tools = Some(tools);
                     }),
                     "resources" => match conn.session.list_resources() {
                         Err(e) => Err(missing_capability(e, "resources", info_cmd)),
@@ -2722,8 +2952,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     ui.resources(&listed, long);
                                 }
                             }
-                            resources = Some(found);
-                            templates = Some(listed);
+                            lists.resources = Some(found);
+                            lists.templates = Some(listed);
                             Ok(())
                         }
                     },
@@ -2731,7 +2961,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         Error::usage("read needs a resource URI"),
                         "usage: read URI   (`resources` lists what this server offers)",
                     )),
-                    "read" => match watched(&mut notices, |w| {
+                    "read" => match shell_watched(&mut notices, &mut subs, |w| {
                         conn.session.read_resource_watching(rest, w)
                     }) {
                         Err(e) => Err(missing_item(e, "resources", "`resources`", info_cmd)),
@@ -2779,7 +3009,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 ui.line(&format!("{} prompt(s):", found.len()));
                                 print_prompts(ui, &found, long);
                             }
-                            prompts = Some(found);
+                            lists.prompts = Some(found);
                             Ok(())
                         }
                     },
@@ -2793,7 +3023,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         } else {
                             args::shell_arguments(args, || Value::Null)
                                 .and_then(|a| {
-                                    watched(&mut notices, |w| {
+                                    shell_watched(&mut notices, &mut subs, |w| {
                                         conn.session.get_prompt_watching(name, a, w)
                                     })
                                 })
@@ -2841,23 +3071,24 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             // rejects mean the same thing to whoever typed the line:
                             // show them what this tool takes.
                             let parsed = args::shell_arguments(args, || {
-                                find_tool(shell_tools(&mut cache, &mut conn), tool)
+                                find_tool(shell_tools(&mut lists.tools, &mut conn), tool)
                                     .map_or(Value::Null, |t| t["inputSchema"].clone())
                             });
                             match parsed.and_then(|mut a| {
-                                shell_fill(ui, &mut cache, &mut conn, tool, &mut a).map(|()| a)
+                                shell_fill(ui, &mut lists.tools, &mut conn, tool, &mut a).map(|()| a)
                             }) {
                                 Err(e) => Err(Failure {
                                     error: e,
-                                    hint: shell_call_hint(&mut cache, &mut conn, tool, true),
+                                    hint: shell_call_hint(&mut lists.tools, &mut conn, tool, true),
                                     tool: None,
                                 }),
                                 Ok(a) => {
                                     let mut live = Live {
                                         conn: &mut conn,
                                         notices: &mut notices,
-                                        tools: &mut cache,
+                                        tools: &mut lists.tools,
                                         results: &mut results,
+                                        subs: &mut subs,
                                     };
                                     shell_call(ui, &out, &mut live, tool, a, cli.json, save_dir)
                                 }
@@ -2907,14 +3138,14 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     Ok(history::no_arguments())
                                 } else {
                                     args::shell_arguments(pairs, || {
-                                        find_tool(shell_tools(&mut cache, &mut conn), tool)
+                                        find_tool(shell_tools(&mut lists.tools, &mut conn), tool)
                                             .map_or(Value::Null, |t| t["inputSchema"].clone())
                                     })
                                 };
                                 match changes {
                                     Err(e) => Err(Failure {
                                         error: e,
-                                        hint: shell_call_hint(&mut cache, &mut conn, tool, true),
+                                        hint: shell_call_hint(&mut lists.tools, &mut conn, tool, true),
                                         tool: None,
                                     }),
                                     Ok(changes) => {
@@ -2939,6 +3170,137 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             print_rerun(ui, &line, cli.json);
                             pending = Some(line);
                             Ok(())
+                        }
+                    },
+                    "subscribe" if rest.is_empty() => Err(Failure::hinted(
+                        Error::usage("subscribe needs a resource URI"),
+                        "usage: subscribe URI [FILE]   (`resources` lists what this server offers)",
+                    )),
+                    "subscribe" => {
+                        let (uri, sink) = subscription_target(rest);
+                        match start_following(&mut conn, subs.mechanism(), uri, info_cmd) {
+                            Err(refused) => Err(refused),
+                            Ok(()) => {
+                                let replaced = subs.follow(uri, sink.clone());
+                                let to = sink.describe();
+                                if cli.json {
+                                    ui.json(
+                                        &json!({"subscribed": {"uri": uri, "to": to,
+                                                "via": subs.mechanism().method()}})
+                                        .to_string(),
+                                    );
+                                } else {
+                                    let again = match replaced {
+                                        Some(_) => " (replacing what it was)",
+                                        None => "",
+                                    };
+                                    ui.line(&format!("following {uri} -> {to}{again}"));
+                                    if subs.mechanism().needs_listening() {
+                                        ui.aside(
+                                            "this revision delivers updates on a `listen` stream",
+                                        );
+                                    }
+                                }
+                                Ok(())
+                            }
+                        }
+                    }
+                    "unsubscribe" if rest.is_empty() => Err(Failure::hinted(
+                        Error::usage("unsubscribe needs a resource URI"),
+                        "usage: unsubscribe URI   (`subscriptions` lists what this session follows)",
+                    )),
+                    "unsubscribe" => match subs.forget(rest) {
+                        Err(e) => Err(Failure::hinted(
+                            e,
+                            "`subscriptions` lists what this session is following.",
+                        )),
+                        Ok(_) => {
+                            // The subscription is over here whatever the server
+                            // makes of the cancellation, so the receipt goes out
+                            // first and a refusal is reported after it: an update
+                            // arriving from now on has nowhere left to go.
+                            if cli.json {
+                                ui.json(
+                                    &json!({"unsubscribed": {"uri": rest,
+                                            "via": subs.mechanism().method()}})
+                                    .to_string(),
+                                );
+                            } else {
+                                ui.line(&format!("no longer following {rest}"));
+                            }
+                            match subs.mechanism() {
+                                // 2026-07-28 cancels a subscription by not asking
+                                // for it in the next `listen`, so there is nothing
+                                // to send.
+                                Mechanism::Listen => Ok(()),
+                                Mechanism::Subscribe => conn
+                                    .session
+                                    .unsubscribe_resource(rest)
+                                    .map(|_| ())
+                                    .map_err(|e| missing_capability(e, "resources", info_cmd)),
+                            }
+                        }
+                    },
+                    "subscriptions" => {
+                        let following: Vec<(String, String)> = subs
+                            .following()
+                            .map(|(uri, sink)| (uri.clone(), sink.describe()))
+                            .collect();
+                        if cli.json {
+                            let rows: Vec<Value> = following
+                                .iter()
+                                .map(|(uri, to)| json!({"uri": uri, "to": to}))
+                                .collect();
+                            print_value(
+                                ui,
+                                &json!({"subscriptions": rows,
+                                        "via": subs.mechanism().method()}),
+                                true,
+                            );
+                        } else {
+                            ui.line(&format!("{} subscription(s):", following.len()));
+                            for (uri, to) in &following {
+                                ui.line(&format!("  {uri} -> {to}"));
+                            }
+                        }
+                        Ok(())
+                    }
+                    // A revision with `resources/subscribe` pushes its updates
+                    // onto whatever stream is open, so they are already here by
+                    // the next prompt and there is no stream to hold open.
+                    "listen" if !subs.mechanism().needs_listening() => Err(Failure::hinted(
+                        Error::usage(format!(
+                            "this server speaks {}, which has no subscriptions/listen",
+                            conn.session.version()
+                        )),
+                        "its updates arrive with the next command's reply; \
+                         `subscribe URI` is all this session needs.",
+                    )),
+                    "listen" => match listen_bound(rest) {
+                        Err(bad) => Err(bad),
+                        Ok(bound) => {
+                            let filter = subs.filter();
+                            subs.opening_a_stream();
+                            let held = shell_watched(&mut notices, &mut subs, |w| {
+                                conn.session.listen(filter, bound, w)
+                            });
+                            held.map_err(Failure::from).map(|closed| {
+                                let seconds = bound.as_secs_f64();
+                                if cli.json {
+                                    ui.json(
+                                        &json!({"listened": {"seconds": seconds,
+                                                "acknowledged": subs.acknowledged(),
+                                                "closed": closed}})
+                                        .to_string(),
+                                    );
+                                } else if !subs.acknowledged() {
+                                    ui.line(&format!("no acknowledgement in {seconds}s"));
+                                } else if closed {
+                                    ui.line("the server closed the subscription");
+                                } else {
+                                    ui.line(&format!("listened for {seconds}s"));
+                                }
+                            })
                         }
                     },
                     "elicit" if rest.is_empty() => Err(Failure::hinted(
@@ -2987,7 +3349,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         "arrow keys and line editing need a terminal on both stdin and stdout",
                     )),
                     other => {
-                        let tools = shell_tools(&mut cache, &mut conn);
+                        let tools = shell_tools(&mut lists.tools, &mut conn);
                         let unknown = || Error::usage(format!("unknown command {other:?}"));
                         let near_tool =
                             closest(other, tools.iter().filter_map(|t| t["name"].as_str()))
@@ -3014,12 +3376,6 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         })
                     }
                 };
-                input.set_completions(
-                    cache.as_deref().unwrap_or_default(),
-                    resources.as_deref().unwrap_or_default(),
-                    templates.as_deref().unwrap_or_default(),
-                    prompts.as_deref().unwrap_or_default(),
-                );
                 if let Err(f) = outcome {
                     failures += 1;
                     if cli.json {
@@ -3028,6 +3384,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         f.report(ui);
                     }
                 }
+                // Between two commands, where a line of ours cannot land in the
+                // middle of a line of the server's.
+                failures +=
+                    drain_subscriptions(ui, says, &mut notices, &mut conn, &mut subs, &mut lists);
+                input.set_completions(
+                    lists.tools(),
+                    lists.resources(),
+                    lists.templates(),
+                    lists.prompts(),
+                );
             }
             input.save_history();
             Ok(if failures > 0 && !interactive {

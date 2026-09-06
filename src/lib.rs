@@ -36,6 +36,7 @@ pub mod schema;
 pub mod search;
 pub mod serve;
 pub mod session;
+pub mod subscribe;
 pub mod transport;
 
 pub use client::{connect, probe, probe_all, resolve, Connection, Probe, Status};

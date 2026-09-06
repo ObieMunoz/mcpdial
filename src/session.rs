@@ -13,6 +13,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,6 +34,14 @@ const MOST_COMPLETIONS: usize = 100;
 /// long as it had patience. Two rounds cover every flow the spec draws; the rest
 /// is headroom for a server that asks for one thing at a time.
 const MAX_INPUT_ROUNDS: usize = 4;
+
+/// How many messages one [`Session::listen`] will take before it hands control
+/// back, whatever its bound still allows.
+///
+/// A server is entitled to talk for as long as it likes on a subscription
+/// stream; whoever opened it is not obliged to listen that long. Anything past
+/// this is left on the wire for the next listen.
+const MOST_MESSAGES_PER_LISTEN: usize = 1000;
 
 /// What a caller does with the notifications a server sends while its request
 /// is still in flight.
@@ -312,6 +321,75 @@ impl<T: Transport> Session<T> {
     pub fn notify(&mut self, method: &str, params: Option<Value>) -> Result<()> {
         self.transport.send(&notification(method, params))?;
         Ok(())
+    }
+
+    /// Ask the server to say when this resource changes, and stop asking.
+    ///
+    /// Only 2025-11-25 and earlier have these: 2026-07-28 folded them into the
+    /// filter of a [`Session::listen`] stream, so a caller on that revision
+    /// registers its interest there instead and never comes here.
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        self.request("resources/subscribe", Some(json!({ "uri": uri })))
+    }
+
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value> {
+        self.request("resources/unsubscribe", Some(json!({ "uri": uri })))
+    }
+
+    /// Open a 2026-07-28 `subscriptions/listen` stream and read it for at most
+    /// `bound`, handing every notification on it to `watch`.
+    ///
+    /// The stream is long-lived by design: the server acknowledges, sends what
+    /// the `notifications` filter asked for as it happens, and answers the
+    /// request itself only when it closes the subscription. So the answer is
+    /// not what this is for, and returning is bounded twice over - by the wall
+    /// clock the caller set and by [`MOST_MESSAGES_PER_LISTEN`] - because a
+    /// caller with a prompt to hand back cannot be held by a talkative server.
+    ///
+    /// Answers `true` when the server closed the subscription itself, which is
+    /// the difference between a stream that ended and one that was left open.
+    pub fn listen(
+        &mut self,
+        notifications: Value,
+        bound: Duration,
+        watch: &mut dyn Watcher,
+    ) -> Result<bool> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let params = Some(json!({ "notifications": notifications }));
+        let params = match self.version.is_modern() {
+            true => Some(with_client_meta(params, self.version, &self.declares())),
+            false => params,
+        };
+        let sent = request("subscriptions/listen", id, params);
+        let mut heard = 0usize;
+        let reply = self.transport.listen(&sent, bound, &mut |from_server| {
+            match classify(from_server, None) {
+                Incoming::ServerRequest { method, .. } if method != PING => watch.interrupted(),
+                _ => {
+                    if let Some(notice) = notify::read(from_server, None) {
+                        watch.notice(&notice);
+                    }
+                }
+            }
+            heard += 1;
+            match heard < MOST_MESSAGES_PER_LISTEN {
+                true => ControlFlow::Continue(()),
+                false => ControlFlow::Break(()),
+            }
+        })?;
+        Ok(check(reply)?.is_some())
+    }
+
+    /// Hand whatever the server has already said, and nobody has read, to
+    /// `watch`. Never waits, and never fails: a server with nothing to say has
+    /// said nothing.
+    pub fn poll(&mut self, watch: &mut dyn Watcher) {
+        self.transport.poll(&mut |from_server| {
+            if let Some(notice) = notify::read(from_server, None) {
+                watch.notice(&notice);
+            }
+        });
     }
 
     /// Bring the session up and return what the server said about itself.

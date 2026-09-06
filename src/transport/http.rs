@@ -11,6 +11,7 @@ use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, Read};
+use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 /// Always send a real browser User-Agent. This is a correctness requirement, not
@@ -422,8 +423,15 @@ impl HttpTransport {
         // is one body with nothing in front of the answer, read whole.
         let (text, streamed_reply) = if streaming(status, &content_type) {
             let mut read_so_far = String::new();
-            let found = read_stream(&mut resp.body_mut().as_reader(), &mut read_so_far, watch)
-                .map_err(|e| broken(&e))?;
+            let found = read_stream(
+                &mut resp.body_mut().as_reader(),
+                &mut read_so_far,
+                &mut |message| {
+                    watch(message);
+                    ControlFlow::Continue(())
+                },
+            )
+            .map_err(|e| broken(&e))?;
             (read_so_far, found)
         } else {
             (
@@ -494,6 +502,104 @@ impl HttpTransport {
         }
         Ok(reply)
     }
+
+    /// POST a request whose response stream is meant to stay open, and read it
+    /// for at most `bound`.
+    ///
+    /// Deliberately not [`HttpTransport::attempt`]: none of what that does
+    /// applies here. There is nothing to retry, because a `subscriptions/listen`
+    /// sent twice opens two subscriptions; the revision that has this request
+    /// has no session to carry; and a stream that stops early is a subscription
+    /// that ended rather than a reply that went missing. The timeout is this
+    /// call's own, so the bound holds whatever `--timeout` is.
+    fn hold_open(
+        &mut self,
+        payload: &Value,
+        bound: Duration,
+        watch: &mut dyn FnMut(&Value) -> ControlFlow<()>,
+    ) -> Result<Option<Value>> {
+        let wire = Wire::Http(&self.url);
+        (self.log)(&TraceEvent::Sent {
+            wire,
+            message: payload,
+        });
+        let started = Instant::now();
+        let mut req = self
+            .identify(
+                self.agent
+                    .post(&self.url)
+                    .config()
+                    .timeout_global(Some(bound))
+                    .build(),
+            )
+            .header("Content-Type", "application/json")
+            // A stream is what this asks for, but a server refusing the
+            // subscription answers in one body, and an `Accept` that leaves no
+            // room for that turns its explanation into a 406.
+            .header("Accept", "application/json, text/event-stream");
+        for (name, value) in mirrored_headers(payload) {
+            req = req.header(name, &value);
+        }
+
+        let mut resp = match req.send(payload.to_string()) {
+            Ok(resp) => resp,
+            // The bound running out before the server said anything at all is
+            // the ordinary end of a listen, not a failure to report.
+            Err(ureq::Error::Timeout(_)) => return Ok(None),
+            Err(e) => {
+                (self.log)(&TraceEvent::HttpFailed {
+                    wire,
+                    method: "POST",
+                    error: e.to_string(),
+                    elapsed: started.elapsed(),
+                });
+                return Err(Error::transport(format!(
+                    "could not reach {}: {e}",
+                    self.url
+                )));
+            }
+        };
+        let status = resp.status().as_u16();
+        let content_type = header(&resp, "content-type").unwrap_or_default();
+        if !(200..300).contains(&status) {
+            let www_authenticate = header(&resp, "www-authenticate");
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
+            (self.log)(&TraceEvent::HttpReply {
+                wire,
+                method: "POST",
+                status,
+                content_type: Some(content_type),
+                body: Some(&body),
+                elapsed: started.elapsed(),
+            });
+            return Err(Error::Http {
+                status,
+                body,
+                www_authenticate,
+            });
+        }
+        self.spoke_streamable_http = true;
+
+        let mut read_so_far = String::new();
+        // Every read error is the stream ending: the bound expiring mid-stream
+        // arrives as one, and so does a server hanging up. Whatever it said
+        // before then has already reached `watch`.
+        let reply = if streaming(status, &content_type) {
+            read_stream(&mut resp.body_mut().as_reader(), &mut read_so_far, watch).unwrap_or(None)
+        } else {
+            read_so_far = resp.body_mut().read_to_string().unwrap_or_default();
+            decode_body(&read_so_far, &content_type).unwrap_or(None)
+        };
+        (self.log)(&TraceEvent::HttpReply {
+            wire: Wire::Http(&self.url),
+            method: "POST",
+            status,
+            content_type: None,
+            body: Some(&read_so_far),
+            elapsed: started.elapsed(),
+        });
+        Ok(reply)
+    }
 }
 
 /// Whether this reply is a stream to be read as it comes rather than a body to
@@ -507,7 +613,7 @@ fn streaming(status: u16, content_type: &str) -> bool {
 }
 
 /// Read an SSE reply event by event, handing everything the server says on the
-/// way to `watch`, and stop at the answer.
+/// way to `watch`, and stop at the answer or wherever `watch` says to.
 ///
 /// Reading the whole body first is what dropped progress: by the time the last
 /// byte arrives there is nothing left to report. Stopping at the answer also
@@ -517,7 +623,7 @@ fn streaming(status: u16, content_type: &str) -> bool {
 fn read_stream(
     stream: &mut impl Read,
     read_so_far: &mut String,
-    watch: &mut dyn FnMut(&Value),
+    watch: &mut dyn FnMut(&Value) -> ControlFlow<()>,
 ) -> io::Result<Option<Value>> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -539,7 +645,11 @@ fn read_stream(
         if let Ok(msg) = serde_json::from_str::<Value>(&std::mem::take(&mut data)) {
             match classify(&msg, None) {
                 Incoming::Response => return Ok(Some(msg)),
-                _the_server_talking_to_us => watch(&msg),
+                _the_server_talking_to_us => {
+                    if watch(&msg).is_break() {
+                        return Ok(None);
+                    }
+                }
             }
         }
         if end_of_the_stream {
@@ -588,6 +698,15 @@ impl Transport for HttpTransport {
 
     fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
         std::mem::replace(&mut self.wait, within)
+    }
+
+    fn listen(
+        &mut self,
+        payload: &Value,
+        bound: Duration,
+        watch: &mut dyn FnMut(&Value) -> ControlFlow<()>,
+    ) -> Result<Option<Value>> {
+        self.hold_open(payload, bound, watch)
     }
 
     fn negotiated(&mut self, version: KnownVersion) {
