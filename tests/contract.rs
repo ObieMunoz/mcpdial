@@ -857,3 +857,65 @@ fn a_terminal_asked_for_plain_output_gets_the_piped_bytes() {
         );
     }
 }
+
+/// Every `.rs` file under `src`, so the grep below cannot miss one that is
+/// added later.
+fn rust_sources(dir: &Path, found: &mut Vec<PathBuf>) {
+    let listing = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+    for entry in listing {
+        let path = entry.expect("read a source directory entry").path();
+        if path.is_dir() {
+            rust_sources(&path, found);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            found.push(path);
+        }
+    }
+    found.sort();
+}
+
+/// #76 rule 1: `Presenter::choose` decides what a terminal gets, and nothing
+/// else in the binary asks stdout or stderr what they are.
+///
+/// It is a grep because the drift it guards against arrives one honest call
+/// site at a time - `notices.rs`, `elicit.rs` and two places in `main.rs` each
+/// grew one between #77 and #159 - and a second opinion about the terminal is
+/// one that can disagree with the first. #149 is what that costs when it does.
+///
+/// Stdin is deliberately not covered: whether somebody is typing is the input
+/// side, which #76 keeps separate, so `stdin().is_terminal()` is fine anywhere.
+/// Naming an output stream on the same line is also what tells this apart from
+/// `src/tasks.rs`, whose own `is_terminal` asks whether a task has finished.
+#[test]
+fn only_the_presenter_asks_stdout_or_stderr_what_they_are() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let presenter = src.join("present.rs");
+    let presenter_parts = src.join("present");
+    let mut files = Vec::new();
+    rust_sources(&src, &mut files);
+    assert!(files.len() > 10, "found no sources under {}", src.display());
+
+    let mut found = Vec::new();
+    for file in files {
+        if file == presenter || file.starts_with(&presenter_parts) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("{file:?}: {e}"));
+        for (i, line) in text.lines().enumerate() {
+            let names_a_stream = line.contains("stdout") || line.contains("stderr");
+            if line.contains("is_terminal") && names_a_stream {
+                let name = file.strip_prefix(&src).unwrap_or(&file).display();
+                found.push(format!("  src/{name}:{}: {}", i + 1, line.trim()));
+            }
+        }
+    }
+
+    assert!(
+        found.is_empty(),
+        "an output stream is asked what it is outside src/present.rs:\n{}\n\n\
+         `Presenter::choose` owns that question, so route it through the \
+         presenter instead: `ui.asks()` for something a person can answer, \
+         `ui.watched()` for prose a person can read, or a new accessor on \
+         `Presenter` when it is neither. See #76 and #159.",
+        found.join("\n")
+    );
+}

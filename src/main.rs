@@ -879,9 +879,10 @@ impl Watcher for ShellWatch<'_, '_> {
 /// Nothing here may wait on a person who is not there, and whether one is there
 /// is a question already answered: [`Presenter::asks`] is what says whether this
 /// run is a person's or a program's, and a missing argument and an elicitation
-/// are the same question put twice. Stderr is looked at as well, because that is
-/// where an elicitation's question and prompts go; `--json` says so twice over,
-/// since it also decides what the report on stderr looks like.
+/// are the same question put twice. [`Presenter::watched`] is asked as well,
+/// because an elicitation writes its question on stderr above the prompts, and
+/// prose nobody will read is not worth stalling a call for; `--json` says so
+/// twice over, since it also decides what the report on stderr looks like.
 fn elicitation(
     ui: &dyn Presenter,
     answers: Option<&str>,
@@ -895,7 +896,7 @@ fn elicitation(
         .and_then(|v| v.as_object().cloned());
     Ok(Elicit {
         answers,
-        ask: ui.asks() && std::io::stderr().is_terminal() && !json,
+        ask: ui.asks() && ui.watched() && !json,
         later: shell,
         browser: !no_browser,
         json,
@@ -2189,15 +2190,19 @@ enum Input {
 }
 
 impl Input {
-    /// A terminal reader when stdin and stdout are both a tty, so that a
-    /// redirected stdout keeps today's behaviour: prompts on stderr, nothing else.
+    /// A terminal reader where a line editor has both its ends, which is
+    /// [`Presenter::edits_lines`]: rustyline draws its prompt on stdout and
+    /// takes keys from stdin. Anything else keeps today's behaviour - prompts
+    /// on stderr, nothing else - and `interactive` is the input side alone,
+    /// saying only whether somebody is typing into that redirected stdout.
     fn open(
         store: &Store,
         r: &client::Resolved,
         label: &str,
+        ui: &dyn Presenter,
         interactive: bool,
     ) -> Result<Self, Error> {
-        if !interactive || !std::io::stdout().is_terminal() {
+        if !ui.edits_lines() {
             // A redirected stdout is the agent's, whatever is on stdin, so what
             // it is prompted with is the plain name and bracket it has always
             // been given rather than anything a state could move.
@@ -2358,10 +2363,10 @@ impl Lists {
 ///
 /// This is the agent contract applied to asynchronous news. Under `--json` the
 /// fact goes out as an object on stderr, which is exactly what a script waiting
-/// for it reads. In prose it is company for a person watching, so it needs a
-/// terminal on both streams - the rule the progress line already keeps. A pipe
-/// reading plain text gets nothing at all, because its bytes are frozen and a
-/// server it has never heard of does not get to move them.
+/// for it reads. In prose it is company for a person watching, which is
+/// [`Presenter::watched`] - the same answer the progress line is drawn on. A
+/// pipe reading plain text gets nothing at all, because its bytes are frozen
+/// and a server it has never heard of does not get to move them.
 #[derive(Clone, Copy)]
 enum Says {
     Wire,
@@ -2370,10 +2375,10 @@ enum Says {
 }
 
 impl Says {
-    fn choose(json: bool) -> Self {
+    fn choose(ui: &dyn Presenter, json: bool) -> Self {
         if json {
             Says::Wire
-        } else if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
+        } else if ui.watched() {
             Says::Prose
         } else {
             Says::Nothing
@@ -3071,7 +3076,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     .as_str()
                     .map_or_else(|| truncate_at(&r.name, 24), String::from)
             };
-            let mut input = Input::open(&store, &r, &label, interactive)?;
+            let mut input = Input::open(&store, &r, &label, ui, interactive)?;
             let mut failures = 0u32;
             // Each list is fetched at most once, so a mistake can be answered
             // with the shape the server actually wants.
@@ -3080,7 +3085,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let lent = Lent::default();
             // What this session is following, and what has changed under it.
             let mut subs = Subscriptions::new(conn.session.version());
-            let says = Says::choose(cli.json);
+            let says = Says::choose(ui, cli.json);
             if matches!(input, Input::Tty { .. }) {
                 // One eager fetch: it gives Tab something to complete and warms
                 // the same cache the hints read.
