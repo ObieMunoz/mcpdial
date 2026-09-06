@@ -1,9 +1,13 @@
-//! What a server says while a request of ours is still in flight.
+//! What a server says on its own initiative: while a request of ours is still
+//! in flight, or on a subscription stream we opened and left open.
 //!
 //! A long tool call is silent for as long as it runs unless the server is
 //! allowed to speak on the way. Two notifications carry that: `notifications/
 //! progress`, which a server only sends for a request that handed it a
-//! `progressToken`, and `notifications/message`, the server's own log.
+//! `progressToken`, and `notifications/message`, the server's own log. Two more
+//! say that what the server offers has moved on: a `list_changed` for each of
+//! the three lists, and `notifications/resources/updated` for one resource
+//! somebody asked to follow.
 //!
 //! Everything here is parsing and filtering. Where the result is shown - and
 //! whether it is shown at all - belongs to whoever is watching, because that
@@ -16,6 +20,59 @@ use std::str::FromStr;
 
 pub const PROGRESS_METHOD: &str = "notifications/progress";
 pub const MESSAGE_METHOD: &str = "notifications/message";
+pub const RESOURCE_UPDATED_METHOD: &str = "notifications/resources/updated";
+pub const ACKNOWLEDGED_METHOD: &str = "notifications/subscriptions/acknowledged";
+
+/// Which of the three lists a server offers, for the notification that says one
+/// of them has changed and for re-reading it afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Listing {
+    Tools,
+    Resources,
+    Prompts,
+}
+
+impl Listing {
+    pub const ALL: [Listing; 3] = [Listing::Tools, Listing::Resources, Listing::Prompts];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Listing::Tools => "tools",
+            Listing::Resources => "resources",
+            Listing::Prompts => "prompts",
+        }
+    }
+
+    /// The notification a server sends when this list is no longer what it was.
+    pub const fn changed_method(self) -> &'static str {
+        match self {
+            Listing::Tools => "notifications/tools/list_changed",
+            Listing::Resources => "notifications/resources/list_changed",
+            Listing::Prompts => "notifications/prompts/list_changed",
+        }
+    }
+
+    /// The key 2026-07-28's `subscriptions/listen` filter opts in under.
+    pub const fn listen_key(self) -> &'static str {
+        match self {
+            Listing::Tools => "toolsListChanged",
+            Listing::Resources => "resourcesListChanged",
+            Listing::Prompts => "promptsListChanged",
+        }
+    }
+
+    fn of_method(method: &str) -> Option<Listing> {
+        Listing::ALL
+            .into_iter()
+            .find(|l| l.changed_method() == method)
+    }
+}
+
+impl fmt::Display for Listing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// The eight severities RFC 5424 names, which MCP adopted as they are.
 ///
@@ -102,6 +159,17 @@ pub enum Body {
         logger: Option<String>,
         text: String,
     },
+    /// A `list_changed`: what the server offers is no longer what it offered,
+    /// so anything holding a copy of that list is holding a stale one.
+    ListChanged(Listing),
+    /// `notifications/resources/updated`: one resource somebody asked to follow
+    /// has new contents. The notification carries no contents of its own - it
+    /// is an invitation to read the resource again.
+    ResourceUpdated { uri: String },
+    /// `notifications/subscriptions/acknowledged`: the first message on a
+    /// 2026-07-28 subscription stream, carrying the subset of the filter the
+    /// server agreed to honour.
+    Acknowledged { notifications: Value },
 }
 
 /// One notification from a server, parsed, with the message it arrived in kept
@@ -114,9 +182,9 @@ pub struct Notice<'a> {
 
 impl Notice<'_> {
     pub fn level(&self) -> Option<Level> {
-        match self.body {
-            Body::Log { level, .. } => Some(level),
-            Body::Progress { .. } => None,
+        match &self.body {
+            Body::Log { level, .. } => Some(*level),
+            _not_a_log_line => None,
         }
     }
 
@@ -147,6 +215,9 @@ impl Notice<'_> {
                 Some(name) => format!("server [{level}] {name}: {text}"),
                 None => format!("server [{level}] {text}"),
             },
+            Body::ListChanged(what) => format!("{what} changed"),
+            Body::ResourceUpdated { uri } => format!("updated {uri}"),
+            Body::Acknowledged { .. } => "subscribed".to_string(),
         }
     }
 }
@@ -178,7 +249,13 @@ pub fn read<'a>(msg: &'a Value, token: Option<&Value>) -> Option<Notice<'a>> {
             logger: params["logger"].as_str().map(one_line),
             text: one_line(&text_of(&params["data"])),
         },
-        _ => return None,
+        RESOURCE_UPDATED_METHOD => Body::ResourceUpdated {
+            uri: one_line(params["uri"].as_str()?),
+        },
+        ACKNOWLEDGED_METHOD => Body::Acknowledged {
+            notifications: params["notifications"].clone(),
+        },
+        changed => Body::ListChanged(Listing::of_method(changed)?),
     };
     Some(Notice { message: msg, body })
 }
@@ -305,10 +382,59 @@ mod tests {
         for msg in [
             json!({"jsonrpc": "2.0", "id": 1, "result": {}}),
             json!({"jsonrpc": "2.0", "id": "srv", "method": "ping"}),
-            json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled"}),
+            // The invitation to re-read a resource is the URI; without one
+            // there is nothing to re-read.
+            json!({"jsonrpc": "2.0", "method": RESOURCE_UPDATED_METHOD, "params": {}}),
         ] {
             assert!(read(&msg, Some(&ours)).is_none(), "{msg}");
         }
+    }
+
+    #[test]
+    fn each_list_has_its_own_notification_and_its_own_listen_key() {
+        for what in Listing::ALL {
+            let msg = json!({"jsonrpc": "2.0", "method": what.changed_method()});
+            let notice = read(&msg, None).unwrap();
+            assert_eq!(notice.body, Body::ListChanged(what));
+            assert_eq!(notice.level(), None);
+            assert_eq!(notice.summary(), format!("{what} changed"));
+        }
+        let keys: Vec<&str> = Listing::ALL.iter().map(|l| l.listen_key()).collect();
+        assert_eq!(
+            keys,
+            [
+                "toolsListChanged",
+                "resourcesListChanged",
+                "promptsListChanged"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_resource_update_names_its_uri_and_an_acknowledgement_its_filter() {
+        let msg = json!({"jsonrpc": "2.0", "method": RESOURCE_UPDATED_METHOD,
+                         "params": {"uri": "file:///notes.md\r"}});
+        let notice = read(&msg, None).unwrap();
+        assert_eq!(
+            notice.body,
+            Body::ResourceUpdated {
+                uri: "file:///notes.md\\r".to_string()
+            },
+            "a server's own text cannot move the cursor"
+        );
+        assert_eq!(notice.summary(), "updated file:///notes.md\\r");
+
+        let ack = json!({"jsonrpc": "2.0", "method": ACKNOWLEDGED_METHOD,
+                         "params": {"_meta": {"io.modelcontextprotocol/subscriptionId": 1},
+                                    "notifications": {"toolsListChanged": true}}});
+        let notice = read(&ack, None).unwrap();
+        assert_eq!(
+            notice.body,
+            Body::Acknowledged {
+                notifications: json!({"toolsListChanged": true})
+            }
+        );
     }
 
     #[test]

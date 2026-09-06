@@ -586,9 +586,10 @@ chrome> quit
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
 `resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `show`, `save`, `retry`,
-`edit`, `info`, `help`, and `quit` (`exit` ends the session too); a `#` starts a
-comment. With `--json` each result is one line of JSON. In a script, any failed command
-makes the exit code 1 after the script finishes.
+`edit`, `subscribe`, `unsubscribe`, `subscriptions`, `listen`, `info`, `help`, and
+`quit` (`exit` ends the session too); a `#` starts a comment. With `--json` each result
+is one line of JSON. In a script, any failed command makes the exit code 1 after the
+script finishes.
 
 Arguments are one JSON object, or the same `key=value` pairs the command line takes.
 When a line does not work, the answer says what the tool actually takes, in both forms,
@@ -732,6 +733,57 @@ every transport can send, so on that revision **Streamable HTTP is answered too*
 server that keeps asking is given up on after four rounds rather than answered for ever,
 and `raw` prints the `input_required` result as it came, since it was asked to send one
 request.
+
+### Following what a server changes
+
+A session is the one place a server's own notifications mean anything, and a long one
+outlives what it was told at the start: a server that adds a tool, or rewrites a
+resource, has moved on from the lists the shell cached for `help` and Tab completion.
+`subscribe URI` follows one resource, with a file to keep in step with it or nothing, in
+which case its new contents are printed:
+
+```
+$ mcpdial shell logs
+logs> subscribe file:///build/latest.log build.log
+following file:///build/latest.log -> build.log
+logs> call rebuild {}
+started build 4821
+file:///build/latest.log -> build.log (1841 bytes)
+logs> subscriptions
+1 subscription(s):
+  file:///build/latest.log -> build.log
+logs> unsubscribe file:///build/latest.log
+no longer following file:///build/latest.log
+```
+
+The file is replaced whole, through a sibling and a rename, so whatever is reading it
+sees the old contents or the new ones and never half of either. `unsubscribe` for a URI
+this session never followed is an error naming it, rather than a silent success that
+would leave the real subscription running, and a resource that has gone away reports the
+failed read once and leaves the session and every other subscription where they were.
+
+Nothing is acted on in the middle of a command. A notification arriving during a call is
+put aside and the lists re-read at the prompt after it, so a line about it never lands
+between two lines of the server's, and five hundred reports of one change are still one
+refresh. **A piped session hears none of it**: the prose is a dim line for a person
+watching, and under `--json` the same fact is one object on stderr for a script to react
+to.
+
+```
+$ mcpdial --json shell logs < script.txt 2> notifications.jsonl
+$ cat notifications.jsonl
+{"notification":{"method":"notifications/tools/list_changed"}}
+{"notification":{"method":"notifications/resources/updated","params":{"uri":"file:///build/latest.log"}}}
+```
+
+Which request carries all this depends on the revision the session settled on. Up to
+2025-11-25 `subscribe` sends `resources/subscribe`, and the server pushes its updates on
+whatever stream is open, so they arrive with the next command's reply. 2026-07-28 removed
+both `resources/subscribe` and the GET stream in favour of `subscriptions/listen`, one
+long-lived response stream that a client opts into per notification type: there
+`subscribe` sends nothing, and `listen [SECONDS]` opens the stream, collects what arrives
+and hands the prompt back. The bound is a wall clock, and the default is five seconds, so
+a server that acknowledges nothing costs a wait rather than a session.
 
 ### Keeping a stdio server running between calls
 

@@ -53,6 +53,14 @@
 //! client for one more fact first, the way a server missing a confirmation or a
 //! region does, and answer with whatever the client replied. The call blocks on
 //! that reply, so a client that neither answers nor refuses hangs the server.
+//! Set `ECHO_SERVER_SUBSCRIBE=N` to add one resource, `counter://calls`, that a
+//! client can subscribe to, and a `register_tool` tool. Each `count` call then
+//! sends N `notifications/resources/updated` for that resource before replying,
+//! and `register_tool` sends `notifications/tools/list_changed` and adds a tool
+//! to what `tools/list` answers from then on. N above one is a server that
+//! reports the same change over and over, which a client has to survive.
+//! Behind a flag because the resource, the tool and the capability would each
+//! renumber a listing every other test counts.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -160,6 +168,13 @@ fn main() {
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
     let shrinking_reports = std::env::var_os("ECHO_SERVER_PROGRESS_SHRINK").is_some();
+    let updates_per_count: u32 = std::env::var("ECHO_SERVER_SUBSCRIBE")
+        .ok()
+        .map(|n| n.parse().unwrap_or(1))
+        .unwrap_or(0);
+    let subscribable = updates_per_count > 0;
+    let mut subscribed: Vec<String> = Vec::new();
+    let mut registered = false;
     let mut count = 0u32;
     let mut calls = 0u32;
     let stdout = io::stdout();
@@ -280,7 +295,39 @@ fn main() {
                 if prompts {
                     result["capabilities"]["prompts"] = json!({});
                 }
+                if subscribable {
+                    result["capabilities"]["resources"] = json!({"subscribe": true});
+                }
                 ok(id, result)
+            }
+            "resources/list" if subscribable => ok(
+                id,
+                json!({"resources": [{"uri": "counter://calls", "name": "counter",
+                                      "description": "How many times count has been called.",
+                                      "mimeType": "text/plain"}]}),
+            ),
+            "resources/read" if subscribable => match params["uri"].as_str().unwrap_or("") {
+                "counter://calls" => ok(
+                    id,
+                    json!({"contents": [{"uri": "counter://calls", "mimeType": "text/plain",
+                                         "text": format!("count={count}")}]}),
+                ),
+                other => err(id, -32002, &format!("Resource not found: {other}")),
+            },
+            // The spec asks for an empty result; what matters to a client is
+            // that the request was accepted at all. A URI it does not have is
+            // accepted too, so that a test can follow something that is not
+            // there and see what happens when the update for it arrives.
+            "resources/subscribe" if subscribable => {
+                let uri = params["uri"].as_str().unwrap_or("").to_string();
+                if !subscribed.contains(&uri) {
+                    subscribed.push(uri);
+                }
+                ok(id, json!({}))
+            }
+            "resources/unsubscribe" if subscribable => {
+                subscribed.retain(|u| u != params["uri"].as_str().unwrap_or(""));
+                ok(id, json!({}))
             }
             "tools/list" => {
                 let mut listed = json!({"tools": [
@@ -306,6 +353,16 @@ fn main() {
                 }
                 if tasks {
                     listed["tools"].as_array_mut().unwrap().push(slow_tool());
+                }
+                if subscribable {
+                    listed["tools"].as_array_mut().unwrap().push(json!(
+                        {"name": "register_tool", "description": "Add a tool to this server.",
+                         "inputSchema": {"type": "object", "properties": {}}}));
+                }
+                if registered {
+                    listed["tools"].as_array_mut().unwrap().push(json!(
+                        {"name": "registered", "description": "The tool register_tool added.",
+                         "inputSchema": {"type": "object", "properties": {}}}));
                 }
                 ok(id, listed)
             }
@@ -413,6 +470,19 @@ fn main() {
                 ),
                 "count" => {
                     count += 1;
+                    // Sent before the reply and on the same pipe, which is how a
+                    // real server reports a change during a call the client is
+                    // already waiting on.
+                    for _ in 0..updates_per_count {
+                        for uri in &subscribed {
+                            tell(
+                                &mut out,
+                                &json!({"jsonrpc": "2.0",
+                                        "method": "notifications/resources/updated",
+                                        "params": {"uri": uri}}),
+                            );
+                        }
+                    }
                     ok(
                         id,
                         json!({"content": [{"type": "text", "text": format!("count={count}")}]}),
@@ -424,6 +494,18 @@ fn main() {
                     -32601,
                     "Tool slow must be called as a task: pass params.task",
                 ),
+                "register_tool" if subscribable => {
+                    registered = true;
+                    tell(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0",
+                                "method": "notifications/tools/list_changed"}),
+                    );
+                    ok(
+                        id,
+                        json!({"content": [{"type": "text", "text": "registered"}]}),
+                    )
+                }
                 other if unknown_tool_is_a_result => ok(
                     id,
                     json!({"isError": true, "content": [{"type": "text",

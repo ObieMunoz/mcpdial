@@ -123,6 +123,12 @@ impl Watcher for Notices<'_> {
                     self.say(notice, prose);
                 }
             }
+            // What a server offers has moved on, which is a fact about the
+            // session rather than about the call in flight. Only the shell
+            // holds a session long enough for it to mean anything, and it
+            // takes these before they reach here; a one-shot command has
+            // nothing to refresh and nothing to say.
+            Body::ListChanged(_) | Body::ResourceUpdated { .. } | Body::Acknowledged { .. } => {}
         }
     }
 }
