@@ -404,8 +404,21 @@ violation as a failed result rather than a JSON-RPC error; both get the same ans
 
 At a terminal the prompt is a real line editor: Up and Down walk the history, Tab
 completes command names and tool names, and `^C` abandons the line being typed (twice
-leaves). History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped
-input is read plainly, exactly as before, so scripts are unaffected.
+leaves). Inside a `call`'s arguments object Tab completes the tool's own parameter
+names, one nested object deep, offering only the keys the object does not have yet, and
+completes the values of a parameter whose schema names them:
+
+```
+chrome> call new_page {"u<TAB>
+chrome> call new_page {"url":                     # the one match completes itself
+
+chrome> call navigate_page {"url": "x", "<TAB>
+"pageId":     "timeout":                          # url is written, so it is not offered
+```
+
+History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped input is
+read plainly, exactly as before, with no editing, no history and no completion, so
+scripts are unaffected.
 
 ### When the server has a question
 

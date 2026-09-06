@@ -1,5 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
+use complete::ShellHelper;
 use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
@@ -29,6 +30,7 @@ use std::time::Duration;
 mod args;
 mod brief;
 mod browse;
+mod complete;
 mod env_defaults;
 mod notices;
 mod output;
@@ -1457,52 +1459,6 @@ fn shell_call_hint(
     )
 }
 
-/// Tab completion for the shell: command names in the first word, then whatever
-/// the command that was typed takes as its one argument.
-#[derive(Default)]
-struct ShellHelper {
-    tools: Vec<String>,
-    resources: Vec<String>,
-    prompts: Vec<String>,
-}
-
-impl rustyline::completion::Completer for ShellHelper {
-    type Candidate = String;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<String>)> {
-        let head = line.get(..pos).unwrap_or(line);
-        let start = head
-            .char_indices()
-            .rev()
-            .find(|(_, c)| c.is_whitespace())
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        let (before, word) = head.split_at(start);
-        let pool: Vec<String> = match before.split_whitespace().collect::<Vec<_>>()[..] {
-            [] => SHELL_COMMANDS.iter().map(|c| c.to_string()).collect(),
-            ["call" | "schema" | "help"] => self.tools.clone(),
-            ["read"] => self.resources.clone(),
-            ["prompt"] => self.prompts.clone(),
-            _ => Vec::new(),
-        };
-        Ok((
-            start,
-            pool.into_iter().filter(|c| c.starts_with(word)).collect(),
-        ))
-    }
-}
-
-impl rustyline::highlight::Highlighter for ShellHelper {}
-impl rustyline::validate::Validator for ShellHelper {}
-impl rustyline::hint::Hinter for ShellHelper {
-    type Hint = String;
-}
-impl rustyline::Helper for ShellHelper {}
-
 /// Where shell input comes from. A terminal gets line editing, history and
 /// completion; anything else is read a line at a time exactly as before, which
 /// is what scripts and pipes depend on.
@@ -1603,7 +1559,7 @@ impl Input {
     fn set_completions(&mut self, tools: &[Value], resources: &[Value], prompts: &[Value]) {
         if let Input::Tty { editor, .. } = self {
             if let Some(helper) = editor.helper_mut() {
-                helper.tools = field_values(tools, "name");
+                helper.tools = tools.to_vec();
                 helper.resources = field_values(resources, "uri");
                 helper.prompts = field_values(prompts, "name");
             }
@@ -3358,8 +3314,6 @@ fn describe_prompt_args(prompt: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustyline::completion::Completer;
-    use rustyline::history::DefaultHistory;
 
     #[test]
     fn media_files_are_named_after_their_source_and_never_overwritten() {
@@ -3399,41 +3353,6 @@ mod tests {
         };
         assert_eq!(nowhere.place(&png).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    fn complete(helper: &ShellHelper, line: &str) -> (usize, Vec<String>) {
-        let history = DefaultHistory::new();
-        let ctx = rustyline::Context::new(&history);
-        helper.complete(line, line.len(), &ctx).unwrap()
-    }
-
-    #[test]
-    fn completes_commands_then_tool_and_prompt_names_and_resource_uris() {
-        let helper = ShellHelper {
-            tools: ["list_pages", "list_console_messages", "new_page"]
-                .map(String::from)
-                .to_vec(),
-            resources: ["file:///a.md", "file:///b.png"].map(String::from).to_vec(),
-            prompts: ["summarize", "translate"].map(String::from).to_vec(),
-        };
-        // The first word is a command.
-        let (at, found) = complete(&helper, "sch");
-        assert_eq!((at, found), (0, vec!["schema".to_string()]));
-        // The argument to these three is a tool, and completion starts at it.
-        let (at, found) = complete(&helper, "call list_");
-        assert_eq!(at, 5);
-        assert_eq!(found, ["list_pages", "list_console_messages"]);
-        assert_eq!(complete(&helper, "schema new").1, ["new_page"]);
-        assert_eq!(complete(&helper, "help li").1.len(), 2);
-        // Each of the other two pools answers to its own command.
-        assert_eq!(complete(&helper, "read file:///b").1, ["file:///b.png"]);
-        assert_eq!(complete(&helper, "prompt sum").1, ["summarize"]);
-        assert!(complete(&helper, "read sum").1.is_empty());
-        // Nothing to say about a tool's arguments, or about other commands.
-        assert!(complete(&helper, "call new_page {\"ur").1.is_empty());
-        assert!(complete(&helper, "raw tools/").1.is_empty());
-        // A server that lists no tools simply offers nothing.
-        assert!(complete(&ShellHelper::default(), "call li").1.is_empty());
     }
 
     #[test]
