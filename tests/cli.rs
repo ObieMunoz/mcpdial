@@ -1680,6 +1680,47 @@ fn completion_scripts_for_every_shell() {
     assert!(examples.contains("mcpdial completions SHELL"), "{examples}");
 }
 
+/// `completions` builds the command tree a second time, under the tree clap
+/// already built to parse the arguments, so it is the deepest stack the binary
+/// ever reaches. clap_derive expands that tree into one function, and
+/// unoptimized its frame is most of the 1 MiB Windows reserves for a main
+/// thread, so the command tree growing by a few arguments is enough to overflow
+/// it there and nowhere else. `.cargo/config.toml` links Windows binaries with
+/// the 8 MiB Unix reserves instead; this is the check that it took.
+#[test]
+#[cfg(windows)]
+fn the_windows_binary_reserves_a_unix_sized_stack() {
+    const WANTED: u64 = 8 * 1024 * 1024;
+    const PE32_PLUS: u16 = 0x20b;
+    const COFF_HEADER_LEN: usize = 24;
+    const STACK_RESERVE_IN_OPTIONAL_HEADER: usize = 0x48;
+
+    let image = std::fs::read(env!("CARGO_BIN_EXE_mcpdial")).unwrap();
+    let at_u16 = |at: usize| u16::from_le_bytes(image[at..at + 2].try_into().unwrap());
+    let at_u32 = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+    let at_u64 = |at: usize| u64::from_le_bytes(image[at..at + 8].try_into().unwrap());
+
+    let pe_header = at_u32(0x3c) as usize;
+    assert!(
+        image[pe_header..pe_header + 4] == *b"PE\0\0",
+        "not a PE image"
+    );
+    let optional_header = pe_header + COFF_HEADER_LEN;
+    assert_eq!(
+        at_u16(optional_header),
+        PE32_PLUS,
+        "the stack reserve sits at another offset in a 32-bit image"
+    );
+
+    let reserved = at_u64(optional_header + STACK_RESERVE_IN_OPTIONAL_HEADER);
+    assert!(
+        reserved >= WANTED,
+        "the binary reserves {reserved} bytes of stack, short of the {WANTED} \
+         .cargo/config.toml asks for; a debug build overflows a 1 MiB stack \
+         before it has finished parsing an argument"
+    );
+}
+
 #[test]
 fn a_structured_only_result_still_prints() {
     let s = start(Mode::Stateless);

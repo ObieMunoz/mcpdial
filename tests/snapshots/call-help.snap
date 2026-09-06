@@ -6,29 +6,84 @@ Call a tool
 Usage: mcpdial call [OPTIONS] <TARGET> <TOOL> [ARGUMENTS]...
 
 Arguments:
-  <TARGET>        A saved name, an http(s):// URL, or stdio:<command>
-  <TOOL>          A tool name from `mcpdial tools TARGET`
-  [ARGUMENTS]...  One JSON object (inline, @file, or - for stdin), or key=value pairs
+  <TARGET>
+          A saved name, an http(s):// URL, or stdio:<command>
+
+  <TOOL>
+          A tool name from `mcpdial tools TARGET`
+
+  [ARGUMENTS]...
+          One JSON object (inline, @file, or - for stdin), or key=value pairs
 
 Options:
-  -h, --help  Print help
+      --elicit <JSON>
+          Answers for anything the server elicits mid-call: a JSON object or @file
+
+      --no-browser
+          Print a url-mode elicitation's address instead of opening a browser
+
+  -h, --help
+          Print help (see a summary with '-h')
 
 Global options:
-      --timeout <SECS>              Seconds to wait for a reply; else the server's saved timeout, else 60. With `add`, saved. (MCPDIAL_TIMEOUT=SECS does the same)
-      --json                        Emit JSON instead of a readable summary (MCPDIAL_JSON=1 does the same)
-      --plain                       Print what a pipe would get, even at a terminal (MCPDIAL_PLAIN=1 does the same)
-      --no-pager                    Print long output straight to the terminal instead of through a pager (MCPDIAL_PAGER= does the same everywhere)
-  -v, --verbose                     Trace every message on stderr (and pass a stdio server's stderr through)
-      --progress                    Print a line on stderr for every progress notification a server sends during a call, whether or not stderr is a terminal
-      --log-level <LEVEL>           Show a server's own log notifications from this level up (default warning), and ask a server that supports logging to send no less
-      --trace <FILE>                Append every message and transport event to FILE as JSON Lines, secrets redacted (MCPDIAL_TRACE=FILE does the same everywhere)
-      --user-agent <USER_AGENT>     Override the User-Agent (HTTP only) (MCPDIAL_USER_AGENT does the same)
-  -H, --header <'Name: value'>      Extra HTTP header, repeatable. With `add`, saved to the server
-      --token-env <VAR>             Env var holding a bearer token; beats any saved credential. With `add`, saved. A `${VAR}` in any `-H` header value does the same for that header
-      --protocol-version <VERSION>  MCP protocol revision to speak, instead of working out which the server does. With `add`, saved
-      --no-retry                    Fail on the first transient HTTP failure instead of sending the request once more
-      --save-dir <DIR>              Write image, audio and blob blocks to DIR/<tool>-<n>.<ext> instead of printing them (call, prompt, read, shell)
-      --max-chars <N>               Show at most N characters of a result; under --json a `truncated` object replaces it (call, prompt, read, raw, shell; MCPDIAL_MAX_CHARS=N does the same)
-  -o, --output <FILE>               Write the whole result to FILE, which must not exist, and print one line saying so (call, prompt, read, raw, shell)
-      --no-daemon                   Dial a stdio server afresh even when `start` left one running (MCPDIAL_NO_DAEMON=1 does the same everywhere)
+      --timeout <SECS>
+          Seconds to wait for a reply; else the server's saved timeout, else 60. With `add`, saved. (MCPDIAL_TIMEOUT=SECS does the same)
+
+      --json
+          Emit JSON instead of a readable summary (MCPDIAL_JSON=1 does the same)
+
+      --plain
+          Print what a pipe would get, even at a terminal (MCPDIAL_PLAIN=1 does the same)
+
+      --no-pager
+          Print long output straight to the terminal instead of through a pager (MCPDIAL_PAGER= does the same everywhere)
+
+      --color <WHEN>
+          Colour the terminal output: `always` (for `less -R`), `never`, or `auto` (at a terminal, unless NO_COLOR is set)
+
+          Possible values:
+          - always: Even into a pipe or a file, for `less -R`
+          - never
+          - auto:   At a terminal, unless NO_COLOR is set
+          
+          [default: auto]
+
+  -v, --verbose
+          Trace every message on stderr (and pass a stdio server's stderr through)
+
+      --progress
+          Print a line on stderr for every progress notification a server sends during a call, whether or not stderr is a terminal
+
+      --log-level <LEVEL>
+          Show a server's own log notifications from this level up (default warning), and ask a server that supports logging to send no less
+
+      --trace <FILE>
+          Append every message and transport event to FILE as JSON Lines, secrets redacted (MCPDIAL_TRACE=FILE does the same everywhere)
+
+      --user-agent <USER_AGENT>
+          Override the User-Agent (HTTP only) (MCPDIAL_USER_AGENT does the same)
+
+  -H, --header <'Name: value'>
+          Extra HTTP header, repeatable. With `add`, saved to the server
+
+      --token-env <VAR>
+          Env var holding a bearer token; beats any saved credential. With `add`, saved. A `${VAR}` in any `-H` header value does the same for that header
+
+      --protocol-version <VERSION>
+          MCP protocol revision to speak, instead of working out which the server does. With `add`, saved
+
+      --no-retry
+          Fail on the first transient HTTP failure instead of sending the request once more
+
+      --save-dir <DIR>
+          Write image, audio and blob blocks to DIR/<tool>-<n>.<ext> instead of printing them (call, prompt, read, shell)
+
+      --max-chars <N>
+          Show at most N characters of a result; under --json a `truncated` object replaces it (call, prompt, read, raw, shell; MCPDIAL_MAX_CHARS=N does the same)
+
+  -o, --output <FILE>
+          Write the whole result to FILE, which must not exist, and print one line saying so (call, prompt, read, raw, shell)
+
+      --no-daemon
+          Dial a stdio server afresh even when `start` left one running (MCPDIAL_NO_DAEMON=1 does the same everywhere)
 --- stderr

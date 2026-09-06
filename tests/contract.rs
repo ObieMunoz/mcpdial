@@ -115,6 +115,9 @@ struct Names {
 impl Names {
     fn normalise(&self, text: &str) -> String {
         let mut out = text.replace("\r\n", "\n");
+        // clap names the command after argv[0], so a usage line reads
+        // `mcpdial.exe` on Windows where it reads `mcpdial` everywhere else.
+        out = out.replace("mcpdial.exe", "mcpdial");
         for (base, name) in &self.bases {
             out = out.replace(base, name);
         }
