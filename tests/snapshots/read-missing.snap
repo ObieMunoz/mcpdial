@@ -3,3 +3,4 @@ exit 1
 --- stdout
 --- stderr
 error: MCP error -32002: Resource not found: file:///nope
+`mcpdial resources web` lists the resources this server does have.

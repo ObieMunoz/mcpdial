@@ -19,6 +19,25 @@ pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// JSON-RPC's "method not found", the honest answer to a request we do not serve.
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
+/// JSON-RPC's "invalid params". 2026-07-28 widened it to carry a resource that is
+/// not there as well, in place of the code below.
+pub const INVALID_PARAMS: i64 = -32602;
+
+/// What every revision before 2026-07-28 answered a missing resource with. That
+/// revision retired it and still asks clients to accept it, because the servers
+/// sending it will be around for years.
+pub const RESOURCE_NOT_FOUND_LEGACY: i64 = -32002;
+
+/// Whether a code says the one resource or prompt asked for is not there, in either
+/// revision's numbering.
+///
+/// `resources/read` and `prompts/get` carry a URI or a name and little else, so the
+/// widened `-32602` and the retired `-32002` are the same answer to the same
+/// question: not that one.
+pub fn is_not_found(code: i64) -> bool {
+    matches!(code, INVALID_PARAMS | RESOURCE_NOT_FOUND_LEGACY)
+}
+
 /// The headers 2026-07-28 mirrors the body into did not agree with the body.
 pub const HEADER_MISMATCH: i64 = -32020;
 /// Serving the request needed a client capability the request did not declare.
@@ -803,6 +822,23 @@ mod tests {
         assert!(is_modern_error(HEADER_MISMATCH));
         assert!(is_modern_error(UNSUPPORTED_PROTOCOL_VERSION));
         assert!(!is_modern_error(METHOD_NOT_FOUND) && !is_modern_error(-32000));
+    }
+
+    #[test]
+    fn a_missing_resource_is_recognised_under_both_numberings() {
+        assert!(is_not_found(INVALID_PARAMS));
+        assert!(is_not_found(RESOURCE_NOT_FOUND_LEGACY));
+        // A capability that was never there, and a server that broke, are neither.
+        assert!(!is_not_found(METHOD_NOT_FOUND));
+        assert!(!is_not_found(-32603));
+        // Nor are the codes 2026-07-28 renumbered into its own reserved range.
+        assert!([
+            HEADER_MISMATCH,
+            MISSING_REQUIRED_CLIENT_CAPABILITY,
+            UNSUPPORTED_PROTOCOL_VERSION
+        ]
+        .iter()
+        .all(|c| !is_not_found(*c)));
     }
 
     #[test]

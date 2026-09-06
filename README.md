@@ -217,6 +217,11 @@ mirrors its method and subject into the `Mcp-Method` and `Mcp-Name` headers.
 serves both eras to the handshake, `2025-06-18` suits one that misbehaves when offered
 anything newer - and `add --protocol-version` saves the choice.
 
+That revision also renumbered the answer to a resource that is not there, from the
+`-32002` every revision before it used to a plain `-32602`. mcpdial reads both, and a
+`read` or a `prompt` that finds nothing carries a hint naming the listing that would
+have shown what does exist, so the number itself never has to be looked up.
+
 ### Watching a long call
 
 A crawl, a build or a browser session can run for minutes with nothing on the screen.

@@ -192,6 +192,63 @@ fn a_name_that_will_not_fit_a_header_travels_encoded() {
     assert!(raw.starts_with("=?base64?"), "{raw}");
 }
 
+/// The renumbering: 2026-07-28 answers a resource that is not there with `-32602`
+/// and forbids the `-32002` of every revision before it. Both are the same answer,
+/// so both get the same hint, and neither is mistaken for a capability the server
+/// never had.
+#[test]
+fn a_missing_resource_reads_the_same_under_either_numbering() {
+    for (mode, code) in [(Mode::Modern, -32602), (Mode::Stateless, -32002)] {
+        let s = start(mode);
+        let home = temp_home(&format!("not-found-{code}"));
+
+        let o = run(mcpdial(&home).args(["--json", "read", &s.url, "file:///nope"]));
+        assert_eq!(o.code, 1, "{}", o.stderr);
+        let err: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+        assert_eq!(err["error"]["code"], code);
+        assert_eq!(
+            err["error"]["hint"],
+            format!(
+                "`mcpdial resources {}` lists the resources this server does have.",
+                s.url
+            )
+        );
+    }
+}
+
+/// The other half of the same code: a server with no `resources/*` at all still
+/// gets the answer that names the capability rather than one resource.
+#[test]
+fn a_server_without_resources_is_told_apart_from_one_missing_a_resource() {
+    let s = start(Mode::Modern);
+    let home = temp_home("modern-no-such-method");
+
+    let o = run(mcpdial(&home).args(["--json", "raw", &s.url, "resources/nope"]));
+    assert_ne!(o.code, 0, "{}", o.stdout);
+    let err: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(err["error"]["code"], -32601);
+}
+
+/// A prompt the server does not have is `-32602` in both eras, and the hint points
+/// at the listing that names the prompts and the arguments they take.
+#[test]
+fn a_missing_prompt_points_at_the_listing_that_would_have_named_it() {
+    let s = start(Mode::Modern);
+    let home = temp_home("modern-missing-prompt");
+
+    let o = run(mcpdial(&home).args(["--json", "prompt", &s.url, "nope"]));
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    let err: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(err["error"]["code"], -32602);
+    assert_eq!(
+        err["error"]["hint"],
+        format!(
+            "`mcpdial prompts {} --long` lists the prompts this server does have.",
+            s.url
+        )
+    );
+}
+
 #[test]
 fn raw_reaches_the_new_revision_without_spelling_out_the_metadata() {
     let s = start(Mode::Modern);

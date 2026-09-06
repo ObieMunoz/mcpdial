@@ -869,7 +869,7 @@ fn answer(mode: &Mode, id: &Value, method: &str, params: &Value, state: &Mutex<S
         "resources/templates/list" => json!({"jsonrpc":"2.0","id":id,"result":{
             "resourceTemplates":[{"uriTemplate":"file:///notes/{name}.md","name":"note",
                 "description":"One note, by name.","mimeType":"text/markdown"}]}}),
-        "resources/read" => resources_read(&id, params["uri"].as_str().unwrap_or("")),
+        "resources/read" => resources_read(mode, &id, params["uri"].as_str().unwrap_or("")),
         "prompts/list" => prompts_list(&id, params["cursor"].as_str()),
         "prompts/get" => prompts_get(&id, params),
         "tools/call" => match params["name"].as_str().unwrap_or("") {
@@ -960,7 +960,7 @@ fn resources_list(id: &Value, cursor: Option<&str>) -> Value {
     }
 }
 
-fn resources_read(id: &Value, uri: &str) -> Value {
+fn resources_read(mode: &Mode, id: &Value, uri: &str) -> Value {
     let contents = match uri {
         "file:///readme.md" => {
             json!([{"uri":uri,"mimeType":"text/markdown","text":"# fake-mcp\nA readme.\n"}])
@@ -969,8 +969,14 @@ fn resources_read(id: &Value, uri: &str) -> Value {
             json!([{"uri":uri,"mimeType":"image/png","blob":STANDARD.encode(PNG_MAGIC)}])
         }
         _ => {
+            // 2026-07-28 answers a resource that is not there with `-32602` and
+            // forbids the `-32002` every revision before it used.
+            let code = match mode {
+                Mode::Modern => -32602,
+                _ => -32002,
+            };
             return json!({"jsonrpc":"2.0","id":id,
-                "error":{"code":-32002,"message":format!("Resource not found: {uri}")}})
+                "error":{"code":code,"message":format!("Resource not found: {uri}")}});
         }
     };
     json!({"jsonrpc":"2.0","id":id,"result":{"contents":contents}})
