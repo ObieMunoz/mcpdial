@@ -13,8 +13,8 @@ Run `mcpdial guide` for the full agent reference. The short version:
 
 ```bash
 mcpdial ls --json                       # saved servers with live status and tool counts
-mcpdial tools TARGET --json             # every tool with its inputSchema
-mcpdial schema TARGET TOOL              # one tool's schema
+mcpdial tools TARGET --json             # every tool's name and one-line description
+mcpdial schema TARGET TOOL              # one tool's schema, in full
 mcpdial call TARGET TOOL '{"k":"v"}' --json
 mcpdial call TARGET TOOL @args.json --json      # large arguments from a file
 mcpdial call TARGET TOOL k=v n=5 --json         # pairs typed from the tool's schema
@@ -30,8 +30,10 @@ Rules:
 - Always pass `--json`, or export `MCPDIAL_JSON=1` once so every command carries it.
   Results go to stdout; errors go to stderr as `{"error":{...}}`.
 - Exit 0 success, 1 the server refused or the tool set `isError`, 2 bad usage.
-- Read `tools --json` or `schema` before calling a tool you have not called before. A
-  rejected call answers with `error.hint`: the tool's usage line and its parameters.
+- Before calling a tool you have not called before: `tools --json` to pick one, then
+  `schema TARGET TOOL` for its `inputSchema`. `tools --long --json` returns every
+  schema at once and is rarely worth the context. A rejected call answers with
+  `error.hint`: the tool's usage line and its parameters.
 - Use `shell` for servers whose state matters across calls, such as a browser: each
   plain `call` is a fresh process. When every command must be its own invocation,
   `start NAME` keeps a saved stdio server running and later `call`s share it (Unix

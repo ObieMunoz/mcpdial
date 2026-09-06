@@ -4,17 +4,6 @@ exit 0
 {
   "prompts": [
     {
-      "arguments": [
-        {
-          "description": "What to summarize",
-          "name": "text",
-          "required": true
-        },
-        {
-          "description": "terse or thorough",
-          "name": "style"
-        }
-      ],
       "description": "Summarize a document.",
       "name": "summarize"
     },

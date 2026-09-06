@@ -242,6 +242,12 @@ object with its own fields one level in (`at: object {x: number, y?: string}`), 
 rejected, so a retry needs no second lookup; `mcpdial schema TARGET TOOL` prints the
 whole `inputSchema` when the summary is not enough.
 
+Under `--json` the same flag says how much of the server's own object comes back. A
+listing is each tool's `name` and the first line of its `description`, which is what it
+takes to choose one; `mcpdial schema TARGET TOOL` then hands over that tool whole,
+`inputSchema` and all. `--long` is every tool whole at once, which on a server with
+fifty of them is tens of kilobytes. `resources` and `prompts` list the same two ways.
+
 ### Allowing and denying tools
 
 A filesystem server with fourteen tools is usually wanted for three of them, and an
@@ -731,8 +737,10 @@ object with a `kind` to branch on (`rpc`, `http`, `transport`, `auth`, `config`,
 `usage`) and the status or code behind it. `schema TARGET TOOL` returns one tool's
 input schema, and a tool the server does not have is a `usage` error (exit 2) listing
 what it does have: the `tools/list` behind it succeeded and nothing was sent for that
-tool. `tools TARGET --json` returns `{"tools": [...]}` and `tools --json` with no
-target returns `{"servers": [...]}`, one probe per saved server. Every `ls --json` row
+tool. `tools TARGET --json` returns `{"tools": [...]}`, each tool a `name` and the first
+line of its `description` until `--long` asks for the schemas, and `tools --json` with
+no target returns `{"servers": [...]}`, one probe per saved server, each listing its
+tools the same way. Every `ls --json` row
 carries what was saved — `location`, `headers`, `token_env`, `credential`, `source`,
 `timeout`, `allow`, `deny` — whether or not the servers were dialed; `--no-probe`
 leaves the status fields out rather than putting different ones in their place.

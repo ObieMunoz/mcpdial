@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod args;
+mod brief;
 mod env_defaults;
 mod present;
 
@@ -1932,7 +1933,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     }
                     "tools" => conn.list_tools().map_err(Failure::from).map(|tools| {
                         if cli.json {
-                            print_value(ui, &json!({ "tools": tools }), true);
+                            print_value(ui, &json!({ "tools": brief::tools(&tools, long) }), true);
                         } else {
                             listed(ui, long, || {
                                 ui.line(&format!("{} tool(s):", tools.len()));
@@ -1949,7 +1950,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             if cli.json {
                                 ui.line(&format!(
                                     "{}",
-                                    json!({"resources": found, "resourceTemplates": templates})
+                                    json!({
+                                        "resources": brief::resources(&found, long),
+                                        "resourceTemplates": brief::resources(&templates, long),
+                                    })
                                 ));
                             } else {
                                 ui.line(&format!("{} resource(s):", found.len()));
@@ -1984,7 +1988,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         Err(e) => Err(missing_capability(e, "prompts", info_cmd)),
                         Ok(found) => {
                             if cli.json {
-                                print_value(ui, &json!({ "prompts": found }), true);
+                                print_value(
+                                    ui,
+                                    &json!({ "prompts": brief::prompts(&found, long) }),
+                                    true,
+                                );
                             } else {
                                 ui.line(&format!("{} prompt(s):", found.len()));
                                 print_prompts(ui, &found, long);
@@ -2240,7 +2248,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             if cli.json {
                 print_json(
                     ui,
-                    &json!({ "resources": resources, "resourceTemplates": templates }),
+                    &json!({
+                        "resources": brief::resources(&resources, long),
+                        "resourceTemplates": brief::resources(&templates, long),
+                    }),
                 );
             } else {
                 ui.line(&format!("{} resource(s):\n", resources.len()));
@@ -2275,7 +2286,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 .list_prompts()
                 .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if cli.json {
-                print_json(ui, &json!({ "prompts": prompts }));
+                print_json(ui, &json!({ "prompts": brief::prompts(&prompts, long) }));
             } else {
                 ui.line(&format!("{} prompt(s):\n", prompts.len()));
                 print_prompts(ui, &prompts, long);
@@ -2475,8 +2486,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         Cmd::Tools {
             target: None, long, ..
         } => {
-            let probes = client::probe_all(&store, &opts, true)?;
+            let mut probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
+                for p in &mut probes {
+                    p.tools = p.tools.take().map(|t| brief::tools(&t, long));
+                }
                 print_json(ui, &Servers { servers: &probes });
                 return Ok(0);
             }
@@ -2526,7 +2540,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 conn.list_tools()?
             };
             if cli.json {
-                print_json(ui, &json!({ "tools": tools }));
+                print_json(ui, &json!({ "tools": brief::tools(&tools, long) }));
             } else {
                 listed(ui, long, || {
                     ui.line(&format!("{} tool(s):\n", tools.len()));

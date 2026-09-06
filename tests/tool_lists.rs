@@ -104,6 +104,19 @@ fn tools_hides_a_denied_tool_and_all_shows_it_marked() {
         o.stdout
     );
 
+    let o = run(mcpdial(&home).args(["--json", "tools", "fs", "--all"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let short: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(
+        short["tools"],
+        json!([
+            {"name": "echo", "description": "Echo a message back."},
+            {"name": "add", "denied": true, "description": "Add two numbers."},
+        ]),
+        "a short listing still marks what the lists hide: {}",
+        o.stdout
+    );
+
     // `--all` needs a server whose lists there are to look past.
     let o = run(mcpdial(&home).args(["tools", "--all"]));
     assert_eq!(o.code, 2, "{}", o.stderr);
