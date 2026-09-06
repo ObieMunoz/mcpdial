@@ -133,7 +133,7 @@ mcpdial browse [--all] [--offline]   tick catalog servers to save and dial; the 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
-mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...]
+mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
 mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
 mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
@@ -141,9 +141,9 @@ mcpdial --save-dir DIR ...       file image, audio and blob blocks as DIR/<tool>
 mcpdial --max-chars N ...        show at most N characters of a result; say so on stderr
 mcpdial -o FILE ...              write the whole result to FILE; print one line saying so
 mcpdial prompts TARGET [--long]  every prompt a server offers
-mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | - | key=value ...]
+mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
-mcpdial shell TARGET             one session, many commands; state persists between calls
+mcpdial shell TARGET [--no-browser]  one session, many commands; state persists between calls
 mcpdial start NAME [--idle SECS] keep a stdio server running; later commands share its session
 mcpdial stop NAME                end it
 mcpdial serve NAME [--listen ADDR] [--bearer-env VAR] [--allow PAT]... [--deny PAT]...
@@ -372,7 +372,7 @@ chrome> quit
 ```
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
-`resources`, `read`, `prompts`, `prompt`, `raw`, `info`, `help`, and `quit`; a `#` starts
+`resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `info`, `help`, and `quit`; a `#` starts
 a comment. With `--json` each result is one line of JSON. In a script, any failed command
 makes the exit code 1 after the script finishes.
 
@@ -402,6 +402,39 @@ At a terminal the prompt is a real line editor: Up and Down walk the history, Ta
 completes command names and tool names, and `^C` abandons the line being typed (twice
 leaves). History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped
 input is read plainly, exactly as before, so scripts are unaffected.
+
+### When the server has a question
+
+Some servers stop halfway through a call and ask for one more fact - a confirmation,
+a region, a parameter nobody passed - with `elicitation/create`. At a terminal mcpdial
+puts the question to you, one property at a time, with its type, its bounds and its
+default, and Enter alone takes the default:
+
+```
+$ mcpdial call deploy release '{"app":"api"}'
+server asked: confirm before running
+confirm (yes/no): y
+region (1) us 2) eu): 2
+```
+
+Unattended there is nobody to ask, so the request is **declined** rather than left
+hanging: a decline is the answer the spec has for "the value is not coming", and the
+server carries on without it. To answer without a human, hand the values over up front:
+
+```
+$ mcpdial call deploy release '{"app":"api"}' --elicit '{"confirm": true, "region": "eu"}'
+$ mcpdial call deploy release '{"app":"api"}' --elicit @answers.json
+```
+
+A form whose required properties those cover is accepted with them; one they miss, or a
+value the schema's own bounds forbid, is declined without being sent. In the shell,
+`elicit {"confirm": true}` sets the answers for every call after it. A url-mode request
+is a different thing: its address is printed, opened in a browser unless `--no-browser`,
+and accepted at once, because the rest happens out of band.
+
+`initialize` declares only what can really answer, so a server that checks does not ask
+for what it will not get. Over Streamable HTTP a mid-POST question cannot be replied to
+yet, so nothing is declared there; stdio servers, `mcpdial start` included, are answered.
 
 ### Keeping a stdio server running between calls
 

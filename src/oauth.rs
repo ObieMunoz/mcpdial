@@ -1244,7 +1244,8 @@ fn credential_from_token_response(value: &Value, mut base: Credential) -> Result
     Ok(base)
 }
 
-fn open_browser(url: &str) -> bool {
+/// Hand a URL to whatever the desktop opens web addresses with.
+pub(crate) fn open_browser(url: &str) -> bool {
     let cmd: (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {

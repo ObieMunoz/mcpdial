@@ -5,7 +5,7 @@ pub mod retry;
 pub mod stdio;
 pub mod trace;
 
-use crate::protocol::{KnownVersion, Result};
+use crate::protocol::{KnownVersion, Responder, Result};
 use serde_json::Value;
 pub(crate) use trace::silent;
 pub use trace::{Logger, TraceEvent};
@@ -35,6 +35,16 @@ pub trait Transport {
     /// Told once, after `initialize`, which version the session settled on. HTTP
     /// puts it on every request from then on; stdio has nowhere to put it.
     fn negotiated(&mut self, _version: KnownVersion) {}
+    /// Install what serves the server requests this client would declare a
+    /// capability for, and say whether it was taken.
+    ///
+    /// A transport with no way to deliver a reply drops the responder and goes
+    /// on refusing, and answers `false` so that nothing is declared on its
+    /// behalf: a capability with nobody behind it is a promise to a server that
+    /// then blocks on an answer never coming.
+    fn answer_requests(&mut self, _responder: Responder) -> bool {
+        false
+    }
     fn close(&mut self) {}
 }
 
@@ -51,6 +61,9 @@ impl Transport for Box<dyn Transport> {
     }
     fn negotiated(&mut self, version: KnownVersion) {
         (**self).negotiated(version)
+    }
+    fn answer_requests(&mut self, responder: Responder) -> bool {
+        (**self).answer_requests(responder)
     }
     fn close(&mut self) {
         (**self).close()

@@ -12,7 +12,7 @@ use mcpdial::session::{
 };
 use mcpdial::transport::trace::Trace;
 use mcpdial::{
-    daemon, oauth, Credential, Error, KnownVersion, Level, ServerConfig, Store, USER_AGENT,
+    daemon, oauth, Credential, Elicit, Error, KnownVersion, Level, ServerConfig, Store, USER_AGENT,
 };
 use notices::Notices;
 use output::{As, Output, Payload};
@@ -278,7 +278,12 @@ enum Cmd {
         preview: Option<String>,
     },
     /// Keep one session open and run commands from stdin (state persists between calls)
-    Shell { target: String },
+    Shell {
+        target: String,
+        /// Print a url-mode elicitation's address instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
+    },
     /// Keep a stdio server running in the background; later commands share its session
     Start {
         name: String,
@@ -324,6 +329,12 @@ enum Cmd {
         tool: String,
         /// One JSON object (inline, @file, or - for stdin), or key=value pairs
         arguments: Vec<String>,
+        /// Answers for anything the server elicits mid-call: a JSON object or @file
+        #[arg(long, value_name = "JSON")]
+        elicit: Option<String>,
+        /// Print a url-mode elicitation's address instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Show one tool's name, description, and input and output schemas
     Schema { target: String, tool: String },
@@ -349,6 +360,12 @@ enum Cmd {
         name: String,
         /// One JSON object (inline, @file, or - for stdin), or key=value pairs
         arguments: Vec<String>,
+        /// Answers for anything the server elicits mid-call: a JSON object or @file
+        #[arg(long, value_name = "JSON")]
+        elicit: Option<String>,
+        /// Print a url-mode elicitation's address instead of opening a browser
+        #[arg(long)]
+        no_browser: bool,
     },
     /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
     Raw {
@@ -625,6 +642,32 @@ fn watched<'a, T>(
     let outcome = request(notices);
     notices.finish();
     outcome
+}
+
+/// What this invocation can answer when a server elicits mid-call.
+///
+/// Nothing here may wait on a person who is not there. Without a terminal on
+/// both stdin and stderr, or under `--json`, where the output is being parsed
+/// rather than read, a form elicitation is declined the moment it arrives and
+/// the call carries on.
+fn elicitation(
+    answers: Option<&str>,
+    no_browser: bool,
+    json: bool,
+    shell: bool,
+) -> Result<Elicit, Error> {
+    let answers = answers
+        .map(|text| read_json_arg(text, "elicit answers"))
+        .transpose()?
+        .and_then(|v| v.as_object().cloned());
+    let at_a_terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
+    Ok(Elicit {
+        answers,
+        ask: at_a_terminal && !json,
+        later: shell,
+        browser: !no_browser,
+        json,
+    })
 }
 
 fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connection, Failure> {
@@ -1354,13 +1397,14 @@ const SHELL_COMMANDS: &[&str] = &[
     "prompts",
     "prompt",
     "raw",
+    "elicit",
     "info",
     "help",
     "quit",
 ];
 
 const SHELL_SUMMARY: &str = "commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, \
-     resources, read URI, prompts, prompt NAME, raw METHOD, info, help, quit";
+     resources, read URI, prompts, prompt NAME, raw METHOD, elicit {\"x\": 1}, info, help, quit";
 
 const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
@@ -1373,6 +1417,7 @@ const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   prompts [--long]           every prompt this server offers
   prompt NAME {"arg": "..."} expand a prompt into its messages
   raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
+  elicit {"arg": "value"}    answers for whatever the server elicits from here on
   info                       the initialize result
   quit                       close the session
 
@@ -1585,7 +1630,7 @@ fn shell_tools<'a>(
 
 fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
     let store = Store::from_env()?;
-    let opts = Options {
+    let mut opts = Options {
         timeout: cli
             .timeout
             .map(|secs| Duration::from_secs_f64(secs.max(0.0))),
@@ -2003,7 +2048,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Shell { target } => {
+        Cmd::Shell { target, no_browser } => {
+            opts.elicit = elicitation(None, no_browser, cli.json, true)?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let si = &conn.server_info["serverInfo"];
@@ -2288,6 +2334,21 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             }
                         }
                     }
+                    "elicit" if rest.is_empty() => Err(Failure::hinted(
+                        Error::usage("elicit needs a JSON object of answers"),
+                        "usage: elicit {\"confirm\": true}   (used for every elicitation from here on)",
+                    )),
+                    "elicit" => parse_object(rest, "answers")
+                        .map_err(Failure::from)
+                        .map(|values| {
+                            let values = values.as_object().cloned().unwrap_or_default();
+                            conn.elicit.set(values.clone());
+                            if cli.json {
+                                ui.json(&json!({ "elicit": values }).to_string());
+                            } else {
+                                ui.line(&format!("{} answer(s) ready to elicit with", values.len()));
+                            }
+                        }),
                     "raw" => {
                         let (method, params) = name_and_args(rest);
                         if method.is_empty() {
@@ -2496,7 +2557,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             target,
             name,
             arguments,
+            elicit,
+            no_browser,
         } => {
+            opts.elicit = elicitation(elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             let arguments = match form.json() {
                 Some(text) => read_json_arg(text, "arguments").map_err(|e| {
@@ -2832,7 +2896,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             target,
             tool,
             arguments,
+            elicit,
+            no_browser,
         } => {
+            opts.elicit = elicitation(elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             // A JSON object is settled before anything is dialed, as it always
             // was; pairs wait for the schema only an open session can supply.

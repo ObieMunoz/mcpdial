@@ -24,6 +24,7 @@ pub mod catalog;
 pub mod client;
 pub mod config;
 pub mod daemon;
+pub mod elicit;
 pub mod export_config;
 pub mod import_config;
 pub mod notify;
@@ -38,6 +39,7 @@ pub mod transport;
 
 pub use client::{connect, probe, probe_all, resolve, Connection, Probe, Status};
 pub use config::{Credential, ServerConfig, Store};
+pub use elicit::Elicit;
 pub use notify::Level;
 pub use protocol::{decode_body, Error, KnownVersion, Result, CLIENT_NAME, PROTOCOL_VERSION};
 pub use session::{render_content, Session, Watcher};
