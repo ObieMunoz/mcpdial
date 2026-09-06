@@ -67,7 +67,8 @@ mcpdial call docs search query="rust ureq" limit=5
 `mcpdial browse` is the same catalog as a checklist, and `mcpdial import` picks up the
 servers you already configured in Claude, Cursor, Windsurf, VS Code, Codex or OpenCode.
 A bare `mcpdial` at a terminal picks a server, then a tool, then asks for its arguments
-and prints the one-line command that would have made the same call.
+and prints the one-line command that would have made the same call; with nothing saved
+yet it says which of these to start with instead.
 
 ## Targets
 

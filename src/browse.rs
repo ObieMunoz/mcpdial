@@ -37,17 +37,6 @@ pub struct Flags {
 /// written before fzf starts and removed when it is done.
 const PREVIEW_FILE: &str = "browse-preview.json";
 
-/// Whether a bare `mcpdial` should open the checklist: a person at a
-/// terminal, on both ends, with nothing saved yet.
-pub fn first_run(cli: &crate::Cli) -> bool {
-    if !crate::pick::at_a_terminal(cli) {
-        return false;
-    }
-    Store::from_env()
-        .and_then(|store| store.servers())
-        .is_ok_and(|servers| servers.is_empty())
-}
-
 pub fn run(ui: &dyn Presenter, store: &Store, opts: &Options, flags: Flags) -> Result<u8, Failure> {
     if let Some(key) = &flags.preview {
         ui.out(&preview_for(store, key));

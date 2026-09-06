@@ -203,11 +203,13 @@ mcpdial call echo echo 'message=hello there'
 `mcpdial pick` is the same thing spelled out, for anyone who aliases the bare form.
 Picking is `fzf` where it is on `PATH` (`--height 40% --reverse`), and the numbered
 list above where it is not; either the number or the line itself answers, and `^D`
-or Esc leaves without sending anything. With nothing saved yet the bare form opens
-`browse` instead. Under a pipe, under `--json` and under `--plain` a bare `mcpdial`
-is the usage error and exit 2 it has always been, and `mcpdial pick` says it needs a
-terminal rather than reading one, so a script that calls either by mistake still
-fails at once instead of waiting for a keystroke.
+or Esc leaves without sending anything. With nothing saved yet there is nothing to
+pick, and the bare form prints a few lines instead: what mcpdial is, the three ways
+to get a server into it (`import`, `browse`, `add`), and the prompt back at exit 0.
+Nothing is fetched to print them. Under a pipe, under `--json` and under `--plain`
+a bare `mcpdial` is the usage error and exit 2 it has always been, and `mcpdial
+pick` says it needs a terminal rather than reading one, so a script that calls
+either by mistake still fails at once instead of waiting for a keystroke.
 
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
@@ -936,9 +938,9 @@ leaves to you (a directory to serve, a required `${VAR}`) is asked for at the pr
 and it is saved under its catalog id, or `id-2` when that name is taken. The new
 servers are then dialed together and their `ls` rows printed, with a `mcpdial login
 NAME` line under any that says `auth required`. Unticking a saved entry removes it,
-after one line asking to confirm. Esc leaves with nothing changed. A bare `mcpdial`
-at a terminal opens the checklist as long as nothing is saved yet; once something is,
-it picks one of what is saved instead.
+after one line asking to confirm. Esc leaves with nothing changed. The checklist is
+only ever opened by asking for it: a bare `mcpdial` names `browse` as one of the ways
+to start, and never takes the screen over on its own.
 
 With [fzf](https://github.com/junegunn/fzf) on `PATH` the list is fzf's, `--multi`
 with a preview pane showing the entry, what it will ask for and the exact `add`

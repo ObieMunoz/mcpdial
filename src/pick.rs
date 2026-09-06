@@ -12,8 +12,14 @@
 //! Nothing here happens without a person. [`Presenter::asks`] is the same
 //! question the schema prompts ask, false for every pipe, every `--json` and
 //! every `--plain`, and this module refuses to run when it is false. A bare
-//! `mcpdial` under a pipe never reaches the module at all: it gets clap's
-//! usage error and exit 2, exactly as it always has.
+//! `mcpdial` under a pipe gets clap's usage error and exit 2, exactly as it
+//! always has, and [`bare`] is where that is settled.
+//!
+//! With nothing saved there is nothing to pick, and a first run gets
+//! [`welcome`] instead: a few lines saying what mcpdial is and how to get a
+//! server into it, and the prompt back. The catalog is one of the ways it
+//! names, offered as a command rather than sprung as a full-screen checklist
+//! that has to be fetched before it can be drawn.
 //!
 //! [`fzf`] and [`numbered`] are the two halves of picking one of a list, and
 //! they are shared: `fzf` when it is on `PATH`, else the list numbered and
@@ -39,12 +45,62 @@ pub fn at_a_terminal(cli: &crate::Cli) -> bool {
     !crate::present::wants_plain(cli) && std::io::stdin().is_terminal()
 }
 
-/// Whether a bare `mcpdial` opens the picker rather than printing clap's usage
-/// error: a person at a terminal, and a build with a `Rich` presenter to ask
-/// them anything with. It is the same answer [`Presenter::asks`] gives, asked
-/// before there is a command to make a presenter for.
-pub fn wanted(cli: &crate::Cli) -> bool {
-    cfg!(feature = "rich") && at_a_terminal(cli)
+/// What a bare `mcpdial` does in place of clap's usage error.
+pub enum Bare {
+    /// A person, and saved servers to pick between.
+    Pick,
+    /// A person on a first run: [`welcome`], and their prompt back.
+    Welcome,
+    /// Everything else, which is the usage error and exit 2.
+    Usage,
+}
+
+/// Which of the three a bare `mcpdial` is, decided before there is a command
+/// to make a presenter for. A pipe, a program, `--json` and `--plain` get the
+/// usage error they always have. A person with nothing saved is greeted rather
+/// than dropped into a list of servers to install, which answers a question
+/// they have not been asked yet and costs a fetch to draw. A person with
+/// servers saved gets the picker, in a build with a `Rich` presenter to ask
+/// them anything with; that last is the same answer [`Presenter::asks`] gives.
+pub fn bare(cli: &crate::Cli) -> Bare {
+    if !at_a_terminal(cli) {
+        return Bare::Usage;
+    }
+    if nothing_saved() {
+        return Bare::Welcome;
+    }
+    match cfg!(feature = "rich") {
+        true => Bare::Pick,
+        false => Bare::Usage,
+    }
+}
+
+/// Whether this is a first run. A config that will not open or will not parse
+/// is not one, and falls through to the command that says why.
+fn nothing_saved() -> bool {
+    Store::from_env()
+        .and_then(|store| store.servers())
+        .is_ok_and(|servers| servers.is_empty())
+}
+
+/// What a first run says: what the tool is, the three ways to get a server
+/// into it, and what the bare form will do once one is saved.
+const WELCOME: &str = "\
+mcpdial dials MCP servers from the shell: what a server offers, a call to one of
+its tools, and a name to keep it under. No servers are saved yet.
+
+getting started:
+  mcpdial import        # the servers Claude, Cursor and VS Code already have
+  mcpdial browse        # tick what you want from a reviewed catalog
+  mcpdial add wiki --http https://mcp.deepwiki.com/mcp
+
+Then `mcpdial ls` says what is saved and whether it answers, and a bare
+`mcpdial` picks a server and a tool and makes the call. `mcpdial --help` lists
+every command.";
+
+/// [`WELCOME`] on stdout, where a person's `--help` goes too.
+pub fn welcome(ui: &dyn Presenter) {
+    ui.line(WELCOME);
 }
 
 /// A server, a tool, its arguments, and the call.

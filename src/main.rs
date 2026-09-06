@@ -645,21 +645,21 @@ enum TokenCmd {
 fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        // A bare `mcpdial` at a terminal with nothing saved yet opens the
-        // checklist, and with something saved picks one of it; a pipe, a
-        // program and `--json` get clap's help and exit 2, as ever.
+        // A bare `mcpdial` at a terminal picks one of the saved servers, and
+        // with nothing saved says what the tool is and how to get a server
+        // into it; a pipe, a program and `--json` get clap's help and exit 2,
+        // as ever.
         Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            let spelling = |cmd| {
-                let mut cli = Cli::parse_from(["mcpdial", cmd]);
-                // MCPDIAL_JSON in the environment is a program asking, not a person.
-                let _ = env_defaults::apply(&mut cli);
-                cli
-            };
-            let bare = spelling("browse");
-            match browse::first_run(&bare) {
-                true => bare,
-                false if pick::wanted(&bare) => spelling("pick"),
-                false => e.exit(),
+            let mut bare = Cli::parse_from(["mcpdial", "pick"]);
+            // MCPDIAL_JSON in the environment is a program asking, not a person.
+            let _ = env_defaults::apply(&mut bare);
+            match pick::bare(&bare) {
+                pick::Bare::Pick => bare,
+                pick::Bare::Welcome => {
+                    pick::welcome(<dyn Presenter>::choose(&bare).as_ref());
+                    return ExitCode::SUCCESS;
+                }
+                pick::Bare::Usage => e.exit(),
             }
         }
         Err(e) => e.exit(),
