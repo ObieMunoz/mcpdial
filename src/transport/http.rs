@@ -1,8 +1,10 @@
 //! Streamable HTTP: POST JSON-RPC to one URL, read back JSON or a one-shot SSE frame.
 
+use super::retry::{self, Failed, Failure, Retry};
 use super::{silent, Logger, Transport};
 use crate::protocol::{decode_body, Error, KnownVersion, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Read;
 use std::time::Duration;
 
@@ -32,6 +34,10 @@ pub struct HttpTransport {
     extra_headers: Vec<(String, String)>,
     agent: ureq::Agent,
     log: Logger,
+    retry: Retry,
+    /// Tools the server has listed with `idempotentHint`, so far as listings have
+    /// passed through here: the only `tools/call`s that are safe to send twice.
+    idempotent_tools: HashSet<String>,
     /// Set by stateful servers on `initialize`; echoed on every later request.
     /// Stateless servers never send one and we simply never echo one.
     pub session_id: Option<String>,
@@ -54,6 +60,7 @@ impl HttpTransport {
             user_agent: USER_AGENT.to_string(),
             extra_headers: Vec::new(),
             log: None,
+            retry: true,
         }
     }
 
@@ -123,6 +130,7 @@ pub struct HttpTransportBuilder {
     user_agent: String,
     extra_headers: Vec<(String, String)>,
     log: Option<Logger>,
+    retry: bool,
 }
 
 impl HttpTransportBuilder {
@@ -146,6 +154,11 @@ impl HttpTransportBuilder {
         self.log = Some(log);
         self
     }
+    /// Whether a transient failure gets one more attempt; see [`Retry`].
+    pub fn retry(mut self, enabled: bool) -> Self {
+        self.retry = enabled;
+        self
+    }
     pub fn build(self) -> HttpTransport {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(self.timeout))
@@ -163,6 +176,11 @@ impl HttpTransportBuilder {
             extra_headers: self.extra_headers,
             agent: ureq::Agent::new_with_config(config),
             log: self.log.unwrap_or_else(silent),
+            retry: Retry {
+                enabled: self.retry,
+                timeout: self.timeout,
+            },
+            idempotent_tools: HashSet::new(),
             session_id: None,
             negotiated_version: None,
         }
@@ -238,9 +256,13 @@ fn is_endpoint_event(line: &str) -> bool {
         .is_some_and(|name| name.trim() == "endpoint")
 }
 
-impl Transport for HttpTransport {
-    fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
-        let body = payload.to_string();
+impl HttpTransport {
+    /// One delivery of `body`, with its failure classified for [`Retry`].
+    fn attempt(
+        &mut self,
+        payload: &Value,
+        body: &str,
+    ) -> std::result::Result<Option<Value>, Failed> {
         (self.log)(&format!("-> POST {}\n   {}", self.url, body));
 
         let req = self.identify(
@@ -251,11 +273,14 @@ impl Transport for HttpTransport {
                 .header("Accept", "application/json, text/event-stream"),
         );
 
-        let mut resp = req.send(&body).map_err(|e| match e {
-            ureq::Error::Timeout(_) => {
-                Error::transport(format!("no reply from {} in time", self.url))
-            }
-            other => Error::transport(format!("could not reach {}: {other}", self.url)),
+        let mut resp = req.send(body).map_err(|e| Failed {
+            failure: retry::before_any_reply(&e),
+            error: match e {
+                ureq::Error::Timeout(_) => {
+                    Error::transport(format!("no reply from {} in time", self.url))
+                }
+                other => Error::transport(format!("could not reach {}: {other}", self.url)),
+            },
         })?;
 
         let status = resp.status().as_u16();
@@ -263,36 +288,78 @@ impl Transport for HttpTransport {
         let www_authenticate = header(&resp, "www-authenticate");
         let session_id = header(&resp, "mcp-session-id");
         let location = header(&resp, "location");
+        let retry_after = retry::retry_after(header(&resp, "retry-after").as_deref());
 
-        let text = resp
-            .body_mut()
-            .read_to_string()
-            .map_err(|e| Error::transport(format!("could not read response body: {e}")))?;
+        let text = resp.body_mut().read_to_string().map_err(|e| Failed {
+            error: Error::transport(format!("could not read response body: {e}")),
+            // A session named on the broken reply is state the server now holds;
+            // a retried `initialize` would open a second one beside it.
+            failure: match session_id {
+                Some(_) => Failure::Final,
+                None => Failure::Interrupted,
+            },
+        })?;
         (self.log)(&format!(
             "<- HTTP {status} {content_type}\n   {}",
             text.trim()
         ));
 
         if (300..400).contains(&status) {
-            return Err(redirect_error(&self.url, status, location.as_deref()));
+            return Err(Failed::final_(redirect_error(
+                &self.url,
+                status,
+                location.as_deref(),
+            )));
         }
         if !(200..300).contains(&status) {
             let never_spoke_streamable_http = self.negotiated_version.is_none();
             let worth_probing = never_spoke_streamable_http
                 && failed_like_a_legacy_endpoint(status, www_authenticate.as_deref());
             if worth_probing && self.speaks_legacy_sse() {
-                return Err(legacy_sse_error(&self.url));
+                return Err(Failed::final_(legacy_sse_error(&self.url)));
             }
-            return Err(Error::Http {
-                status,
-                body: text,
-                www_authenticate,
+            return Err(Failed {
+                error: Error::Http {
+                    status,
+                    body: text,
+                    www_authenticate,
+                },
+                failure: Failure::Status {
+                    status,
+                    retry_after,
+                },
             });
         }
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
-        decode_body(&text, &content_type)
+        let reply = decode_body(&text, &content_type).map_err(Failed::final_)?;
+        if payload["method"] == "tools/list" {
+            if let Some(page) = &reply {
+                retry::note_tools(&mut self.idempotent_tools, page);
+            }
+        }
+        Ok(reply)
+    }
+}
+
+impl Transport for HttpTransport {
+    fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+        let body = payload.to_string();
+        let idempotent = retry::is_idempotent(payload, &self.idempotent_tools);
+        let first = match self.attempt(payload, &body) {
+            Ok(reply) => return Ok(reply),
+            Err(failed) => failed,
+        };
+        let Some(delay) = self
+            .retry
+            .delay(idempotent, self.session_id.is_some(), &first.failure)
+        else {
+            return Err(first.error);
+        };
+        (self.log)(&format!("retrying after {} (1 of 1)", first.failure));
+        std::thread::sleep(delay);
+        self.attempt(payload, &body).map_err(|second| second.error)
     }
 
     fn negotiated(&mut self, version: KnownVersion) {

@@ -12,6 +12,8 @@
 //! call does not finish until both requests are answered, which is what a real
 //! server checking a slow connection does to a client that only listens for its
 //! own id.
+//! Set `ECHO_SERVER_EXIT_ON_CALL=N` to make it exit with status 9 on its Nth
+//! `tools/call`, before replying, the way a server that crashes mid-call does.
 //! The `count` tool returns how many times it has been called in this process,
 //! which is how the tests tell one long session from several short ones. The
 //! `shot` tool answers with a 4 KB image block, the way a screenshot tool does.
@@ -39,7 +41,11 @@ fn main() {
     let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
     let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
+    let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
+        .ok()
+        .and_then(|n| n.parse().ok());
     let mut count = 0u32;
+    let mut calls = 0u32;
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let stdin = io::stdin();
@@ -66,6 +72,14 @@ fn main() {
 
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
+
+        if method == "tools/call" {
+            calls += 1;
+            if exit_on_call == Some(calls) {
+                eprintln!("echo_server: crashing on call {calls}");
+                std::process::exit(9);
+            }
+        }
 
         // Interrupt the call the client is waiting on. A wrong answer is reported
         // through the call itself, so a test that only reads the tool's output

@@ -7,6 +7,8 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::io::{self, Read};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,6 +51,18 @@ pub enum Mode {
     LegacySse,
     /// Accepts every request and answers none of them, until the server is dropped.
     BlackHole,
+    /// Stateless, but the first request to `/mcp` gets a 503, like a load balancer
+    /// whose backend is still coming up.
+    UnavailableOnce,
+    /// 503 on every request to `/mcp`, with a `Retry-After` far longer than any
+    /// test's `--timeout`.
+    Unavailable,
+    /// Stateless, reached through a port that drops the first connection without a
+    /// byte in reply and passes every later one through.
+    HangUpOnce,
+    /// The first `tools/call` gets a 503; everything else is served, with or
+    /// without a session.
+    CallUnavailableOnce { stateful: bool },
 }
 
 /// The client the administrator registered out of band. The secret carries the
@@ -84,6 +98,7 @@ struct State {
     registered: bool,
     issued: u32,
     stuck_cursor_pages_served: u32,
+    refused_once: bool,
 }
 
 pub struct FakeServer {
@@ -107,9 +122,15 @@ pub fn start(mode: Mode) -> FakeServer {
     let server = Server::http("127.0.0.1:0").expect("bind");
     let port = server.server_addr().to_ip().unwrap().port();
     let base = format!("http://127.0.0.1:{port}");
-    let url = format!("{base}/mcp");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let stop = Arc::new(AtomicBool::new(false));
+    let url = match mode {
+        Mode::HangUpOnce => {
+            let front = hang_up_once(format!("127.0.0.1:{port}"), stop.clone());
+            format!("http://127.0.0.1:{front}/mcp")
+        }
+        _ => format!("{base}/mcp"),
+    };
 
     let state = Arc::new(Mutex::new(State {
         valid_tokens: match &mode {
@@ -160,6 +181,50 @@ pub fn start(mode: Mode) -> FakeServer {
         stop,
         handle: Some(handle),
     }
+}
+
+/// A port in front of `upstream` that hangs up on the first connection after
+/// reading its request, without a byte in reply, and pipes every later one
+/// through. tiny_http answers a dropped request with a 500 of its own, so a
+/// socket that simply closes has to be arranged in front of it.
+fn hang_up_once(upstream: String, stop: Arc<AtomicBool>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let mut hung_up = false;
+        while !stop.load(Ordering::SeqCst) {
+            let Ok((client, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            };
+            client.set_nonblocking(false).unwrap();
+            if !hung_up {
+                hung_up = true;
+                let mut request = [0u8; 4096];
+                let _ = (&client).read(&mut request);
+                drop(client);
+                continue;
+            }
+            let server = TcpStream::connect(&upstream).expect("upstream");
+            pipe(client, server);
+        }
+    });
+    port
+}
+
+/// Copy bytes both ways until either side closes.
+fn pipe(a: TcpStream, b: TcpStream) {
+    let (mut a_read, mut b_write) = (a.try_clone().unwrap(), b.try_clone().unwrap());
+    let (mut b_read, mut a_write) = (b, a);
+    thread::spawn(move || {
+        let _ = io::copy(&mut a_read, &mut b_write);
+        let _ = b_write.shutdown(Shutdown::Write);
+    });
+    thread::spawn(move || {
+        let _ = io::copy(&mut b_read, &mut a_write);
+        let _ = a_write.shutdown(Shutdown::Write);
+    });
 }
 
 type Resp = Response<std::io::Cursor<Vec<u8>>>;
@@ -507,6 +572,15 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if let Mode::LegacySse = mode {
         return legacy_sse(base, rec);
     }
+    let unavailable = || Response::from_string("upstream unavailable").with_status_code(503);
+    if let Mode::Unavailable = mode {
+        return with_headers(unavailable(), &[("Retry-After", "3600")]);
+    }
+    if let Mode::UnavailableOnce = mode {
+        if !std::mem::replace(&mut state.lock().unwrap().refused_once, true) {
+            return unavailable();
+        }
+    }
     if matches!(
         mode,
         Mode::Auth { .. }
@@ -535,7 +609,10 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
-    let stateful = matches!(mode, Mode::Stateful | Mode::StatefulNoDelete);
+    let stateful = matches!(
+        mode,
+        Mode::Stateful | Mode::StatefulNoDelete | Mode::CallUnavailableOnce { stateful: true }
+    );
 
     if rec.method == "DELETE" {
         if matches!(mode, Mode::StatefulNoDelete) {
@@ -560,6 +637,13 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("").with_status_code(202);
     };
     let method = msg["method"].as_str().unwrap_or("");
+
+    if matches!(mode, Mode::CallUnavailableOnce { .. })
+        && method == "tools/call"
+        && !std::mem::replace(&mut state.lock().unwrap().refused_once, true)
+    {
+        return unavailable();
+    }
 
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
@@ -675,7 +759,8 @@ fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
         "inputSchema":{"type":"object","properties":{"message":{"type":"string","description":"What to echo"}},"required":["message"]}});
     let add = json!({"name":"add","description":"Add two numbers.",
         "inputSchema":{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]},
-        "outputSchema":{"type":"object","properties":{"sum":{"type":"number"}},"required":["sum"]}});
+        "outputSchema":{"type":"object","properties":{"sum":{"type":"number"}},"required":["sum"]},
+        "annotations":{"idempotentHint":true}});
     match cursor {
         None => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[echo],"nextCursor":"page-2"}}),
         Some("page-2") => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[add]}}),

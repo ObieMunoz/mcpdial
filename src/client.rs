@@ -43,6 +43,8 @@ pub struct Options {
     /// `--no-daemon` or `$MCPDIAL_NO_DAEMON`: dial a stdio server even when a
     /// daemon started for it is running.
     pub no_daemon: bool,
+    /// One more attempt after a transient HTTP failure; `--no-retry` clears it.
+    pub retry: bool,
 }
 
 impl Default for Options {
@@ -56,6 +58,7 @@ impl Default for Options {
             protocol_version: None,
             verbose: false,
             no_daemon: false,
+            retry: true,
         }
     }
 }
@@ -182,7 +185,7 @@ fn refresh_and_save(
     opts: &Options,
     timeout: Duration,
 ) -> Result<Credential> {
-    let http = oauth::Http::new(timeout, Some(opts.user_agent.clone()));
+    let http = oauth::Http::new(timeout, Some(opts.user_agent.clone())).retry(opts.retry);
     let fresh = if cred.renews_by_grant() {
         oauth::renew_client_credentials(&http, cred)?
     } else {
@@ -228,7 +231,8 @@ fn http_transport(
     let mut b = HttpTransport::builder(r.config.http.clone().unwrap_or_default())
         .token(token)
         .timeout(timeout)
-        .user_agent(opts.user_agent.clone());
+        .user_agent(opts.user_agent.clone())
+        .retry(opts.retry);
     for (k, v) in &r.config.headers {
         b = b.header(k.clone(), v.clone());
     }

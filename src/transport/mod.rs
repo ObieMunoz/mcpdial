@@ -1,6 +1,7 @@
 //! The two MCP transports. There is no third.
 
 pub mod http;
+pub mod retry;
 pub mod stdio;
 
 use crate::protocol::{KnownVersion, Result};

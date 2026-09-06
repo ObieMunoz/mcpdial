@@ -80,6 +80,9 @@ struct Cli {
     /// MCP protocol version to offer at initialize instead of the newest. With `add`, saved.
     #[arg(long, global = true, value_name = "VERSION")]
     protocol_version: Option<KnownVersion>,
+    /// Fail on the first transient HTTP failure instead of sending the request once more
+    #[arg(long, global = true)]
+    no_retry: bool,
 
     /// Write image, audio and blob blocks to DIR/<tool>-<n>.<ext> instead of
     /// printing them (call, prompt, read, shell)
@@ -1403,6 +1406,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         protocol_version: cli.protocol_version,
         verbose: cli.verbose,
         no_daemon: cli.no_daemon || daemon::disabled_by_env(),
+        retry: !cli.no_retry,
         ..Options::default()
     };
     if let Some(dir) = &cli.save_dir {
@@ -2460,7 +2464,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .then(|| read_secret(client_secret_env.as_deref(), "client secret"))
                 .transpose()?;
             let existing = store.credential(&r.name)?;
-            let http = oauth::Http::new(opts.timeout_for(&r)?, Some(opts.user_agent.clone()));
+            let http = oauth::Http::new(opts.timeout_for(&r)?, Some(opts.user_agent.clone()))
+                .retry(opts.retry);
             let client_metadata = match client_metadata_url {
                 Some(url) => oauth::ClientMetadata::Url(url),
                 None if no_client_metadata => oauth::ClientMetadata::Never,

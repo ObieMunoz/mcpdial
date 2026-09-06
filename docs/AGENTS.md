@@ -229,4 +229,10 @@ terminal; piped input is read one line at a time with no editing and no history.
   server agreed to under `protocolVersion`. A `transport` error naming a version
   mcpdial does not speak means the server wants one it was not offered; retry with
   `--protocol-version 2025-06-18` (or `2025-03-26`), and save it with `add`.
+- A transient HTTP failure is retried once, only where that is provably safe: the
+  request is idempotent (`initialize`, a `*/list`, `ping`, or a tool whose listing
+  carries `idempotentHint`), or it failed before the server could have processed
+  it (connection refused or reset with no reply, DNS failure, 429, or 502/503/504
+  before a session was issued). A timeout, any other 4xx, a JSON-RPC error and a
+  stdio server that dies are never retried. `--no-retry` reports the first failure.
 - `mcpdial guide` prints this document.
