@@ -8,12 +8,11 @@
 //! it prints wherever it was asked for, and one JSON object per line under
 //! `--json` so that stdout stays parseable and stderr stays parseable too.
 
-use crate::present::{self, Presenter};
+use crate::present::Presenter;
 use crate::Cli;
 use mcpdial::notify::{Body, Level, Notice};
 use mcpdial::session::Watcher;
 use serde_json::json;
-use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 /// How often the one updating line is redrawn. A server may send thousands of
@@ -28,7 +27,11 @@ pub struct Notices<'a> {
     /// `--progress`: one line per notification wherever stderr goes, so that a
     /// captured log holds what the server reported.
     lines: bool,
-    /// Whether the one updating line has anywhere to go.
+    /// Whether the one updating line has anywhere to go: [`Presenter::watched`],
+    /// which is the same answer `Presenter::choose` settled stdout with. It
+    /// also decides whether a `progressToken` is sent at all, because a server
+    /// told to report progress into a pipe is being asked for bytes nobody
+    /// will read.
     spinner: bool,
     threshold: Level,
     last_drawn: Option<Instant>,
@@ -44,7 +47,7 @@ impl<'a> Notices<'a> {
             ui,
             json: cli.json,
             lines: cli.progress,
-            spinner: !cli.progress && a_person_is_watching(cli),
+            spinner: !cli.progress && ui.watched(),
             threshold: cli.log_level.unwrap_or(Level::DEFAULT),
             last_drawn: None,
             held_back: None,
@@ -135,24 +138,4 @@ impl Watcher for Notices<'_> {
             Body::ListChanged(_) | Body::ResourceUpdated { .. } | Body::Acknowledged { .. } => {}
         }
     }
-}
-
-/// Whether a person is watching this run go by.
-///
-/// It is the question `Presenter::choose` asks of stdout, and the one the line
-/// itself needs answered as well: the updating line goes to stderr, and a
-/// redirected stderr is a log file rather than a screen. It also decides
-/// whether a `progressToken` is sent at all, which is why it is settled here
-/// and not left to the presenter - a server told to report progress into a pipe
-/// is being asked for bytes nobody will read.
-fn a_person_is_watching(cli: &Cli) -> bool {
-    let plain_by_env = std::env::var(present::ENV_PLAIN).is_ok_and(|v| !v.is_empty() && v != "0");
-    let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
-    cfg!(feature = "rich")
-        && !cli.json
-        && !cli.plain
-        && !plain_by_env
-        && !dumb
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal()
 }

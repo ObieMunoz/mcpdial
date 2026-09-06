@@ -96,7 +96,13 @@ pub fn responder(elicit: &Elicit, answers: Answers) -> Responder {
     let mut state = Elicitor {
         elicit: elicit.clone(),
         answers,
-        reader: Reader::Unopened,
+        // Whether there is anybody at the terminal is `Elicit::ask`, settled
+        // from the presenter before the transport was ever dialed; nothing
+        // down here gets a second opinion about it.
+        reader: match elicit.ask {
+            true => Reader::Unopened,
+            false => Reader::Plain,
+        },
     };
     Box::new(move |method, params| (method == METHOD).then(|| state.respond(params)))
 }
@@ -294,8 +300,11 @@ fn fill(fields: &[Field], values: &Map<String, Value>) -> Reply {
 ///
 /// A terminal on all three streams gets the line editor, so that `^C` answers
 /// `cancel` instead of killing the process mid-call; anything else reads stdin a
-/// line at a time, where the end of input is the only way out.
+/// line at a time, where the end of input is the only way out. Which of the two
+/// this is was decided by [`Elicit::ask`], not here.
 enum Reader {
+    /// The line editor a person gets, not built yet: the first question is
+    /// what opens it, and a run that never asks one never pays for it.
     Unopened,
     Editing(Box<rustyline::DefaultEditor>),
     Plain,
@@ -305,12 +314,9 @@ impl Reader {
     /// The next answer, or `None` for `^C`, `^D` or a closed stdin.
     fn line(&mut self, prompt: &str) -> Option<String> {
         if let Reader::Unopened = self {
-            *self = match std::io::IsTerminal::is_terminal(&std::io::stdout()) {
-                true => match rustyline::DefaultEditor::new() {
-                    Ok(editor) => Reader::Editing(Box::new(editor)),
-                    Err(_) => Reader::Plain,
-                },
-                false => Reader::Plain,
+            *self = match rustyline::DefaultEditor::new() {
+                Ok(editor) => Reader::Editing(Box::new(editor)),
+                Err(_) => Reader::Plain,
             };
         }
         match self {

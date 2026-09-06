@@ -189,6 +189,30 @@ pub trait Presenter {
         false
     }
 
+    /// Whether a person is watching this run go by, on both streams.
+    ///
+    /// The other half of [`asks`]. A question wants somebody to answer it,
+    /// which is stdin and the stdout a prompt is drawn on; prose beside the
+    /// answer - the updating progress line, a word about the session, the
+    /// sentence an elicitation puts above its prompts - wants somebody to read
+    /// it, which is that stdout and a stderr that is a screen rather than a
+    /// log. `--color always` hands a pipe `Rich`, and nobody is watching a
+    /// pipe, so being `Rich` does not settle this on its own.
+    ///
+    /// [`asks`]: Presenter::asks
+    fn watched(&self) -> bool {
+        false
+    }
+
+    /// Whether the shell's reader can be a line editor here: see
+    /// [`a_line_can_be_edited`], which is the whole of the answer. Neither
+    /// presenter gives a different one - `--plain` freezes the bytes, not the
+    /// keyboard, and `MCPDIAL_PLAIN=1` at a terminal still gets Tab - but the
+    /// question is about the terminal, so it is answered here with the rest.
+    fn edits_lines(&self) -> bool {
+        a_line_can_be_edited()
+    }
+
     /// A line beside the output rather than part of it: what a prompt filled
     /// in, written as the command that would have said it outright. Dim at a
     /// terminal, since it is not the answer, only how to ask again.
@@ -279,6 +303,18 @@ pub(crate) fn wants_plain(cli: &Cli) -> bool {
     asked_for_plain(cli) || !std::io::stdout().is_terminal()
 }
 
+/// Whether a line editor has both its ends. It draws its prompt on stdout and
+/// takes keys from stdin, so a person has to be at each of them.
+///
+/// This is the fact [`Presenter::asks`] is built on, and on its own it is the
+/// whole of what the shell's reader needs: what the bytes look like is the
+/// other decision, and the two are not the same one. Reached from outside
+/// through [`Presenter::edits_lines`].
+fn a_line_can_be_edited() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal() && std::io::stdin().is_terminal()
+}
+
 /// The four ways of asking for the piped bytes outright, whatever the stream.
 fn asked_for_plain(cli: &Cli) -> bool {
     let by_env = std::env::var(ENV_PLAIN).is_ok_and(|v| !v.is_empty() && v != "0");
@@ -287,8 +323,10 @@ fn asked_for_plain(cli: &Cli) -> bool {
 }
 
 /// Colour is decided per stream: `2>log` at a terminal keeps escapes out of
-/// the log. Stdout takes no second look, since `Rich` at all means either a
-/// terminal or the `--color always` that asked for the pipe.
+/// the log. Colour on stdout takes no second look, since `Rich` at all means
+/// either a terminal or the `--color always` that asked for the pipe - and
+/// that pipe is exactly why `asks` and `watched` do look, because neither a
+/// question nor a line of prose has anybody at the far end of one.
 #[cfg(feature = "rich")]
 fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
     use std::io::IsTerminal;
@@ -298,10 +336,13 @@ fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
         color_err: style::color_enabled(cli.color, stderr_is_terminal),
         image: image::protocol(|name| std::env::var(name).ok()),
         markdown: !cli.raw,
-        // A question wants a person at both ends: one to read it on stdout,
-        // one to answer it on stdin. `--color always` gets a pipe `Rich`, and
-        // a pipe can be asked nothing.
-        asks: std::io::stdout().is_terminal() && std::io::stdin().is_terminal(),
+        // A question needs both ends of a line editor and bytes that are a
+        // person's; `--color always` gets a pipe `Rich`, and a pipe can be
+        // asked nothing.
+        asks: a_line_can_be_edited(),
+        // Prose beside the answer wants a screen at both ends instead: a
+        // redirected stderr is a log file, and nobody reads a pipe's stdout.
+        watched: std::io::stdout().is_terminal() && stderr_is_terminal,
         ..Rich::default()
     })
 }
@@ -409,6 +450,9 @@ pub struct Rich {
     /// Whether a question can be put and answered: both ends a terminal. See
     /// [`rich`], which is the only place that decides it.
     asks: bool,
+    /// Whether prose beside the answer has anybody to read it: stdout and
+    /// stderr both a terminal. Decided in [`rich`] alongside `asks`.
+    watched: bool,
     /// What the section since `page_start` has printed, until `page_end`
     /// decides where it goes.
     page: std::cell::RefCell<Option<Vec<u8>>>,
@@ -448,6 +492,10 @@ impl Presenter for Rich {
 
     fn asks(&self) -> bool {
         self.asks
+    }
+
+    fn watched(&self) -> bool {
+        self.watched
     }
 
     fn aside(&self, line: &str) {
