@@ -865,30 +865,15 @@ pub fn listing_named(store: &Store, opts: &Options, names: &[String]) -> Result<
 
 /// Human-readable parameter summary from a tool's JSON schema.
 pub fn describe_params(tool: &Value) -> Vec<String> {
-    let schema = &tool["inputSchema"];
-    let required: Vec<&str> = schema["required"]
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    let Some(props) = schema["properties"].as_object() else {
-        return Vec::new();
-    };
-    // Required parameters first: they are what a caller has to get right. The sort
-    // is stable, so everything else keeps the order the schema listed it in.
-    let mut ordered: Vec<(&String, &Value)> = props.iter().collect();
-    ordered.sort_by_key(|(name, _)| !required.contains(&name.as_str()));
-    ordered
+    schema::parameters(&tool["inputSchema"])
         .into_iter()
-        .map(|(name, spec)| {
-            let mut line = format!("{name}: {}", schema::type_name(spec));
-            if required.contains(&name.as_str()) {
+        .map(|p| {
+            let mut line = format!("{}: {}", p.name, schema::type_name(p.spec));
+            if p.required {
                 line.push_str(" (required)");
             }
-            if let Some(d) = spec["description"].as_str() {
-                let first = d.trim().lines().next().unwrap_or("");
-                if !first.is_empty() {
-                    line.push_str(&format!(" - {first}"));
-                }
+            if let Some(first) = schema::summary(p.spec) {
+                line.push_str(&format!(" - {first}"));
             }
             line
         })

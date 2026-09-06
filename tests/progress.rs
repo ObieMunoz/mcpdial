@@ -381,7 +381,9 @@ fn a_question_from_the_server_starts_on_a_line_of_its_own() {
             "call",
             &target,
             "echo",
-            "{}",
+            // `echo` requires `message`: without it a terminal now asks for it
+            // (#82) and this unattended pty would wait for an answer forever.
+            r#"{"message":"hi"}"#,
             "--elicit",
             r#"{"confirm":true,"region":"eu"}"#,
         ],

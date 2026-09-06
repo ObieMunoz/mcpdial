@@ -181,6 +181,21 @@ pub trait Presenter {
         }
     }
 
+    /// Whether there is a person on stdin to answer a question. A program is
+    /// never asked one, whatever is on its stdin: a prompt into a pipe waits
+    /// for an answer that is not coming, so a missing argument there stays the
+    /// error it has always been.
+    fn asks(&self) -> bool {
+        false
+    }
+
+    /// A line beside the output rather than part of it: what a prompt filled
+    /// in, written as the command that would have said it outright. Dim at a
+    /// terminal, since it is not the answer, only how to ask again.
+    fn aside(&self, line: &str) {
+        self.err_line(line);
+    }
+
     /// A note on stderr: `note:` before the first line, the rest indented under it.
     fn note(&self, note: &str) {
         let mut lines = note.lines();
@@ -262,12 +277,17 @@ fn asked_for_plain(cli: &Cli) -> bool {
 /// terminal or the `--color always` that asked for the pipe.
 #[cfg(feature = "rich")]
 fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
+    use std::io::IsTerminal;
     Box::new(Rich {
         no_pager: cli.no_pager,
         color_out: style::color_enabled(cli.color, true),
         color_err: style::color_enabled(cli.color, stderr_is_terminal),
         image: image::protocol(|name| std::env::var(name).ok()),
         markdown: !cli.raw,
+        // A question wants a person at both ends: one to read it on stdout,
+        // one to answer it on stdin. `--color always` gets a pipe `Rich`, and
+        // a pipe can be asked nothing.
+        asks: std::io::stdout().is_terminal() && std::io::stdin().is_terminal(),
         ..Rich::default()
     })
 }
@@ -372,6 +392,9 @@ pub struct Rich {
     /// Whether a server's markdown is rendered rather than shown as written;
     /// `--raw` is what turns it off.
     markdown: bool,
+    /// Whether a question can be put and answered: both ends a terminal. See
+    /// [`rich`], which is the only place that decides it.
+    asks: bool,
     /// What the section since `page_start` has printed, until `page_end`
     /// decides where it goes.
     page: std::cell::RefCell<Option<Vec<u8>>>,
@@ -407,6 +430,15 @@ impl Presenter for Rich {
         } else {
             Plain.bytes(bytes)
         }
+    }
+
+    fn asks(&self) -> bool {
+        self.asks
+    }
+
+    fn aside(&self, line: &str) {
+        let dim = style::Style::new().dim().when(self.color_err);
+        self.err_line(&dim.paint(line));
     }
 
     fn page_start(&self) {

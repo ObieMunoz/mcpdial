@@ -231,6 +231,17 @@ for each command typed in `shell`, whose prompt returns when the pager exits.
 `--no-pager`, or `MCPDIAL_PAGER=` set empty, prints it straight; a pipe never
 pages, and a pager that cannot be started is skipped without a word.
 
+At a terminal, a `call` that leaves out something the tool requires is asked for it
+rather than refused. The tool's own schema decides the question: a string is a line,
+a number is a line read as one, a boolean is `y/n`, an array or an object is a line
+of JSON, and named values are a numbered list, or `fzf` where it is installed.
+Missing optional arguments are offered too, and Enter leaves them out. Every answer
+is read exactly as the same text in a `key=value` pair would be, and the finished
+call is printed as the one-line command that would have made it, ready to paste into
+a script. Nothing is asked unless stdin is a terminal: under `--json`, under
+`--plain`, and with anything piped in, a missing argument is the error and the usage
+line it has always been.
+
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
 for a server that installs packages on first launch or runs tools for minutes, `ls
