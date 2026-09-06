@@ -132,8 +132,11 @@ mcpdial browse [--all] [--offline]   tick catalog servers to save and dial; the 
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
+mcpdial tools TARGET --snapshot FILE     write the tools in full, to commit beside a script
+mcpdial tools TARGET --check FILE [--strict]   how they differ from that file; exit 3 on drift
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
+mcpdial call TARGET TOOL ... --check FILE [--strict]   refuse to call a tool that drifted
 mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
 mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
@@ -327,6 +330,45 @@ listing is each tool's `name` and the first line of its `description`, which is 
 takes to choose one; `mcpdial schema TARGET TOOL` then hands over that tool whole,
 `inputSchema` and all. `--long` is every tool whole at once, which on a server with
 fifty of them is tens of kilobytes. `resources` and `prompts` list the same two ways.
+
+### Pinning what a server promised
+
+A script written against `read_text_file(path)` breaks silently when the server renames
+the parameter or adds a required one. Write down what the server offers today, commit
+the file next to the scripts that depend on it, and check it before the work starts:
+
+```
+$ mcpdial tools files --snapshot tools.json
+wrote 14 tool(s) to tools.json
+
+$ mcpdial tools files --check tools.json; echo "exit=$?"
+ok
+exit=0
+```
+
+Months later, the server has moved:
+
+```
+$ mcpdial tools files --check tools.json; echo "exit=$?"
+tool read_text_file: required property path was removed
+tool read_text_file: property file is new and required
+info: tool list_directory_with_sizes: not in the snapshot
+2 differences
+exit=3
+```
+
+Exit 3 is drift and nothing else - not the 1 that means the server refused - so a CI job
+can branch on it. Lines prefixed `info:` are changes nobody breaks on (a new tool, a new
+optional parameter, a requirement the server dropped); they are printed and leave the
+exit code alone. `--strict` makes them failures too, and holds each snapshotted tool to
+the object the snapshot holds, key for key. `--json` prints
+`{"ok": bool, "differences": [{"tool", "kind", "detail", "level"}]}`.
+
+The file is the server's whole tool objects, `inputSchema` and all, sorted by name with
+every object's keys sorted, so a diff is only what changed. `mcpdial call TARGET TOOL
+ARGS --check tools.json` runs the same comparison for that one tool and refuses to send
+anything when it fails. A snapshot is never written over: a path that exists, or is a
+directory, is exit 2 before the server is dialed.
 
 ### Allowing and denying tools
 
@@ -890,6 +932,7 @@ never on disk under the permissions the profile directory hands down.
 | 0 | Success |
 | 1 | The server said no: HTTP error, JSON-RPC error, or a tool result with `isError` |
 | 2 | Usage or config problem; nothing was sent |
+| 3 | `--check`: the server's tools drifted from the snapshot; nothing was sent |
 
 Errors are one line on stderr, so it composes:
 

@@ -22,6 +22,12 @@ Options:
       --no-browser
           Print a url-mode elicitation's address instead of opening a browser
 
+      --check <FILE>
+          Refuse to call when TOOL has drifted from this snapshot; exit 3 with the differences
+
+      --strict
+          With --check: hold TOOL to the object the snapshot holds
+
   -h, --help
           Print help (see a summary with '-h')
 

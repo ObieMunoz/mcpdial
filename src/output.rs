@@ -28,6 +28,10 @@ pub const ENV_MAX_CHARS: &str = "MCPDIAL_MAX_CHARS";
 /// prints something mcpdial composed itself, which is already small.
 const APPLIES_TO: &str = "--max-chars and --output apply to call, prompt, read, raw and shell";
 
+/// The flag whose path this module reserves and writes, for the errors that
+/// name it.
+const FLAG: &str = "--output";
+
 /// A payload on its way to stdout, in the unit its bound is counted in.
 pub enum Payload<'a> {
     /// Text a server sent, already rendered.
@@ -122,7 +126,7 @@ impl Output {
             None => from_env()?,
         };
         if let Some(path) = &cli.output {
-            reserve(path)?;
+            reserve(FLAG, path)?;
         }
         Ok(Self {
             max_chars,
@@ -226,9 +230,9 @@ impl Output {
         } else {
             open.create_new(true);
         }
-        let mut file = open.open(path).map_err(|e| refused(path, &e))?;
+        let mut file = open.open(path).map_err(|e| refused(FLAG, path, &e))?;
         file.write_all(bytes)
-            .map_err(|e| Error::transport(format!("--output {}: {e}", path.display())))?;
+            .map_err(|e| Error::transport(format!("{FLAG} {}: {e}", path.display())))?;
         self.ours.set(true);
         Ok(())
     }
@@ -287,40 +291,55 @@ fn from_env() -> Result<Option<usize>, Error> {
     }
 }
 
-/// What `--output` can be told about its path before a single byte is sent: a
-/// file already there is not written over, and neither is a directory.
-fn reserve(path: &Path) -> Result<(), Error> {
+/// What a flag that writes a file can be told about its path before a single
+/// byte is sent: a file already there is not written over, and neither is a
+/// directory. `flag` names the flag being answered, since more than one of
+/// them writes a file and each has to say which one refused.
+pub fn reserve(flag: &str, path: &Path) -> Result<(), Error> {
     match path.metadata() {
         Ok(m) if m.is_dir() => Err(Error::usage(format!(
-            "--output {} is a directory; name the file to write",
+            "{flag} {} is a directory; name the file to write",
             path.display()
         ))),
-        Ok(_) => Err(already_exists(path)),
+        Ok(_) => Err(already_exists(flag, path)),
         Err(e) if e.kind() == ErrorKind::NotFound => match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() && !dir.is_dir() => {
                 Err(Error::usage(format!(
-                    "--output {}: {} is not a directory",
+                    "{flag} {}: {} is not a directory",
                     path.display(),
                     dir.display()
                 )))
             }
             _ => Ok(()),
         },
-        Err(e) => Err(Error::usage(format!("--output {}: {e}", path.display()))),
+        Err(e) => Err(Error::usage(format!("{flag} {}: {e}", path.display()))),
     }
 }
 
-fn already_exists(path: &Path) -> Error {
+/// A file that was not there a moment ago, holding `bytes`. The path was
+/// [`reserve`]d before anything was dialed, but a directory the process cannot
+/// write to only says so here, so the same words answer either way.
+pub fn create(flag: &str, path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| refused(flag, path, &e))?;
+    file.write_all(bytes)
+        .map_err(|e| Error::transport(format!("{flag} {}: {e}", path.display())))
+}
+
+fn already_exists(flag: &str, path: &Path) -> Error {
     Error::usage(format!(
-        "--output {} already exists; name a path that does not, or remove it",
+        "{flag} {} already exists; name a path that does not, or remove it",
         path.display()
     ))
 }
 
-fn refused(path: &Path, e: &std::io::Error) -> Error {
+fn refused(flag: &str, path: &Path, e: &std::io::Error) -> Error {
     match e.kind() {
-        ErrorKind::AlreadyExists => already_exists(path),
-        _ => Error::usage(format!("--output {}: {e}", path.display())),
+        ErrorKind::AlreadyExists => already_exists(flag, path),
+        _ => Error::usage(format!("{flag} {}: {e}", path.display())),
     }
 }
 
@@ -514,9 +533,9 @@ mod tests {
     fn a_directory_and_a_missing_parent_are_refused_before_anything_is_sent() {
         let dir = std::env::temp_dir().join(format!("mcpdial-refuse-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(reserve(&dir).is_err(), "a directory is not a file");
-        assert!(reserve(&dir.join("nowhere/deep/result.txt")).is_err());
-        assert!(reserve(&dir.join("result.txt")).is_ok());
+        assert!(reserve(FLAG, &dir).is_err(), "a directory is not a file");
+        assert!(reserve(FLAG, &dir.join("nowhere/deep/result.txt")).is_err());
+        assert!(reserve(FLAG, &dir.join("result.txt")).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 

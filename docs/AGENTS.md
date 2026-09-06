@@ -268,6 +268,7 @@ a question it would be left waiting on.
 | 0 | Success. For `call`, the tool did not set `isError`. |
 | 1 | The server refused: HTTP error, JSON-RPC error, tool `isError`, or a transport failure. |
 | 2 | Usage or config problem. Nothing was sent. |
+| 3 | `--check`: the server's tools no longer match the snapshot. Only `--check` returns it. |
 
 With `--json`, errors are one JSON object on **stderr**:
 
@@ -307,6 +308,66 @@ than as a JSON-RPC error; that case prints the same usage block or suggestion on
 untouched.
 
 With `--json`, every line on either stream is a JSON object.
+
+## Schema snapshots
+
+A script written against `read_text_file(path)` breaks silently when the server renames
+the parameter or adds a required one. Write down what the server offers, commit that
+file next to the scripts that depend on it, and check it before the work starts:
+
+```
+mcpdial tools TARGET --snapshot tools.json     # write it
+mcpdial tools TARGET --check tools.json        # exit 0 compatible, 3 drifted
+mcpdial call TARGET TOOL ARGS --check tools.json
+```
+
+The file is `{"server": {"name", "version"}, "protocolVersion", "tools": [...]}` with
+tools sorted by name, every object's keys sorted, and a trailing newline, so two
+snapshots of the same server are the same bytes and a diff is only what changed. The
+`tools` are the server's **whole** objects, `inputSchema` and all - not the name and
+first line a listing shortens to, since the schema is exactly what drift happens in.
+`--snapshot` writes only the tools the server's allow and deny lists permit, and takes
+neither `--long` nor `--all`, which would make the file mean something else.
+
+`--check` compares that file with the server as it is now and prints one line per
+difference, then `ok` or `N differences`. It fails - **exit 3**, distinct from the 1 that
+means the server refused - on what breaks a caller holding the snapshot:
+
+| Line | `kind` |
+|---|---|
+| `tool NAME: gone from the server` | `tool-missing` |
+| `tool NAME: required property P was removed` | `property-removed` |
+| `tool NAME: property P is number, was string` | `type-changed` |
+| `tool NAME: property P is now required` / `is new and required` | `now-required` |
+
+and lists what does not, prefixed `info:` and leaving the exit code 0: a new tool
+(`tool-added`), a new optional property (`property-added`), an optional property that
+went away (`property-removed`), and a requirement the server dropped (`now-optional`).
+`--strict` makes every one of those a failure but the arrival of a whole new tool, and
+adds any remaining difference between the two objects (`differs`), so a snapshotted tool
+has to be what it was, key for key.
+
+The comparison reaches one level into `inputSchema`: which properties the object has,
+which of them `required` names, and what each one's type is called - the same words
+`tools --long` uses, so `string|string[]` and `object {x: number}` compare as they read.
+A nested schema is compared as one value, which keeps the answer small and predictable;
+`--strict` is there when that is not enough. The `server` and `protocolVersion` in the
+file say what was dialed and are never compared: a version bump is not drift.
+
+Under `--json` the report is one object, `{"ok": bool, "differences": [{"tool", "kind",
+"detail", "level"}]}`, where `level` is `fail` or `info`. Branch on `ok`, or on the exit
+code; `kind` is stable across releases and `detail` is for a person.
+
+`call --check FILE` runs the same comparison for the one tool being called, before
+anything is sent. A comparison that passes prints nothing at all, so stdout still holds
+the result and nothing else; one that fails prints the report on **stderr**, sends
+nothing, and exits 3.
+
+Both files are answered before the server is dialed. FILE for `--snapshot` must not
+already exist and must not be a directory, and its parent must be one; each is a usage
+error (exit 2) with nothing written and no connection made, so a snapshot is never
+written over - remove it, or write beside it and diff. A `--check` file that is missing,
+is not JSON, or holds no `tools` array is the same usage error, never a quiet pass.
 
 ## Receipts
 
