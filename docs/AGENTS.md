@@ -92,7 +92,16 @@ once and every command carries it.
    writes it (the whole object under `--json`, and one line of receipt,
    `{"output","chars"|"bytes","isError"}`), `retry [TOOL] [key=value ...]` sends the
    last call again with those arguments changed, and `_` names the last result where
-   `$3` and `3` name the third. A session holds its last 50 results, or 8 MiB of them,
+   `$3` and `3` name the third. A line may end with `| PATH` - `.key`, `.key.sub`,
+   `.[0]`, `.[]` and combinations - to print those values one per line instead of the
+   whole result, each line a JSON document under `--json`; the path is read over
+   `structuredContent` where the server sent one, over the text where that text is
+   JSON, and over the result object otherwise, and one that matches nothing prints
+   nothing and puts `{"note": ...}` on stderr without failing. `| jq ARGS` hands the
+   same JSON to `jq` on stdin where that program is installed, each word after `jq` one
+   argument to it. A filter follows `call`, `read`, `prompt`, `raw`, `show N`, `_` and
+   `$N`, along with `retry` and `edit`, which put it on the end of the `call` line they
+   hand back; an expression outside the grammar is refused before anything is sent. A session holds its last 50 results, or 8 MiB of them,
    whichever runs out first. When each command has to be its own invocation,
    `mcpdial start NAME [--idle SECS]`
    keeps a saved stdio server running in the background and prints

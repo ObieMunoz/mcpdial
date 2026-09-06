@@ -1672,6 +1672,119 @@ fn shell_edit_sends_what_the_editor_left() {
     assert!(o.stderr.contains("set $EDITOR"), "{}", o.stderr);
 }
 
+/// A `| ...` at the end of a shell line prints one part of the result instead of
+/// all of it, after a fresh command and after the number of one already printed.
+#[test]
+fn shell_filters_a_result_with_a_path_expression() {
+    let home = temp_home("shell-filter");
+    let target = format!("stdio:{}", echo_command());
+    let o = shell_script(
+        mcpdial(&home).args(["shell", &target]),
+        concat!(
+            "raw tools/list | .tools[].name\n",
+            "call echo {\"message\":\"hi\"} | .content[0].text\n",
+            // A bar inside a JSON string is part of the string, not a filter.
+            "call echo {\"message\":\"a|b\"} | .content[0].text\n",
+            "_ | .content[0].type\n",
+            "show 2 | .content[].text\n",
+            "$2 | .\n",
+            // A retry carries the filter on the end of the line it hands back.
+            "retry message=again | .content[0].text\n",
+            "call echo {\"message\":\"z\"} | .nope.deep\n",
+            "quit\n",
+        ),
+    );
+    assert_eq!(
+        o.code, 0,
+        "a path naming nothing is not a failure: {}",
+        o.stderr
+    );
+    assert_eq!(
+        o.stdout,
+        concat!(
+            "echo\nfail\ncount\nstrict\nshot\n",
+            "Echo: hi\n",
+            "Echo: a|b\n",
+            "text\n",
+            "Echo: hi\n",
+            "{\"content\":[{\"text\":\"Echo: hi\",\"type\":\"text\"}]}\n",
+            "Echo: again\n",
+        ),
+        "stderr was: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr
+            .contains(r#"call echo {"message":"again"} | .content[0].text"#),
+        "the line a retry hands back carries the filter, ready to paste: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr
+            .contains(".nope.deep matched nothing in this result"),
+        "a path that matches nothing prints nothing and says so: {}",
+        o.stderr
+    );
+}
+
+/// What the small grammar will not read goes to `jq`, and what neither of them
+/// can read is refused before anything is sent.
+#[test]
+fn shell_hands_the_rest_to_jq_and_refuses_what_neither_can_read() {
+    let home = temp_home("shell-filter-jq");
+    let target = format!("stdio:{}", echo_command());
+
+    // `count` answers with how many calls it has had, so the number it comes
+    // back with is the proof that an unreadable filter sent nothing.
+    let o = shell_script(
+        mcpdial(&home).args(["shell", &target]),
+        "call count | .content[\ntools | .name\n| .name\ncall count\nquit\n",
+    );
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert!(o.stderr.contains("is not a path"), "{}", o.stderr);
+    assert!(
+        o.stderr.contains("tools prints no result to filter"),
+        "a filter needs a result to filter: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("a filter needs a command in front of it"),
+        "and a command in front of it: {}",
+        o.stderr
+    );
+    assert_eq!(
+        o.stdout, "count=1\n",
+        "the filter nobody could read sent nothing: {}",
+        o.stdout
+    );
+
+    let script = concat!(
+        "call echo {\"message\":\"hi\"} | jq -r '.content[0].text'\n",
+        "call echo {\"message\":\"hi\"} | jq '.content['\n",
+        "quit\n",
+    );
+    let o = shell_script(mcpdial(&home).args(["shell", &target]), script);
+    if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .any(|dir| dir.join("jq").is_file() || dir.join("jq.exe").is_file())
+    {
+        assert_eq!(o.stdout, "Echo: hi\n", "{}", o.stderr);
+        assert!(
+            o.stderr.contains("jq failed"),
+            "a filter jq itself refuses is reported as jq's refusal: {}",
+            o.stderr
+        );
+    } else {
+        assert_eq!(o.stdout, "", "{}", o.stdout);
+        assert_eq!(
+            o.stderr.matches("jq is not installed").count(),
+            2,
+            "{}",
+            o.stderr
+        );
+    }
+    assert_eq!(o.code, 1, "{}", o.stderr);
+}
+
 /// Every way a line can be wrong should answer with the shape that was wanted.
 #[test]
 fn shell_explains_the_shape_it_expected() {
