@@ -9,7 +9,7 @@
 //! a fixed budget. A schema arrives from a server: one that nests a thousand deep
 //! or points back at itself must cost a summary no more than a flat one does.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// How many members of a list a summary names, be they an `anyOf`'s alternatives
 /// or an object's properties, before it says only that there are more.
@@ -27,6 +27,25 @@ const UNIONS: u8 = 1;
 /// `string|string[]`, `object {x: number, y?: string}`.
 pub fn type_name(spec: &Value) -> String {
     named(spec, DEPTH, UNIONS)
+}
+
+/// The properties of an object schema, keyed by name. `None` when the schema
+/// describes something other than an object, or names no properties.
+pub fn properties(spec: &Value) -> Option<&Map<String, Value>> {
+    example_of(spec)["properties"]
+        .as_object()
+        .filter(|props| !props.is_empty())
+}
+
+/// Every value a schema allows outright, for offering a choice between them.
+/// [`choices`] is the same list cut to what a one-line summary can carry; this
+/// one is whole, because a picker that hid the fifth option would be wrong.
+pub fn allowed_values(spec: &Value) -> Vec<&Value> {
+    let spec = example_of(spec);
+    if let Some(values) = spec["enum"].as_array().filter(|v| !v.is_empty()) {
+        return values.iter().collect();
+    }
+    spec.get("const").into_iter().collect()
 }
 
 /// What stands in for one value in an example JSON arguments object.
@@ -314,6 +333,32 @@ mod tests {
             "$defs": {"loop": {"$ref": "#/$defs/loop"}},
         });
         assert_eq!(type_name(&cyclic), "object {child?: any}");
+    }
+
+    #[test]
+    fn what_a_schema_offers_is_whole_where_a_summary_is_cut() {
+        let props = |spec: Value| properties(&spec).map(|p| p.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(
+            props(json!({"type": "object", "properties": {"b": {}, "a": {}}})),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+        // An object with nothing to offer, and things that are no object at all.
+        assert_eq!(props(json!({"type": "object", "properties": {}})), None);
+        assert_eq!(props(json!({"type": "string"})), None);
+        assert_eq!(props(Value::Null), None);
+        // The alternative an example is written from is the one whose fields count.
+        assert_eq!(
+            props(json!({"anyOf": [{"type": "object", "properties": {"x": {}}}]})),
+            Some(vec!["x".to_string()])
+        );
+
+        // Every value, where `type_name` and the placeholders stop at four.
+        let many = json!({"enum": ["a", "b", "c", "d", "e", "f"]});
+        assert_eq!(allowed_values(&many).len(), 6);
+        assert_eq!(json_placeholder(&many), r#""a"|"b"|"c"|"d""#);
+        assert_eq!(allowed_values(&json!({"const": 5})), vec![&json!(5)]);
+        assert!(allowed_values(&json!({"type": "string"})).is_empty());
+        assert!(allowed_values(&json!({"enum": []})).is_empty());
     }
 
     #[test]
