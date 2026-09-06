@@ -1,7 +1,7 @@
 mod common;
 
 use common::{
-    echo_command, echo_server, mcpdial, run, start, temp_home, Iss, Mode, CONFIDENTIAL_ID,
+    echo_command, echo_server, mcpdial, run, start, temp_home, Iss, Mode, Out, CONFIDENTIAL_ID,
     CONFIDENTIAL_SECRET as SECRET,
 };
 use serde_json::{json, Value};
@@ -1353,7 +1353,14 @@ fn shell_keeps_one_session_alive() {
         assert_eq!(o.stdout.trim(), "count=1");
     }
 
-    let script = "# a comment\ncall count\ncall count {}\ntools\ncall nope\nraw tools/list\ncall count\nquit\ncall count\n";
+    // The results are numbered as they print, so the lines after them can name
+    // one instead of running it again.
+    let saved = home.join("out.txt");
+    let script = format!(
+        "# a comment\ncall count\ncall count {{}}\ntools\ncall nope\nraw tools/list\n\
+         call count\nshow 1\nsave 2 {}\nretry echo message=again\nquit\ncall count\n",
+        saved.display()
+    );
     let mut child = mcpdial(&home)
         .args(["shell", &target])
         .stdin(Stdio::piped())
@@ -1388,6 +1395,20 @@ fn shell_keeps_one_session_alive() {
         "errors go to stderr and do not end the session: {stderr}"
     );
     assert_eq!(
+        stdout.matches("count=1\n").count(),
+        2,
+        "`show 1` prints the first result again: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "count=2",
+        "`save 2` writes the second result"
+    );
+    assert!(
+        stdout.contains("Echo: again"),
+        "`retry echo message=again` sends the pairs it was given: {stdout}"
+    );
+    assert_eq!(
         out.status.code(),
         Some(1),
         "a failed command in a script is reported in the exit code"
@@ -1410,6 +1431,245 @@ fn shell_keeps_one_session_alive() {
     assert_eq!(out.status.code(), Some(0));
     let v: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
     assert_eq!(v["content"][0]["text"], "count=1");
+}
+
+/// One `shell` session fed a script, with a wall clock around it: a shell left
+/// waiting for input nobody is going to type fails the test instead of stalling
+/// the suite.
+fn shell_script(cmd: &mut Command, script: &str) -> Out {
+    use std::time::{Duration, Instant};
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                child.kill().ok();
+                child.wait().ok();
+                panic!("the shell was still running after 60s");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let o = child.wait_with_output().unwrap();
+    Out {
+        code: o.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+/// The three ways of naming a result, what `save` does with each kind of one,
+/// and what it says when it will not write.
+#[test]
+fn shell_names_results_and_saves_them() {
+    let home = temp_home("shell-history");
+    let target = format!("stdio:{}", echo_command());
+    let text = home.join("text.txt");
+    let shot = home.join("shot.png");
+    let script = format!(
+        "call echo {{\"message\":\"one\"}}\ncall count\ncall shot\n\
+         show 1\nshow $2\nshow _\nsave 2 {text}\nsave 3 {shot}\n\
+         show 9\nshow nope\nsave 1 {text}\nsave 1 {dir}\nquit\n",
+        text = text.display(),
+        shot = shot.display(),
+        dir = home.display(),
+    );
+    let o = shell_script(mcpdial(&home).args(["shell", &target]), &script);
+
+    assert_eq!(
+        o.stdout.matches("Echo: one").count(),
+        2,
+        "`show 1` prints the first result again: {}",
+        o.stdout
+    );
+    assert_eq!(
+        o.stdout.matches("count=1").count(),
+        2,
+        "`show $2` names the second: {}",
+        o.stdout
+    );
+    assert_eq!(
+        std::fs::read_to_string(&text).unwrap(),
+        "count=1",
+        "text is saved as text"
+    );
+    let bytes = std::fs::read(&shot).unwrap();
+    assert_eq!(
+        &bytes[..4],
+        b"\x89PNG",
+        "a binary block is saved as its bytes"
+    );
+    assert_eq!(bytes.len(), 4096, "all of them, not the placeholder line");
+
+    assert!(
+        o.stderr.contains("there is no result 9"),
+        "a number nobody printed: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("not a result number"),
+        "a word that is no number: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("already exists"),
+        "a file already there is not written over: {}",
+        o.stderr
+    );
+    assert!(
+        o.stderr.contains("is a directory"),
+        "and neither is a directory: {}",
+        o.stderr
+    );
+    assert_eq!(o.code, 1, "the refusals are counted: {}", o.stderr);
+
+    // With no file named, one is named after the tool and the media type. It
+    // lands in the working directory, so give the session one of its own.
+    let named = temp_home("shell-save-named");
+    let o = shell_script(
+        mcpdial(&home).args(["shell", &target]).current_dir(&named),
+        "call shot\nsave _\nquit\n",
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stdout.contains("wrote 4,096 bytes to shot.png"),
+        "{}",
+        o.stdout
+    );
+    assert_eq!(std::fs::read(named.join("shot.png")).unwrap().len(), 4096);
+}
+
+/// `retry` sends the last call again with one argument different, and takes the
+/// types from the tool's schema exactly as a typed `call` does.
+#[test]
+fn shell_retries_the_last_call_with_one_argument_changed() {
+    let home = temp_home("shell-retry");
+    let target = format!("stdio:{}", echo_command());
+    let session = || {
+        let mut c = mcpdial(&home);
+        c.env("ECHO_SERVER_TYPES", "1").args(["shell", &target]);
+        c
+    };
+    let o = shell_script(
+        &mut session(),
+        "call typed text=a count=1\nretry count=2\nretry typed flag=true\n\
+         retry echo message=hi\nretry\nquit\n",
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stdout.contains(r#"{"count":1,"text":"a"}"#),
+        "{}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains(r#"{"count":2,"text":"a"}"#),
+        "the arguments nobody changed are kept, and 2 is still a number: {}",
+        o.stdout
+    );
+    assert!(
+        o.stdout.contains(r#"{"count":2,"flag":true,"text":"a"}"#),
+        "a named tool retries its own last call: {}",
+        o.stdout
+    );
+    assert_eq!(
+        o.stdout.matches("Echo: hi").count(),
+        2,
+        "a bare `retry` sends the last call over: {}",
+        o.stdout
+    );
+    assert!(
+        o.stderr.contains(r#"call typed {"count":2,"text":"a"}"#),
+        "what it re-ran is said the way it would be typed: {}",
+        o.stderr
+    );
+
+    // Nothing to retry yet says so rather than sending anything.
+    let o = shell_script(&mut session(), "retry\nedit\nquit\n");
+    assert_eq!(o.code, 1);
+    assert_eq!(
+        o.stderr.matches("no call in this session yet").count(),
+        2,
+        "{}",
+        o.stderr
+    );
+}
+
+/// `edit` opens a call's arguments in `$EDITOR` and sends what it left; an editor
+/// that fails, or leaves nothing behind, sends nothing.
+#[cfg(unix)]
+#[test]
+fn shell_edit_sends_what_the_editor_left() {
+    let home = temp_home("shell-edit");
+    let target = format!("stdio:{}", echo_command());
+    let write = |name: &str, body: &str| {
+        let path = home.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        path
+    };
+    let good = write(
+        "good.sh",
+        "#!/bin/sh\nprintf '{\"message\": \"edited\"}' > \"$1\"\n",
+    );
+    let refuses = write("bad.sh", "#!/bin/sh\nexit 3\n");
+    let empties = write("empty.sh", "#!/bin/sh\n: > \"$1\"\n");
+
+    let script = "call echo {\"message\":\"first\"}\nedit 1\nquit\n";
+    let o = shell_script(
+        mcpdial(&home).args(["shell", &target]).env("EDITOR", &good),
+        script,
+    );
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("Echo: edited"), "{}", o.stdout);
+    assert!(
+        o.stderr.contains(r#"call echo {"message":"edited"}"#),
+        "{}",
+        o.stderr
+    );
+
+    for (editor, said) in [
+        (&refuses, "exited without saving"),
+        (&empties, "left empty"),
+    ] {
+        let o = shell_script(
+            mcpdial(&home)
+                .args(["shell", &target])
+                .env("EDITOR", editor),
+            script,
+        );
+        assert_eq!(o.code, 1, "{}", o.stderr);
+        assert!(o.stderr.contains(said), "{}", o.stderr);
+        assert_eq!(
+            o.stdout.matches("Echo:").count(),
+            1,
+            "nothing was sent a second time: {}",
+            o.stdout
+        );
+    }
+
+    // Nothing to open the arguments with is said before anything is written.
+    let o = shell_script(
+        mcpdial(&home)
+            .args(["shell", &target])
+            .env_remove("EDITOR")
+            .env_remove("VISUAL"),
+        script,
+    );
+    assert_eq!(o.code, 1);
+    assert!(o.stderr.contains("set $EDITOR"), "{}", o.stderr);
 }
 
 /// Every way a line can be wrong should answer with the shape that was wanted.
@@ -2670,15 +2930,18 @@ fn a_server_without_the_capability_names_it_instead_of_the_code() {
 fn the_shell_reaches_resources_and_prompts() {
     let s = start(Mode::Stateful);
     let home = temp_home("shell-resources");
-    let script = concat!(
-        "resources\n",
-        "read file:///readme.md\n",
-        "prompts\n",
-        "prompt summarize {\"text\":\"a memo\"}\n",
-        "read\n",
-        "quit\n",
+    // A read and a prompt are numbered results too, so they can be shown again
+    // and saved: text as text, a blob as the bytes it arrived as.
+    let notes = home.join("summary.txt");
+    let logo = home.join("logo.png");
+    let script = format!(
+        "resources\nread file:///readme.md\nprompts\n\
+         prompt summarize {{\"text\":\"a memo\"}}\nshow 1\nsave 2 {notes}\n\
+         read file:///logo.png\nsave 3 {logo}\nread\nquit\n",
+        notes = notes.display(),
+        logo = logo.display(),
     );
-    let (stdout, stderr, code) = shell(&home, &s.url, false, script);
+    let (stdout, stderr, code) = shell(&home, &s.url, false, &script);
     assert!(
         stdout.contains("2 resource(s):") && stdout.contains("file:///logo.png"),
         "{stdout}"
@@ -2692,6 +2955,21 @@ fn the_shell_reaches_resources_and_prompts() {
     assert!(stdout.contains("user: Summarize this: a memo"), "{stdout}");
     assert!(stderr.contains("read needs a resource URI"), "{stderr}");
     assert_eq!(code, Some(1), "the read with no URI failed");
+    assert_eq!(
+        stdout.matches("# fake-mcp").count(),
+        2,
+        "`show 1` prints the resource again: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&notes).unwrap(),
+        "user: Summarize this: a memo\nassistant: Sure.",
+        "a prompt is saved as the messages it printed"
+    );
+    assert_eq!(
+        &std::fs::read(&logo).unwrap()[..4],
+        b"\x89PNG",
+        "a blob is saved as the bytes it arrived as"
+    );
 
     let (stdout, _, _) = shell(&home, &s.url, true, "resources\nprompt greet\nquit\n");
     let lines: Vec<Value> = stdout

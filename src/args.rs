@@ -224,7 +224,7 @@ fn is_json_form(word: &str) -> bool {
     word.starts_with('{') || word.starts_with('@') || word == "-"
 }
 
-fn looks_like_pair(word: &str) -> bool {
+pub fn looks_like_pair(word: &str) -> bool {
     !is_json_form(word)
         && word
             .split_once('=')

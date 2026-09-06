@@ -29,7 +29,7 @@ pub const ENV_MAX_CHARS: &str = "MCPDIAL_MAX_CHARS";
 const APPLIES_TO: &str = "--max-chars and --output apply to call, prompt, read, raw and shell";
 
 /// The flag whose path this module reserves and writes, for the errors that
-/// name it.
+/// name it. A shell `save` writes through the same sink under its own name.
 const FLAG: &str = "--output";
 
 /// A payload on its way to stdout, in the unit its bound is counted in.
@@ -96,6 +96,9 @@ pub struct Output {
     max_chars: Option<usize>,
     file: Option<PathBuf>,
     json: bool,
+    /// What the errors and the summary call whoever asked for the file, since
+    /// `--output` is not the only thing that writes one.
+    flag: &'static str,
     /// Whether this run made `file`. Later commands of one `shell` session
     /// replace what earlier ones wrote there; a file mcpdial did not make is
     /// never written over.
@@ -132,8 +135,23 @@ impl Output {
             max_chars,
             file: cli.output.clone(),
             json: cli.json,
+            flag: FLAG,
             ours: Cell::new(false),
         })
+    }
+
+    /// One file, named by the command that asked for it rather than by a flag:
+    /// what the shell's `save` writes through, so that an unwritable path, a
+    /// file already there and a path that is a directory are all answered in
+    /// the words `--output` answers them in.
+    pub fn to_path(flag: &'static str, path: PathBuf, json: bool) -> Self {
+        Self {
+            max_chars: None,
+            file: Some(path),
+            json,
+            flag,
+            ours: Cell::new(false),
+        }
     }
 
     fn inert(json: bool) -> Self {
@@ -141,6 +159,7 @@ impl Output {
             max_chars: None,
             file: None,
             json,
+            flag: FLAG,
             ours: Cell::new(false),
         }
     }
@@ -230,9 +249,9 @@ impl Output {
         } else {
             open.create_new(true);
         }
-        let mut file = open.open(path).map_err(|e| refused(FLAG, path, &e))?;
+        let mut file = open.open(path).map_err(|e| refused(self.flag, path, &e))?;
         file.write_all(bytes)
-            .map_err(|e| Error::transport(format!("{FLAG} {}: {e}", path.display())))?;
+            .map_err(|e| Error::transport(format!("{} {}: {e}", self.flag, path.display())))?;
         self.ours.set(true);
         Ok(())
     }
@@ -366,17 +385,13 @@ mod tests {
             max_chars: Some(limit),
             file: None,
             json,
+            flag: FLAG,
             ours: Cell::new(false),
         }
     }
 
     fn to_file(path: &Path, json: bool) -> Output {
-        Output {
-            max_chars: None,
-            file: Some(path.to_path_buf()),
-            json,
-            ours: Cell::new(false),
-        }
+        Output::to_path(FLAG, path.to_path_buf(), json)
     }
 
     fn cut(d: Delivery) -> (String, Option<String>) {

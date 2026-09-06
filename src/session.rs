@@ -715,6 +715,25 @@ pub fn save_media(result: &mut Value, sink: &mut MediaSink) -> Result<()> {
     Ok(())
 }
 
+/// Every block a result can carry media in, for a reader that is only looking:
+/// see [`media_blocks_mut`], which is the same walk for a writer.
+pub fn media_blocks(result: &Value) -> Vec<&Value> {
+    let Some(fields) = result.as_object() else {
+        return Vec::new();
+    };
+    let mut blocks = Vec::new();
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("content" | "contents", Value::Array(items)) => blocks.extend(items.iter()),
+            ("messages", Value::Array(items)) => {
+                blocks.extend(items.iter().filter_map(|m| m.get("content")))
+            }
+            _ => {}
+        }
+    }
+    blocks
+}
+
 /// Every block a result can carry media in: `content[]` of `tools/call`,
 /// `messages[].content` of `prompts/get`, and `contents[]` of `resources/read`.
 fn media_blocks_mut(result: &mut Value) -> Vec<&mut Value> {
