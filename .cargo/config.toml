@@ -1,0 +1,11 @@
+# Windows reserves 1 MiB of stack for a process's main thread where Unix
+# reserves 8 MiB. clap_derive expands the whole command tree into a single
+# function, and unoptimized that function's frame is most of the 1 MiB before
+# `main` has run, so a debug build overflows on Windows and nowhere else. Ask
+# for the Unix figure rather than let the command tree's size decide whether
+# the binary starts.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]

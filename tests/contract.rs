@@ -26,6 +26,10 @@
 //! errors are left out for the same reason, and `serve` because it is a
 //! server: it runs until it is killed, and what it prints comes from the
 //! library rather than the presenter.
+//!
+//! `call --help` is held as tightly as the rest, though. It is what a person
+//! reads before their first call, so a flag or a heading that moves it has to
+//! be a deliberate act too.
 
 mod common;
 
@@ -111,6 +115,9 @@ struct Names {
 impl Names {
     fn normalise(&self, text: &str) -> String {
         let mut out = text.replace("\r\n", "\n");
+        // clap names the command after argv[0], so a usage line reads
+        // `mcpdial.exe` on Windows where it reads `mcpdial` everywhere else.
+        out = out.replace("mcpdial.exe", "mcpdial");
         for (base, name) in &self.bases {
             out = out.replace(base, name);
         }
@@ -580,6 +587,7 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("login-stdio", &["login", "echo"]),
         Case::both("guide", &["guide"]),
         Case::both("completions", &["completions", "bash"]),
+        Case::both("call-help", &["call", "--help"]).only_piped(),
         // From the registry: saved without being run, and never probed.
         Case::each(
             "add-registry",

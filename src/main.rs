@@ -37,6 +37,12 @@ mod present;
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
 const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 
+/// The positionals more than one subcommand takes, worded once so they cannot
+/// drift apart.
+const TARGET_HELP: &str = "A saved name, an http(s):// URL, or stdio:<command>";
+const SAVED_NAME_HELP: &str = "A saved server (`mcpdial ls` lists them)";
+const CREDENTIAL_TARGET_HELP: &str = "A saved name, or the http(s):// URL a token was saved for";
+
 /// Dial any MCP server from the shell. No SDK, no host app, no connector.
 ///
 /// TARGET is a saved server name, an http(s):// URL, or stdio:<command>.
@@ -45,6 +51,7 @@ const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
     name = "mcpdial",
     version,
     about,
+    next_help_heading = "Global options",
     after_help = "\
 examples:
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
@@ -59,6 +66,7 @@ examples:
   mcpdial call wiki read_wiki_structure '{\"repoName\":\"modelcontextprotocol/servers\"}'
   mcpdial call https://mcp.deepwiki.com/mcp read_wiki_structure '{\"repoName\":\"x/y\"}'
   mcpdial tools 'stdio:npx -y @modelcontextprotocol/server-everything stdio'
+  mcpdial completions SHELL       # bash, zsh, fish, elvish, powershell
 
 calling from a program or an agent: pass --json everywhere and run `mcpdial guide`."
 )]
@@ -159,6 +167,7 @@ struct Cli {
 enum Cmd {
     /// Save a server under a name
     Add {
+        /// The name to save it under, and to dial it by from then on
         name: String,
         /// Streamable HTTP endpoint
         #[arg(
@@ -213,6 +222,7 @@ enum Cmd {
     },
     /// Change a saved server's tool allow and deny lists, or show them
     Set {
+        #[arg(help = SAVED_NAME_HELP)]
         name: String,
         /// Replace the allow list with these globs (`*`, `?`), repeatable
         #[arg(long, value_name = "PATTERN", conflicts_with = "clear_allow")]
@@ -285,6 +295,7 @@ enum Cmd {
     },
     /// Keep one session open and run commands from stdin (state persists between calls)
     Shell {
+        #[arg(help = TARGET_HELP)]
         target: String,
         /// Print a url-mode elicitation's address instead of opening a browser
         #[arg(long)]
@@ -292,13 +303,17 @@ enum Cmd {
     },
     /// Keep a stdio server running in the background; later commands share its session
     Start {
+        /// A saved stdio server to hold open
         name: String,
         /// Exit after this many seconds with no caller (default: never)
         #[arg(long, value_name = "SECS")]
         idle: Option<f64>,
     },
     /// End a server kept running by `start`
-    Stop { name: String },
+    Stop {
+        /// The saved stdio server whose background session to end
+        name: String,
+    },
     /// Run a server's daemon in this process (what `start` runs in the background)
     #[command(hide = true)]
     Daemon {
@@ -307,7 +322,10 @@ enum Cmd {
         idle: Option<f64>,
     },
     /// Forget a server and any credential saved for it
-    Rm { name: String },
+    Rm {
+        #[arg(help = SAVED_NAME_HELP)]
+        name: String,
+    },
     /// List saved servers with their connection status
     Ls {
         /// Do not connect; just show the configuration
@@ -319,6 +337,7 @@ enum Cmd {
     },
     /// Show the tools a server offers (every server when no target is given)
     Tools {
+        /// A saved name, an http(s):// URL, or stdio:<command>; every saved server when omitted
         target: Option<String>,
         /// Show full descriptions and parameters
         #[arg(short, long)]
@@ -328,10 +347,15 @@ enum Cmd {
         all: bool,
     },
     /// Initialize and show server identity and capabilities
-    Info { target: String },
+    Info {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+    },
     /// Call a tool
     Call {
+        #[arg(help = TARGET_HELP)]
         target: String,
+        /// A tool name from `mcpdial tools TARGET`
         tool: String,
         /// One JSON object (inline, @file, or - for stdin), or key=value pairs
         arguments: Vec<String>,
@@ -343,18 +367,30 @@ enum Cmd {
         no_browser: bool,
     },
     /// Show one tool's name, description, and input and output schemas
-    Schema { target: String, tool: String },
+    Schema {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// A tool name from `mcpdial tools TARGET`
+        tool: String,
+    },
     /// Show the resources a server offers, and its URI templates
     Resources {
+        #[arg(help = TARGET_HELP)]
         target: String,
         /// Show full descriptions and mime types
         #[arg(short, long)]
         long: bool,
     },
     /// Read one resource. Text goes to stdout; binary needs a redirect or --save-dir
-    Read { target: String, uri: String },
+    Read {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        /// A resource URI from `mcpdial resources TARGET`, or a template expanded yourself
+        uri: String,
+    },
     /// Show the prompts a server offers
     Prompts {
+        #[arg(help = TARGET_HELP)]
         target: String,
         /// Show full descriptions and arguments
         #[arg(short, long)]
@@ -362,7 +398,9 @@ enum Cmd {
     },
     /// Render a prompt into the messages it expands to
     Prompt {
+        #[arg(help = TARGET_HELP)]
         target: String,
+        /// A prompt name from `mcpdial prompts TARGET`
         name: String,
         /// One JSON object (inline, @file, or - for stdin), or key=value pairs
         arguments: Vec<String>,
@@ -375,7 +413,9 @@ enum Cmd {
     },
     /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
     Raw {
+        #[arg(help = TARGET_HELP)]
         target: String,
+        /// A JSON-RPC method name, such as tools/list
         method: String,
         /// JSON object of params: inline, @file, or - for stdin
         #[arg(default_value = "{}")]
@@ -383,6 +423,7 @@ enum Cmd {
     },
     /// Expose a saved server to a client that must not see its credentials
     Serve {
+        #[arg(help = TARGET_HELP)]
         target: String,
         /// Address to listen on; port 0 picks a free one and reports it
         #[arg(
@@ -412,9 +453,13 @@ enum Cmd {
     Guide,
     /// Print a shell completion script for bash, zsh, fish, elvish or powershell
     #[command(hide = true)]
-    Completions { shell: Shell },
+    Completions {
+        /// The shell to write the script for
+        shell: Shell,
+    },
     /// Authorize in the browser once and save the token (HTTP servers)
     Login {
+        /// A saved name, or an http(s):// URL
         target: String,
         /// authorization-code (a browser, once) or client-credentials (a confidential
         /// client's --client-id and secret, no human)
@@ -462,7 +507,10 @@ enum Cmd {
         no_browser: bool,
     },
     /// Delete the saved credential for a server
-    Logout { target: String },
+    Logout {
+        #[arg(help = CREDENTIAL_TARGET_HELP)]
+        target: String,
+    },
     /// Manage saved tokens without the browser
     #[command(subcommand)]
     Token(TokenCmd),
@@ -472,14 +520,21 @@ enum Cmd {
 enum TokenCmd {
     /// Save a token read from stdin, or from --env VAR. Never from an argument.
     Set {
+        #[arg(help = CREDENTIAL_TARGET_HELP)]
         name: String,
         #[arg(long, value_name = "VAR")]
         env: Option<String>,
     },
     /// Describe the saved credential without revealing it
-    Show { name: String },
+    Show {
+        #[arg(help = CREDENTIAL_TARGET_HELP)]
+        name: String,
+    },
     /// Delete the saved credential
-    Rm { name: String },
+    Rm {
+        #[arg(help = CREDENTIAL_TARGET_HELP)]
+        name: String,
+    },
 }
 
 fn main() -> ExitCode {
