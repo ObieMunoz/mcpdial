@@ -9,7 +9,7 @@ echo
   parameters:
     message: string (required) - What to echo
 
-add
+add  [idempotent]
     Add two numbers.
   parameters:
     a: number (required)

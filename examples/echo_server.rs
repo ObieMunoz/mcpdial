@@ -32,6 +32,9 @@
 //! JSON type and refusing any other, which answers with the arguments it was handed
 //! so a test can see what type each one arrived as. It is behind a flag for the same
 //! reason: a sixth tool would renumber every listing assertion.
+//! Set `ECHO_SERVER_ANNOTATED=1` to add an `erase` tool that says what calling it
+//! does: a `title`, `annotations` marking it destructive and open-world, and
+//! `execution.taskSupport`. Behind a flag for the same reason `typed` is.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -53,6 +56,17 @@ fn typed_tool() -> Value {
     }}})
 }
 
+/// A tool whose own metadata warns a caller off before they call it: what
+/// `title`, `annotations` and `execution.taskSupport` look like on the wire.
+fn annotated_tool() -> Value {
+    json!({"name": "erase", "title": "Erase a file",
+    "description": "Remove a file permanently.",
+    "annotations": {"destructiveHint": true, "openWorldHint": true},
+    "execution": {"taskSupport": "optional"},
+    "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}},
+                    "required": ["path"]}})
+}
+
 /// A PNG signature padded to 4096 bytes: enough to be a nuisance on stdout.
 fn image_block() -> Value {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -66,6 +80,7 @@ fn main() {
     let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
     let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
     let types = std::env::var_os("ECHO_SERVER_TYPES").is_some();
+    let annotated = std::env::var_os("ECHO_SERVER_ANNOTATED").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
@@ -169,6 +184,12 @@ fn main() {
                 ]});
                 if types {
                     listed["tools"].as_array_mut().unwrap().push(typed_tool());
+                }
+                if annotated {
+                    listed["tools"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(annotated_tool());
                 }
                 ok(id, listed)
             }

@@ -285,6 +285,33 @@ object with its own fields one level in (`at: object {x: number, y?: string}`), 
 rejected, so a retry needs no second lookup; `mcpdial schema TARGET TOOL` prints the
 whole `inputSchema` when the summary is not enough.
 
+What a tool says about *itself* goes on the name line: the server's own `title` where it
+says more than the name does, then a tag for every annotation hint the tool set —
+`[read-only]`, `[destructive]`, `[idempotent]`, `[open-world]` — and `[task:optional]`
+or `[task:required]` where the server will run the tool as a task.
+
+```
+$ mcpdial tools files --long
+erase  "Erase a file"  [destructive] [open-world]
+    Remove a file permanently.
+  parameters:
+    path: string (required)
+```
+
+Only a hint the server actually set is printed. The spec's default for `destructiveHint`
+is true, so a tool that annotates nothing is one that said nothing, not one that promised
+to be safe. The short listing has room for a single hint, and marks a destructive tool
+with a trailing `*` on its name:
+
+```
+$ mcpdial tools files
+  read_file                    Read a file.
+  erase*                       Remove a file permanently.
+```
+
+The same tags head `mcpdial schema TARGET TOOL`, the shell's `help TOOL`, and the usage
+block printed under a rejected call, since that is where a caller looks next.
+
 Under `--json` the same flag says how much of the server's own object comes back. A
 listing is each tool's `name` and the first line of its `description`, which is what it
 takes to choose one; `mcpdial schema TARGET TOOL` then hands over that tool whole,

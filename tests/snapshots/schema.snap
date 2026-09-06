@@ -35,4 +35,5 @@ exit 0
   }
 }
 --- stderr
+add  [idempotent]
 this tool declares an outputSchema: results carry structuredContent

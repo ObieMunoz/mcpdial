@@ -44,11 +44,17 @@ once and every command carries it.
    (exit 2) listing what it does have, since the `tools/list` behind it succeeded
    and nothing was sent for that tool. Take those two in that order rather than
    `mcpdial tools TARGET --long --json`, which is every tool in full and tens of
-   kilobytes on a large server. `prompts` and `resources` list the same way: a
-   name and one line each, the server's own objects under `--long`. A saved server
-   may carry `allow` and `deny` lists of glob patterns (`mcpdial set NAME --json`
-   shows them); `tools` and `ls` then list and count only the permitted tools, and
-   `tools NAME --all` adds the hidden ones with `"denied": true`.
+   kilobytes on a large server. That full object carries the tool's `annotations`,
+   the server's own word on what a call does (`readOnlyHint`, `destructiveHint`,
+   `idempotentHint`, `openWorldHint`); only a hint that is present and true says
+   anything, since the spec's default for `destructiveHint` is true. Without
+   `--json` they print as `[destructive]` tags beside the name under `--long`, and
+   a destructive tool's name carries a `*` in the short listing. `prompts` and
+   `resources` list the same way: a name and one line each, the server's own
+   objects under `--long`. A saved server may carry `allow` and `deny` lists of
+   glob patterns (`mcpdial set NAME --json` shows them); `tools` and `ls` then
+   list and count only the permitted tools, and `tools NAME --all` adds the hidden
+   ones with `"denied": true`.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json`, or
    `mcpdial call TARGET TOOL key=value ... --json`, prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text

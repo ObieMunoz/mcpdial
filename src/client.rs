@@ -833,6 +833,67 @@ pub fn describe_params(tool: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The hints a tool's `annotations` set, as the words a listing tags it with.
+///
+/// Only a hint that is present and true is named. The spec's default for
+/// `destructiveHint` is true, so a tool that annotates nothing is a tool that
+/// said nothing, which must never be read as a promise that a call is safe.
+pub fn describe_annotations(tool: &Value) -> Vec<&'static str> {
+    let mut tags: Vec<&'static str> = [
+        ("readOnlyHint", "read-only"),
+        ("destructiveHint", "destructive"),
+        ("idempotentHint", "idempotent"),
+        ("openWorldHint", "open-world"),
+    ]
+    .into_iter()
+    .filter(|(hint, _)| tool["annotations"][hint] == true)
+    .map(|(_, tag)| tag)
+    .collect();
+    // A tool a server can run as a task is one a caller may start and leave; one
+    // that only runs as a task cannot be called any other way.
+    match tool["execution"]["taskSupport"].as_str() {
+        Some("optional") => tags.push("task:optional"),
+        Some("required") => tags.push("task:required"),
+        _ => {}
+    }
+    tags
+}
+
+/// The name a server gave a tool for a person to read, where it says more than
+/// the tool's own name does. `title` is where protocol 2025-06-18 put it;
+/// servers written against 2025-03-26 put the same string in `annotations`.
+pub fn describe_title(tool: &Value) -> Option<&str> {
+    let title = tool["title"]
+        .as_str()
+        .or_else(|| tool["annotations"]["title"].as_str())?
+        .trim();
+    (!title.is_empty() && Some(title) != tool["name"].as_str()).then_some(title)
+}
+
+/// What a `--long` listing writes after a tool's name: its title, then a tag per
+/// hint. Empty for a tool that says nothing about itself, and for every prompt.
+pub fn hint_tags(tool: &Value) -> String {
+    let titled = describe_title(tool).map(|t| format!("  {t:?}"));
+    let tags = describe_annotations(tool);
+    let tagged = (!tags.is_empty()).then(|| format!("  [{}]", tags.join("] [")));
+    format!(
+        "{}{}",
+        titled.unwrap_or_default(),
+        tagged.unwrap_or_default()
+    )
+}
+
+/// What the short listing writes after a tool's name, having room for one hint
+/// only: the tool a caller must not try blind wears a `*`.
+pub fn hint_mark(tool: &Value) -> String {
+    let destroys_something = tool["annotations"]["destructiveHint"] == true;
+    if destroys_something {
+        "*".into()
+    } else {
+        String::new()
+    }
+}
+
 /// A skeleton arguments object for a tool: every required property with a
 /// placeholder for its type. Tools that require nothing get `{}`.
 pub fn example_arguments(tool: &Value) -> String {
@@ -1039,6 +1100,56 @@ mod tests {
             ["z: string (required)", "a: string"]
         );
         assert!(describe_params(&json!({"name":"x"})).is_empty());
+    }
+
+    #[test]
+    fn describes_what_a_tool_says_about_itself() {
+        let every = json!({"name":"wipe","title":"Wipe the disk","annotations":{
+            "readOnlyHint":true,"destructiveHint":true,"idempotentHint":true,
+            "openWorldHint":true},"execution":{"taskSupport":"optional"}});
+        assert_eq!(
+            describe_annotations(&every),
+            [
+                "read-only",
+                "destructive",
+                "idempotent",
+                "open-world",
+                "task:optional"
+            ]
+        );
+        assert_eq!(
+            hint_tags(&every),
+            r#"  "Wipe the disk"  [read-only] [destructive] [idempotent] [open-world] [task:optional]"#
+        );
+        assert_eq!(hint_mark(&every), "*");
+
+        // A tool that annotated nothing is tagged with nothing: the spec's
+        // default for destructiveHint is true, so silence is not safety.
+        let quiet = json!({"name":"add"});
+        assert!(describe_annotations(&quiet).is_empty());
+        assert_eq!(hint_tags(&quiet), "");
+        assert_eq!(hint_mark(&quiet), "");
+
+        // A hint that is present and false says the opposite of its tag.
+        let safe =
+            json!({"name":"read","annotations":{"destructiveHint":false,"readOnlyHint":true}});
+        assert_eq!(describe_annotations(&safe), ["read-only"]);
+        assert_eq!(hint_mark(&safe), "");
+
+        // A title that only repeats the name has nothing to add.
+        let same = json!({"name":"erase","title":"erase","annotations":{"destructiveHint":true}});
+        assert_eq!(hint_tags(&same), "  [destructive]");
+        assert_eq!(describe_title(&same), None);
+        // The place an older server puts the same string is read too.
+        let legacy = json!({"name":"erase","annotations":{"title":"Erase a file"}});
+        assert_eq!(hint_tags(&legacy), r#"  "Erase a file""#);
+
+        // A tool that only runs as a task cannot be called any other way, and
+        // anything else the field could say is not a tag.
+        let required = json!({"name":"render","execution":{"taskSupport":"required"}});
+        assert_eq!(describe_annotations(&required), ["task:required"]);
+        let forbidden = json!({"name":"render","execution":{"taskSupport":"forbidden"}});
+        assert!(describe_annotations(&forbidden).is_empty());
     }
 
     #[test]

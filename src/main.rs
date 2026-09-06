@@ -908,8 +908,15 @@ fn field_values(items: &[Value], key: &str) -> Vec<String> {
 /// `quote` wraps the argument object, which a shell needs quoted and the REPL does not.
 fn tool_usage(tool: &Value, prefix: &str, quote: &str) -> String {
     let name = tool["name"].as_str().unwrap_or("?");
+    // Whoever is reading this has just had a call refused. What the tool says a
+    // call does belongs above the parameters it takes, not under them.
+    let hints = client::hint_tags(tool);
+    let headline = match hints.is_empty() {
+        true => String::new(),
+        false => format!("{name}{hints}\n"),
+    };
     let mut out = format!(
-        "usage: {prefix} {name} {quote}{}{quote}",
+        "{headline}usage: {prefix} {name} {quote}{}{quote}",
         client::example_arguments(tool)
     );
     // The same call in the other form, so a retry after either one goes wrong
@@ -2336,6 +2343,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     tool: None,
                 });
             };
+            // Beside the note below, and on stderr for the same reason: stdout
+            // is the tool object, whole, whichever mode asked for it.
+            let hints = client::hint_tags(t);
+            if !hints.is_empty() {
+                ui.err_line(&format!("{tool}{hints}"));
+            }
             ui.paged(|| print_json(ui, t));
             if t.get("outputSchema").is_some() {
                 ui.err_line("this tool declares an outputSchema: results carry structuredContent");
@@ -3125,7 +3138,14 @@ fn truncate(s: &str) -> String {
 }
 
 fn print_tools(ui: &dyn Presenter, tools: &[Value], long: bool) {
-    ui.named(tools, long, "parameters", &describe_params);
+    // A `--long` listing has room to spell out what calling a tool does; the
+    // short one carries only the hint a caller cannot afford to miss.
+    let hints: &dyn Fn(&Value) -> String = if long {
+        &client::hint_tags
+    } else {
+        &client::hint_mark
+    };
+    ui.named(tools, long, "parameters", &describe_params, hints);
 }
 
 /// A `--long` listing reads like a document and may run past the screen; the
@@ -3139,7 +3159,9 @@ fn listed(ui: &dyn Presenter, long: bool, print: impl FnOnce()) {
 }
 
 fn print_prompts(ui: &dyn Presenter, prompts: &[Value], long: bool) {
-    ui.named(prompts, long, "arguments", &describe_prompt_args);
+    ui.named(prompts, long, "arguments", &describe_prompt_args, &|_| {
+        String::new()
+    });
 }
 
 /// A prompt's arguments carry no schema: every one of them is a string.

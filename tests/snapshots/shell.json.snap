@@ -14,7 +14,7 @@ exit 1
 {"capabilities":{"prompts":{},"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake-mcp","version":"1.0"}}
 {"annotations":{"idempotentHint":true},"description":"Add two numbers.","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"name":"add","outputSchema":{"properties":{"sum":{"type":"number"}},"required":["sum"],"type":"object"}}
 {"nextCursor":"page-2","tools":[{"description":"Echo a message back.\nSecond line.","inputSchema":{"properties":{"message":{"description":"What to echo","type":"string"}},"required":["message"],"type":"object"},"name":"echo"}]}
-{"error":{"hint":"usage: call add {\"a\": <number>, \"b\": <number>}\n   or: call add a=<number> b=<number>\n  a: number (required)\n  b: number (required)","kind":"usage","message":"add is a tool, not a command"}}
+{"error":{"hint":"add  [idempotent]\nusage: call add {\"a\": <number>, \"b\": <number>}\n   or: call add a=<number> b=<number>\n  a: number (required)\n  b: number (required)","kind":"usage","message":"add is a tool, not a command"}}
 --- stderr
 commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
@@ -32,6 +32,7 @@ commands (one per line; # starts a comment):
 
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.
+add  [idempotent]
 usage: call add {"a": <number>, "b": <number>}
    or: call add a=<number> b=<number>
   a: number (required)
