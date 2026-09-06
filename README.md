@@ -223,6 +223,13 @@ read_wiki_structure
     repoName: string (required) - GitHub repository: owner/repo (e.g. "facebook/react")
 ```
 
+A parameter that takes more than one shape is named as all of them
+(`repoName: string|string[]`), an array as what it holds (`pages: object[]`), and an
+object with its own fields one level in (`at: object {x: number, y?: string}`), where a
+`?` marks a field the schema does not require. The same lines follow a call the server
+rejected, so a retry needs no second lookup; `mcpdial schema TARGET TOOL` prints the
+whole `inputSchema` when the summary is not enough.
+
 ### Allowing and denying tools
 
 A filesystem server with fourteen tools is usually wanted for three of them, and an

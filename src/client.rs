@@ -6,6 +6,7 @@
 use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
 use crate::oauth;
 use crate::protocol::{Error, KnownVersion, Result};
+use crate::schema;
 use crate::session::Session;
 use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
@@ -781,17 +782,7 @@ pub fn describe_params(tool: &Value) -> Vec<String> {
     ordered
         .into_iter()
         .map(|(name, spec)| {
-            let ty = match &spec["type"] {
-                Value::String(s) => s.clone(),
-                Value::Array(a) => a
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("|"),
-                _ if spec.get("enum").is_some() => "enum".into(),
-                _ => "any".into(),
-            };
-            let mut line = format!("{name}: {ty}");
+            let mut line = format!("{name}: {}", schema::type_name(spec));
             if required.contains(&name.as_str()) {
                 line.push_str(" (required)");
             }
@@ -819,30 +810,10 @@ pub fn example_arguments(tool: &Value) -> String {
         .filter_map(Value::as_str)
         .map(|name| {
             let spec = props.and_then(|p| p.get(name)).unwrap_or(&Value::Null);
-            format!("{}: {}", json!(name), placeholder(spec))
+            format!("{}: {}", json!(name), schema::json_placeholder(spec))
         })
         .collect();
     format!("{{{}}}", fields.join(", "))
-}
-
-/// What stands in for one value in [`example_arguments`].
-fn placeholder(spec: &Value) -> String {
-    if let Some(values) = spec["enum"].as_array().filter(|v| !v.is_empty()) {
-        return values
-            .iter()
-            .take(4)
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("|");
-    }
-    match spec["type"].as_str() {
-        Some("string") => "\"<string>\"".into(),
-        Some("number") | Some("integer") => "<number>".into(),
-        Some("boolean") => "true|false".into(),
-        Some("array") => "[...]".into(),
-        Some("object") => "{...}".into(),
-        _ => "<value>".into(),
-    }
 }
 
 #[cfg(test)]
@@ -1004,12 +975,25 @@ mod tests {
         let tool = json!({"name":"add","inputSchema":{"type":"object","properties":{
             "a":{"type":"number","description":"First\nsecond line"},
             "b":{"type":["number","null"]},
-            "mode":{"enum":["x","y"]}
+            "mode":{"enum":["x","y"]},
+            "repoName":{"anyOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}]},
+            "pages":{"type":"array","items":{"type":"object"}},
+            "at":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"string"}},
+                  "required":["x"]}
         },"required":["a"]}});
-        let lines = describe_params(&tool);
-        assert_eq!(lines[0], "a: number (required) - First");
-        assert_eq!(lines[1], "b: number|null");
-        assert_eq!(lines[2], "mode: enum");
+        // A parameter with more than one shape says both of them, a container
+        // says what it holds, and an object names its fields one level in.
+        assert_eq!(
+            describe_params(&tool),
+            [
+                "a: number (required) - First",
+                "at: object {x: number, y?: string}",
+                "b: number|null",
+                "mode: enum",
+                "pages: object[]",
+                "repoName: string|string[]",
+            ]
+        );
         // Required first, whatever the order the schema listed them in.
         let reordered = json!({"inputSchema":{"properties":{
             "a":{"type":"string"}, "z":{"type":"string"}
@@ -1027,11 +1011,13 @@ mod tests {
             "url":{"type":"string"},
             "timeout":{"type":"number"},
             "mode":{"enum":["fast","slow"]},
-            "flag":{"type":"boolean"}
-        },"required":["url","mode","flag"]}});
+            "flag":{"type":"boolean"},
+            "repoName":{"anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},
+            "at":{"type":"object","properties":{"x":{"type":"number"}}}
+        },"required":["url","mode","flag","repoName","at"]}});
         assert_eq!(
             example_arguments(&tool),
-            r#"{"url": "<string>", "mode": "fast"|"slow", "flag": true|false}"#
+            r#"{"url": "<string>", "mode": "fast"|"slow", "flag": true|false, "repoName": [...], "at": {...}}"#
         );
         // Nothing required means the empty object is already a complete call.
         assert_eq!(
