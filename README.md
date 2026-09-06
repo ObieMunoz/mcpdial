@@ -125,6 +125,7 @@ mcpdial add NAME ... [--allow GLOB]... [--deny GLOB]...   offer some of a server
 mcpdial set NAME [--allow GLOB]... [--deny GLOB]... [--clear-allow] [--clear-deny]   change those lists; no flags shows them
 mcpdial search QUERY [--limit N] [--refresh] [--offline]   the MCP registry, ranked, from a local copy
 mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor, Windsurf, VS Code, Codex, OpenCode configs
+mcpdial export [NAME...] [--format mcpservers|vscode|codex] [--merge FILE]  the same servers in a host's shape, on stdout
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 
@@ -327,6 +328,29 @@ Codex's `config.toml` is read by a small reader of its own rather than a full TO
 parser: tables, dotted keys, strings, arrays, inline tables, booleans, numbers and
 comments, which is everything a server entry uses. A multi-line string, an array of
 tables or a date in the file is refused with its line number rather than misread.
+
+### Exporting to a host
+
+`mcpdial export` is `import` pointed the other way: it writes saved servers out in the
+shape a host reads and prints them, so a set tested here with `ls` can be pasted into
+Claude Code, Cursor, Windsurf, VS Code or Codex without retyping. `--format mcpservers`
+(the default) writes the `mcpServers` object; `vscode` writes `servers` with an explicit
+`type`; `codex` writes `[mcp_servers.NAME]` tables. With no names every saved server is
+exported. `--merge FILE` prints that host's file with the exported entries replaced or
+added and everything else in it left alone; nothing is ever written for you, so the
+redirect and the diff stay yours. Exit 2 if a named server is not saved.
+
+```
+$ mcpdial export fs > .mcp.json
+fs: its allow and deny lists are not exported; the host will offer every tool
+$ mcpdial export --format codex --merge ~/.codex/config.toml > merged.toml
+```
+
+No credential is exported. A saved OAuth token stays here and the host is told to log in
+for itself; a `token_env` travels as the `${VAR}` placeholder it is, as an `Authorization:
+Bearer ${VAR}` header for the hosts that expand one and as Codex's own
+`bearer_token_env_var`. Each thing left behind is named on stderr, one line per server
+(`{"note": "..."}` under `--json`), so nothing goes missing silently.
 
 ### Adding from the catalog
 
