@@ -386,4 +386,26 @@ goes to stdout in that mode, so there is no receipt.
   502/503/504 before a session was issued). A timeout, any other 4xx, a JSON-RPC error
   and a stdio server that dies are never retried. `--no-retry` reports the first
   failure.
+- `--max-chars N` bounds a result to N characters, counted in characters so no
+  UTF-8 sequence is ever halved (`MCPDIAL_MAX_CHARS=N` sets it once for a whole
+  harness). It applies to `call`, `prompt`, `read`, `raw` and `shell`; without it
+  nothing is ever cut. Under `--json` a result over the bound is not rewritten but
+  replaced, by an object carrying a `truncated` key no whole result has:
+  `{"truncated": {"chars": 2000, "totalChars": 480221, "hint": ...}, "isError": false,
+  "head": "..."}`. Test for `truncated` to know you are holding a head; `head` is the
+  first N characters of the document the whole result would have been. Without
+  `--json` the head goes to stdout and the same counts go to stderr as one line.
+  Reach for it on an exploratory call, where the shape of an answer matters and its
+  bulk does not.
+- `--output FILE` (`-o`) writes the whole result to FILE and prints one line instead:
+  `{"output": "result.json", "chars": 480221, "isError": false}` under `--json`, and
+  `wrote 480,221 chars to result.json` without it. The file holds exactly the payload
+  and nothing else - the result object under `--json`, the rendered text otherwise,
+  and a resource's bytes unchanged for `read` of a blob, which is the other way past
+  the redirect a terminal asks for. A blob is counted in `bytes` rather than `chars`,
+  since it has no characters. Exit codes are unchanged: a tool that reported an error
+  still exits 1, and its file is still written. FILE must not already exist and must
+  not be a directory; either is a usage error (exit 2) raised before the server is
+  dialed, so nothing is ever written over. Reach for it for anything to be processed
+  with `jq` later.
 - `mcpdial guide` prints this document.

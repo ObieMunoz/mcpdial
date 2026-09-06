@@ -15,6 +15,7 @@ use mcpdial::{
     daemon, oauth, Credential, Error, KnownVersion, Level, ServerConfig, Store, USER_AGENT,
 };
 use notices::Notices;
+use output::{As, Output, Payload};
 use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -28,6 +29,7 @@ mod args;
 mod brief;
 mod env_defaults;
 mod notices;
+mod output;
 mod present;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
@@ -126,6 +128,16 @@ struct Cli {
     /// printing them (call, prompt, read, shell)
     #[arg(long, global = true, value_name = "DIR")]
     save_dir: Option<PathBuf>,
+
+    /// Show at most N characters of a result; under --json a `truncated` object
+    /// replaces it (call, prompt, read, raw, shell; MCPDIAL_MAX_CHARS=N does the same)
+    #[arg(long, global = true, value_name = "N")]
+    max_chars: Option<usize>,
+
+    /// Write the whole result to FILE, which must not exist, and print one line
+    /// saying so (call, prompt, read, raw, shell)
+    #[arg(short = 'o', long, global = true, value_name = "FILE")]
+    output: Option<PathBuf>,
 
     /// Dial a stdio server afresh even when `start` left one running
     /// (MCPDIAL_NO_DAEMON=1 does the same everywhere)
@@ -518,11 +530,7 @@ fn print_json(ui: &dyn Presenter, v: &impl serde::Serialize) {
 }
 
 fn print_value(ui: &dyn Presenter, v: &Value, compact: bool) {
-    if compact {
-        ui.json(&v.to_string());
-    } else {
-        print_json(ui, v);
-    }
+    ui.json(&output::document(v, compact));
 }
 
 /// A hint on stderr: prose for a human, `{"hint": ...}` under `--json`, where
@@ -541,23 +549,43 @@ fn print_hint(ui: &dyn Presenter, hint: &str, json: bool) {
 /// itself. Returns whether the tool reported an error.
 fn print_tool_result(
     ui: &dyn Presenter,
+    out: &Output,
     result: &Value,
     text: &str,
     json: bool,
     one_line: bool,
-) -> bool {
+) -> Result<bool, Failure> {
     let failed = result["isError"].as_bool().unwrap_or(false);
-    if json {
-        print_value(ui, result, one_line);
+    let payload = if json {
+        Payload::Json {
+            value: result,
+            one_line,
+        }
     } else {
-        if !text.is_empty() {
+        Payload::Text(text)
+    };
+    let sent = out.deliver(payload, failed)?;
+    output::show(ui, sent, shape(json), json, || {
+        if json {
+            print_value(ui, result, one_line);
+        } else if !text.is_empty() {
             ui.text(text);
         }
-        if failed {
-            ui.err_line("(tool reported an error)");
-        }
+    });
+    if !json && failed {
+        ui.err_line("(tool reported an error)");
     }
-    failed
+    Ok(failed)
+}
+
+/// A result goes out as a document under `--json` and as the server's own text
+/// otherwise, cut or whole.
+fn shape(json: bool) -> As {
+    if json {
+        As::Json
+    } else {
+        As::Text
+    }
 }
 
 /// One request with somebody listening to what the server says on the way, and
@@ -1097,6 +1125,7 @@ fn rendered(
 /// otherwise.
 fn emit(
     ui: &dyn Presenter,
+    out: &Output,
     result: &mut Value,
     json: bool,
     compact: bool,
@@ -1104,11 +1133,22 @@ fn emit(
     render: Render,
 ) -> Result<(), Failure> {
     let text = rendered(result, json, files, render)?;
-    if json {
-        print_value(ui, result, compact);
-    } else if !text.is_empty() {
-        ui.text(&text);
-    }
+    let payload = if json {
+        Payload::Json {
+            value: result,
+            one_line: compact,
+        }
+    } else {
+        Payload::Text(&text)
+    };
+    let sent = out.deliver(payload, false)?;
+    output::show(ui, sent, shape(json), json, || {
+        if json {
+            print_value(ui, result, compact);
+        } else if !text.is_empty() {
+            ui.text(&text);
+        }
+    });
     Ok(())
 }
 
@@ -1117,6 +1157,7 @@ fn emit(
 /// themselves, which is the presenter's business.
 fn emit_resource(
     ui: &dyn Presenter,
+    out: &Output,
     result: &mut Value,
     json: bool,
     compact: bool,
@@ -1128,11 +1169,30 @@ fn emit_resource(
         if files.saves() {
             save_media(result, &mut sink)?;
         }
-        print_value(ui, result, compact);
+        let sent = out.deliver(
+            Payload::Json {
+                value: result,
+                one_line: compact,
+            },
+            false,
+        )?;
+        output::show(ui, sent, As::Json, json, || {
+            print_value(ui, result, compact)
+        });
     } else if files.saves() {
-        ui.out(&render_resource(result, &mut sink)?);
+        let text = render_resource(result, &mut sink)?;
+        let sent = out.deliver(Payload::Text(&text), false)?;
+        output::show(ui, sent, As::Raw, json, || ui.out(&text));
     } else {
-        ui.resource(&resource_bodies(result)?, redirect)?;
+        // Bodies leave byte for byte, so the presenter that refuses binary at a
+        // terminal keeps its say - unless `--output` has somewhere to put them.
+        let bodies = resource_bodies(result)?;
+        let sent = out.deliver_resource(&bodies)?;
+        let mut refused = Ok(());
+        output::show(ui, sent, As::Raw, json, || {
+            refused = ui.resource(&bodies, redirect);
+        });
+        refused?;
     }
     Ok(())
 }
@@ -1491,6 +1551,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             .map_err(|e| Error::usage(format!("--save-dir {}: {e}", dir.display())))?;
     }
     let save_dir = cli.save_dir.as_deref();
+    let out = Output::choose(&cli)?;
 
     match cli.cmd {
         Cmd::Add {
@@ -2011,7 +2072,15 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 stem: resource_stem(rest),
                             };
                             ui.paged(|| {
-                                emit_resource(ui, &mut result, cli.json, true, &files, &redirect)
+                                emit_resource(
+                                    ui,
+                                    &out,
+                                    &mut result,
+                                    cli.json,
+                                    true,
+                                    &files,
+                                    &redirect,
+                                )
                             })
                         }
                     },
@@ -2055,6 +2124,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     ui.paged(|| {
                                         emit(
                                             ui,
+                                            &out,
                                             &mut result,
                                             cli.json,
                                             true,
@@ -2096,16 +2166,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                             dir: save_dir,
                                             stem: file_stem(tool),
                                         };
-                                        rendered(&mut result, cli.json, &files, render_content).map(
-                                            |out| {
+                                        rendered(&mut result, cli.json, &files, render_content)
+                                            .and_then(|text| {
                                                 let failed = ui.paged(|| {
                                                     print_tool_result(
-                                                        ui, &result, &out, cli.json, true,
+                                                        ui, &out, &result, &text, cli.json, true,
                                                     )
-                                                });
+                                                })?;
                                                 if failed {
                                                     let argument_error =
-                                                        reads_as_argument_error(&out);
+                                                        reads_as_argument_error(&text);
                                                     if let Some(hint) = shell_call_hint(
                                                         &mut cache,
                                                         &mut conn,
@@ -2115,8 +2185,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                                         print_hint(ui, &hint, cli.json);
                                                     }
                                                 }
-                                            },
-                                        )
+                                                Ok(())
+                                            })
                                     }
                                     Err(e) => {
                                         let hint = server_refused(&e)
@@ -2312,7 +2382,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: resource_stem(&uri),
             };
-            ui.paged(|| emit_resource(ui, &mut result, cli.json, false, &files, &redirect))?;
+            ui.paged(|| emit_resource(ui, &out, &mut result, cli.json, false, &files, &redirect))?;
             Ok(0)
         }
 
@@ -2370,7 +2440,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: file_stem(&name),
             };
-            ui.paged(|| emit(ui, &mut result, cli.json, false, &files, render_messages))?;
+            ui.paged(|| {
+                emit(
+                    ui,
+                    &out,
+                    &mut result,
+                    cli.json,
+                    false,
+                    &files,
+                    render_messages,
+                )
+            })?;
             Ok(0)
         }
 
@@ -2400,9 +2480,23 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Completions { shell } => {
-            let mut command = Cli::command();
-            let name = command.get_name().to_string();
-            clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
+            // Building the whole command tree to walk it recurses deeper than
+            // the 1 MB stack a Windows main thread is given, and every global
+            // flag added takes it deeper still, so the walk gets a stack of its
+            // own rather than being one flag away from overflowing.
+            const SCRIPT_STACK: usize = 8 * 1024 * 1024;
+            let failed =
+                |what: &str| Error::transport(format!("writing the {shell} script: {what}"));
+            std::thread::Builder::new()
+                .stack_size(SCRIPT_STACK)
+                .spawn(move || {
+                    let mut command = Cli::command();
+                    let name = command.get_name().to_string();
+                    clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
+                })
+                .map_err(|e| failed(&e.to_string()))?
+                .join()
+                .map_err(|_| failed("the writer stopped"))?;
             Ok(0)
         }
 
@@ -2702,7 +2796,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 stem: file_stem(&tool),
             };
             let text = rendered(&mut result, cli.json, &files, render_content)?;
-            let is_error = ui.paged(|| print_tool_result(ui, &result, &text, cli.json, false));
+            let is_error =
+                ui.paged(|| print_tool_result(ui, &out, &result, &text, cli.json, false))?;
             // A failed result that is really a schema complaint, or a server's way
             // of saying it has no such tool, gets the same answer as the JSON-RPC
             // error other servers would have sent.
@@ -2722,7 +2817,14 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let params = read_json_arg(&params, "params")?;
             let mut conn = dial(&store, &opts, &target)?;
             let result = conn.session.request(&method, Some(params))?;
-            ui.paged(|| print_json(ui, &result));
+            let sent = out.deliver(
+                Payload::Json {
+                    value: &result,
+                    one_line: false,
+                },
+                false,
+            )?;
+            ui.paged(|| output::show(ui, sent, As::Json, cli.json, || print_json(ui, &result)));
             Ok(0)
         }
 

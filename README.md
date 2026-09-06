@@ -137,6 +137,8 @@ mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
 mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
 mcpdial --save-dir DIR ...       file image, audio and blob blocks as DIR/<tool>-<n>.<ext>
+mcpdial --max-chars N ...        show at most N characters of a result; say so on stderr
+mcpdial -o FILE ...              write the whole result to FILE; print one line saying so
 mcpdial prompts TARGET [--long]  every prompt a server offers
 mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | - | key=value ...]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
@@ -167,9 +169,20 @@ MCP revision instead of working out which the server speaks,
 `--no-retry` to fail on the first transient HTTP failure instead of sending the
 request once more, `--progress` to print a line on stderr for every progress
 notification a server sends during a call, `--log-level LEVEL` to move the line a
-server's own log messages print from, `--plain` (or `MCPDIAL_PLAIN=1`) to print at a
-terminal exactly what a pipe would get, and `--no-pager` to print long output
-straight to the terminal.
+server's own log messages print from, `--max-chars N` (or `MCPDIAL_MAX_CHARS=N`) and
+`--output FILE` (`-o`) to keep a large result out of a context window, `--plain` (or
+`MCPDIAL_PLAIN=1`) to print at a terminal exactly what a pipe would get, and
+`--no-pager` to print long output straight to the terminal.
+
+`--max-chars` and `--output` apply to `call`, `prompt`, `read`, `raw` and `shell`.
+A result over the bound is cut between characters, never inside one; under `--json`
+it is replaced by an object with a `truncated` key rather than half rewritten, so a
+program can tell a head from a whole result by testing for that one key. `--output`
+writes the payload exactly - the result object under `--json`, the rendered text
+otherwise, and a resource's bytes unchanged, which is the other way past the
+redirect a terminal asks a `read` of a blob for. It refuses a path that already
+exists or is a directory, before the server is dialed. `mcpdial guide` has the
+detail.
 
 What a pipe gets is frozen. Everything mcpdial prints goes through one of two
 presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
