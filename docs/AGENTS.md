@@ -244,6 +244,39 @@ A bare tool name is not a command; `call` it. Nothing else in the line is guesse
 Line editing, history and Tab completion apply only when stdin and stdout are both a
 terminal; piped input is read one line at a time with no editing and no history.
 
+## Serving a saved server to something that must not hold its token
+
+`mcpdial serve NAME` re-exposes one saved server as a plain MCP endpoint, dialing
+upstream with the saved credential and never handing it on. It runs until `^C`
+(exit 0), so start it in the background and read where it landed:
+
+```
+mcpdial serve NAME [--listen ADDR] [--bearer-env VAR] [--allow PAT]... [--deny PAT]...
+mcpdial serve NAME --stdio
+```
+
+`--listen` defaults to `127.0.0.1:0`; a non-loopback address is a usage error
+(exit 2) unless `--listen-any` is passed. With `--json` the first line on stdout is
+the receipt, before anything is served:
+
+```json
+{"serve":{"name":"work","url":"http://127.0.0.1:54321/mcp","address":"127.0.0.1:54321",
+          "bearer_env":"SANDBOX_TOKEN","allow":[],"deny":["delete_*"]}}
+```
+
+Point a client at `serve.url` like any other HTTP target, with `--token-env` holding
+the same value as `--bearer-env`; a wrong or missing token is a 401 and nothing
+reaches the upstream server. `--allow` / `--deny` are globs (`*`, `?`) over tool
+names, deny first: a denied tool is absent from `tools/list` and a call to it is
+`-32602`; the allow and deny lists saved with the server apply here as well.
+`initialize` is answered by the proxy, so `serverInfo.name` is `mcpdial`
+rather than the upstream's name, and the capabilities are the upstream's minus the
+ones that need the server to speak first (`logging`, `listChanged`, `subscribe`).
+
+`--stdio` speaks the same protocol on stdin and stdout instead, which makes
+`stdio:mcpdial serve NAME --stdio` a target like any other. Nothing but protocol
+goes to stdout in that mode, so there is no receipt.
+
 ## Authentication
 
 - `ls --json` says `auth_required` when a server wants a token and none is saved.

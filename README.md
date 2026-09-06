@@ -142,6 +142,8 @@ mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
 mcpdial start NAME [--idle SECS] keep a stdio server running; later commands share its session
 mcpdial stop NAME                end it
+mcpdial serve NAME [--listen ADDR] [--bearer-env VAR] [--allow PAT]... [--deny PAT]...
+mcpdial serve NAME --stdio       the same, on this process's own stdin and stdout
 
 mcpdial login TARGET [--scope S] [--port N] [--client-id ID] [--client-metadata-url URL]
                      [--no-client-metadata] [--redirect-host H] [--no-browser]
@@ -326,6 +328,51 @@ a note on stderr, and dials as if it had never been there.
 `start` applies to saved stdio servers and to Unix (macOS, Linux). An HTTP server has
 no process to keep, and session reuse for it is a separate matter; on Windows `start`
 and `stop` say they are not supported yet, and everything else dials.
+### Lending a server to a sandbox, without lending its token
+
+`mcpdial serve` puts a saved server on loopback as a plain MCP endpoint. It dials the
+upstream with the credential you logged in with once, and hands the client the protocol
+and nothing else: the upstream `Authorization` and any saved headers are added on the
+proxy's side, and the client's own headers never travel upstream. So an agent in a
+sandbox can use a server it has no credential for, and still has none if it is
+compromised.
+
+```
+$ mcpdial login work                                          # once, in the browser
+$ export SANDBOX_TOKEN=$(openssl rand -hex 16)
+$ mcpdial serve work --listen 127.0.0.1:8321 --bearer-env SANDBOX_TOKEN --deny 'delete_*'
+serving work on http://127.0.0.1:8321/mcp
+clients must send Authorization: Bearer $SANDBOX_TOKEN
+^C to stop
+```
+
+and in the sandbox, which holds `SANDBOX_TOKEN` and nothing else:
+
+```
+$ mcpdial add work --http http://127.0.0.1:8321/mcp --token-env SANDBOX_TOKEN
+```
+
+`--listen` defaults to `127.0.0.1:0`, whose chosen port is printed (and is `serve.url`
+under `--json`); an address that is not loopback takes `--listen-any`, since anyone who
+can reach the port can use the server behind it. `--bearer-env VAR` makes clients present
+that value, and a wrong or missing one gets a 401 without the upstream being dialed at
+all. `--allow` and `--deny` take globs (`*`, `?`) matched against tool names: a denied
+tool is left out of `tools/list` and a call to it is refused with `-32602`. Deny beats
+allow, an empty allow list admits everything not denied, and the lists saved with the
+server (`add --deny`, `set --deny`) still hold on top of these.
+
+`mcpdial serve NAME --stdio` speaks the same MCP on its own stdin and stdout instead, so
+a host application can list it as a stdio server and reach a remote server it could not
+otherwise authenticate to:
+
+```json
+{"mcpServers": {"work": {"command": "mcpdial", "args": ["serve", "work", "--stdio"]}}}
+```
+
+The client's `initialize` is answered here, with mcpdial's identity over the upstream's
+capabilities minus the ones a proxy cannot relay, and each client session opens an
+upstream session of its own. Token refresh happens upstream, invisibly. `^C` ends every
+upstream session and exits 0.
 
 ### Importing from a host you already configured
 
