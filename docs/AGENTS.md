@@ -55,6 +55,30 @@ once and every command carries it.
    glob patterns (`mcpdial set NAME --json` shows them); `tools` and `ls` then
    list and count only the permitted tools, and `tools NAME --all` adds the hidden
    ones with `"denied": true`.
+
+   **Find it instead of reading every listing.** With ten saved servers, step 2
+   is `mcpdial grep PATTERN [TARGET] --json` and then `schema` on what it named.
+   One pattern runs over every saved server at once: tool names, titles,
+   descriptions and the names and descriptions of the parameters in their
+   schemas; resource URIs, templates, names, descriptions and mime types; prompt
+   names, descriptions and argument names; and the `instructions` the server sent
+   at startup, read a line at a time. The answer is
+   `{"matches": [...], "skipped": [...]}`, each match carrying `server`, `kind`
+   (`tool`, `resource`, `template`, `prompt` or `instructions`), the `name` to
+   pass to the next command, a one-line `description` and the `matched` field the
+   pattern was found in, under the server's own word for it. `PATTERN` is a
+   substring; `-E` reads it as a regular expression and `-i` ignores case, and a
+   pattern `-E` cannot compile is exit 2 with nothing dialed. `--tools`,
+   `--resources`, `--prompts` and `--instructions` each narrow the search to that
+   kind and combine, and only the listings they ask for are fetched. `-m N`
+   reports at most N matches, in server order. Exit 1 means nothing matched, so
+   `grep` composes with `&&`. A server that could not be dialed - down, or wanting
+   a token nobody saved - is one entry under `skipped` carrying the same `status`
+   object `ls` reports for it, and every other server is searched anyway; each
+   dial is bounded by the ten seconds a status probe waits rather than the
+   `--timeout` a call gets. Naming one TARGET searches that server alone, and one
+   that will not answer is then this command's own error rather than a `skipped`
+   entry, as it is for `tools TARGET`.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json`, or
    `mcpdial call TARGET TOOL key=value ... --json`, prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text

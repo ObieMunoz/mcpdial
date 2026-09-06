@@ -1,0 +1,37 @@
+$ mcpdial --json grep numbers
+exit 0
+--- stdout
+{
+  "matches": [
+    {
+      "server": "cat",
+      "kind": "tool",
+      "name": "add",
+      "description": "Add two numbers.",
+      "matched": "description"
+    },
+    {
+      "server": "imported",
+      "kind": "tool",
+      "name": "add",
+      "description": "Add two numbers.",
+      "matched": "description"
+    },
+    {
+      "server": "slow",
+      "kind": "tool",
+      "name": "add",
+      "description": "Add two numbers.",
+      "matched": "description"
+    },
+    {
+      "server": "web",
+      "kind": "tool",
+      "name": "add",
+      "description": "Add two numbers.",
+      "matched": "description"
+    }
+  ],
+  "skipped": []
+}
+--- stderr

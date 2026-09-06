@@ -554,13 +554,7 @@ pub fn probe(store: &Store, r: &Resolved, opts: &Options, with_tools: bool) -> P
         server: None,
         tools: None,
     };
-    let had_credential = r.config.token_env.is_some()
-        || opts.token_env.is_some()
-        || store
-            .credential(&r.name)
-            .ok()
-            .flatten()
-            .is_some_and(|c| c.has_token());
+    let had_credential = had_credential(store, r, opts);
 
     match connect(store, r, opts) {
         Ok(mut conn) => {
@@ -584,6 +578,26 @@ pub fn probe(store: &Store, r: &Resolved, opts: &Options, with_tools: bool) -> P
         Err(e) => p.status = classify(&e, had_credential),
     }
     p
+}
+
+/// How a dial of `r` that went wrong reads as a status, the same reading `ls`
+/// gives it. Anything that visits every saved server at once needs it: one
+/// server that is down, or wants a token nobody saved, is a row of its own to
+/// report rather than the end of the whole errand.
+pub fn status_of(store: &Store, r: &Resolved, opts: &Options, e: &Error) -> Status {
+    classify(e, had_credential(store, r, opts))
+}
+
+/// Whether anything was offered to the server as proof of identity, which is
+/// what tells a refusal that wants a token from one that rejected ours.
+fn had_credential(store: &Store, r: &Resolved, opts: &Options) -> bool {
+    r.config.token_env.is_some()
+        || opts.token_env.is_some()
+        || store
+            .credential(&r.name)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.has_token())
 }
 
 fn classify(e: &Error, had_credential: bool) -> Status {

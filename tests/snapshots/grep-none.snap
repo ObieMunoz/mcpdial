@@ -1,0 +1,5 @@
+$ mcpdial grep nothing-here web
+exit 1
+--- stdout
+--- stderr
+no match for "nothing-here" in 1 server(s)

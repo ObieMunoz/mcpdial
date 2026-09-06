@@ -134,6 +134,8 @@ mcpdial ls [--no-probe]          every saved server, with live status and tool c
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
 mcpdial tools TARGET --snapshot FILE     write the tools in full, to commit beside a script
 mcpdial tools TARGET --check FILE [--strict]   how they differ from that file; exit 3 on drift
+mcpdial grep PATTERN [TARGET] [--tools] [--resources] [--prompts] [--instructions]
+                     [-i] [-E] [-m N]    find one across every saved server at once
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
 mcpdial call TARGET TOOL ... --check FILE [--strict]   refuse to call a tool that drifted
@@ -382,6 +384,53 @@ every object's keys sorted, so a diff is only what changed. `mcpdial call TARGET
 ARGS --check tools.json` runs the same comparison for that one tool and refuses to send
 anything when it fails. A snapshot is never written over: a path that exists, or is a
 directory, is exit 2 before the server is dialed.
+### Finding one across every server
+
+Ten saved servers is ten `tools` listings to read before the one that "creates a
+calendar event" turns up. `mcpdial grep` dials them all at once and runs a pattern
+over everything they offer:
+
+```
+$ mcpdial grep wiki
+wiki
+  tool      read_wiki_structure       Get a list of documentation topics for a repository
+  tool      ask_question              Ask any question about a GitHub repository
+notes
+  resource  file:///wiki/index.md     The wiki index
+```
+
+Tools match on name, title, description and the names and descriptions of the
+parameters in their `inputSchema`; resources on URI, name, description and mime type,
+and templates on their `uriTemplate`; prompts on name, description and argument names;
+and the server's own `instructions` are read a line at a time, the way grep reads a
+file, so the line the pattern is on is the line reported. `--tools`, `--resources`,
+`--prompts` and `--instructions` narrow the search to those kinds and combine, and only
+the listings they ask for are fetched — a server that never advertised `resources` is
+never asked for them.
+
+`PATTERN` is a substring by default. `-E` reads it as a regular expression, `-i`
+ignores case, and `-m N` reports at most N matches. Exit 1 means nothing matched, so
+`grep` composes: `mcpdial grep calendar --json && ...`. A pattern `-E` cannot compile is
+exit 2, before anything is dialed.
+
+Under `--json` the answer is `{"matches": [...], "skipped": [...]}`, each match carrying
+`server`, `kind`, the `name` the next command needs, a one-line `description`, and the
+`matched` field the pattern was found in under the server's own word for it
+(`description`, `parameter`, `uriTemplate`, `argument`, …), so `grep` and then
+`schema TARGET TOOL` is two requests instead of a listing per server.
+
+Dialing several servers is several ways to be let down, and none of them ends the
+search. A server that is down, or wants a token nobody saved, is one entry under
+`skipped` carrying the same `status` object `ls` reports for it, one line on stderr
+without `--json`, and every other server is searched anyway. Each dial is bounded by the
+ten seconds a status probe waits rather than the minute a call gets, so one hung server
+costs ten seconds and not the whole search; `--timeout` and a server's own saved timeout
+still win. Naming one TARGET searches that server alone, and one that will not answer is
+then the command's own error, as it is for `tools TARGET`.
+
+`-E` is the one feature here with a dependency behind it: `regex-lite`, which is pure
+Rust, pulls in nothing itself, and costs the static binary far less than the full
+`regex` engine's Unicode tables. Substring matching, which is the default, needs nothing.
 
 ### Allowing and denying tools
 
@@ -965,7 +1014,9 @@ what it does have: the `tools/list` behind it succeeded and nothing was sent for
 tool. `tools TARGET --json` returns `{"tools": [...]}`, each tool a `name` and the first
 line of its `description` until `--long` asks for the schemas, and `tools --json` with
 no target returns `{"servers": [...]}`, one probe per saved server, each listing its
-tools the same way. Every `ls --json` row
+tools the same way. `grep PATTERN --json` searches every saved server at once and
+returns `{"matches": [...], "skipped": [...]}`, which is how to find a tool without
+reading a listing per server; exit 1 means nothing matched. Every `ls --json` row
 carries what was saved — `location`, `headers`, `token_env`, `credential`, `source`,
 `timeout`, `allow`, `deny` — whether or not the servers were dialed; `--no-probe`
 leaves the status fields out rather than putting different ones in their place.

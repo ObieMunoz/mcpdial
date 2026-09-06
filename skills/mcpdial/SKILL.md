@@ -14,6 +14,7 @@ Run `mcpdial guide` for the full agent reference. The short version:
 ```bash
 mcpdial ls --json                       # saved servers with live status and tool counts
 mcpdial tools TARGET --json             # every tool's name and one-line description
+mcpdial grep PATTERN --json             # find one across every saved server at once
 mcpdial schema TARGET TOOL              # one tool's schema, in full
 mcpdial call TARGET TOOL '{"k":"v"}' --json
 mcpdial call TARGET TOOL @args.json --json      # large arguments from a file
@@ -34,6 +35,11 @@ Rules:
   `schema TARGET TOOL` for its `inputSchema`. `tools --long --json` returns every
   schema at once and is rarely worth the context. A rejected call answers with
   `error.hint`: the tool's usage line and its parameters.
+- With several servers saved, `grep PATTERN --json` beats a listing per server: it
+  searches tools, resources, prompts and instructions on all of them at once and
+  answers `{"matches":[...],"skipped":[...]}`, each match naming the `server`, `kind`
+  and `name` to pass to `schema` next. Exit 1 means nothing matched; a server that
+  could not be dialed is under `skipped` rather than an error.
 - Use `shell` for servers whose state matters across calls, such as a browser: each
   plain `call` is a fresh process. When every command must be its own invocation,
   `start NAME` keeps a saved stdio server running and later `call`s share it (Unix
