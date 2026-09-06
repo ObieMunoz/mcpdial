@@ -101,6 +101,14 @@ impl Watcher for Notices<'_> {
         self.lines || self.spinner
     }
 
+    /// Somebody else is about to write to stderr - `elicit` puts its question
+    /// and its prompts there, and it is a library module with no presenter to
+    /// go through. The updating line is finished first, the way `say` does it,
+    /// so the question is not appended to `working... 3/10`.
+    fn interrupted(&mut self) {
+        self.finish();
+    }
+
     fn notice(&mut self, notice: &Notice<'_>) {
         match &notice.body {
             Body::Progress { .. } if self.lines => {

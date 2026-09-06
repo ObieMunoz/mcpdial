@@ -16,6 +16,9 @@ pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST_LEGACY.as_str();
 pub const CLIENT_NAME: &str = "mcpdial";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The one request every MCP client answers itself, whatever it declared.
+pub const PING: &str = "ping";
+
 /// JSON-RPC's "method not found", the honest answer to a request we do not serve.
 pub const METHOD_NOT_FOUND: i64 = -32601;
 
@@ -519,7 +522,7 @@ pub type Responder = Box<dyn FnMut(&str, &Value) -> Option<Value>>;
 /// silence it can only time out.
 pub fn answer(id: &Value, method: &str) -> Value {
     match method {
-        "ping" => reply(id, json!({})),
+        PING => reply(id, json!({})),
         other => reply_error(
             id,
             METHOD_NOT_FOUND,
@@ -538,7 +541,7 @@ pub fn answer_with(
     responder: Option<&mut Responder>,
 ) -> Value {
     match responder {
-        Some(serve) if method != "ping" => match serve(method, params) {
+        Some(serve) if method != PING => match serve(method, params) {
             Some(result) => reply(id, result),
             None => answer(id, method),
         },
