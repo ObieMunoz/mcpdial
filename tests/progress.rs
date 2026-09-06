@@ -401,3 +401,44 @@ fn a_question_from_the_server_starts_on_a_line_of_its_own() {
         .find(|l| l.contains("working...") && l.contains("server asked:"));
     assert_eq!(shared, None, "the question shares the line:\n{shown}");
 }
+
+/// A report shorter than the one under it takes the rest of the line with it.
+///
+/// The example server's messages shrink a word at a time and then stop coming
+/// altogether, the way a server moving off a status message onto a bare count
+/// does. `under_pty` keeps the escape sequences and drops the `\r` every redraw
+/// starts with, so a redraw running straight into the next one in what it
+/// returns is exactly the screen the bug leaves behind: the tail of the long
+/// message still standing after the short one drawn over it.
+#[test]
+fn a_report_shorter_than_the_one_under_it_leaves_no_tail_behind() {
+    if !cfg!(unix) || !cfg!(feature = "rich") {
+        eprintln!("skipped: needs `script` and the rich presenter");
+        return;
+    }
+    // The first report's message, and what every redraw of the line starts with.
+    const LONGEST: &str = "fetching the remote index";
+    const REDRAW: &str = "working...";
+
+    let home = temp_home("progress-shrink");
+    let target = echo_target();
+    let shown = String::from_utf8_lossy(&common::under_pty(
+        &home,
+        &["call", &target, "echo", r#"{"message":"hi"}"#],
+        &[
+            ("ECHO_SERVER_PROGRESS", "5"),
+            ("ECHO_SERVER_PROGRESS_SHRINK", "1"),
+        ],
+    ))
+    .into_owned();
+
+    assert!(
+        shown.contains(LONGEST),
+        "the longest message got as far as the screen: {shown:?}"
+    );
+    assert!(
+        !shown.contains(&format!("{LONGEST}{REDRAW}")),
+        "the redraw over it left its tail on the line: {shown:?}"
+    );
+    assert!(shown.contains("Echo: hi"), "{shown:?}");
+}

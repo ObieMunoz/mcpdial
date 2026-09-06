@@ -18,6 +18,11 @@
 //! carried none, and a log message at each end of the severity scale. That is
 //! what a crawler or a build does, and it is behind a flag because a server
 //! that talks during every call would change what every other test reads.
+//! Set `ECHO_SERVER_PROGRESS_SHRINK=1` to make those reports carry a message
+//! that gets shorter each time instead of longer, and none at all once it has
+//! run out, the way a server moving off a status message onto a bare count
+//! does. Behind its own flag so that the `step N` every other test reads stays
+//! where it is.
 //! Set `ECHO_SERVER_EXIT_ON_CALL=N` to make it exit with status 9 on its Nth
 //! `tools/call`, before replying, the way a server that crashes mid-call does.
 //! The `count` tool returns how many times it has been called in this process,
@@ -94,6 +99,7 @@ fn main() {
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
+    let shrinking_reports = std::env::var_os("ECHO_SERVER_PROGRESS_SHRINK").is_some();
     let mut count = 0u32;
     let mut calls = 0u32;
     let stdout = io::stdout();
@@ -132,7 +138,12 @@ fn main() {
         }
 
         if reports > 0 && method == "tools/call" {
-            report(&mut out, reports, &params["_meta"]["progressToken"]);
+            report(
+                &mut out,
+                reports,
+                &params["_meta"]["progressToken"],
+                shrinking_reports,
+            );
         }
 
         // Interrupt the call the client is waiting on. A wrong answer is reported
@@ -313,7 +324,10 @@ fn main() {
 /// One report always goes out under a token nobody asked for, and a request
 /// that sent no `progressToken` gets all of them that way: real servers do
 /// both, and a client has to drop them rather than report them.
-fn report(out: &mut impl Write, times: u32, token: &Value) {
+///
+/// `shrinking` swaps the growing `step N` for a message that gets shorter, for
+/// a client that draws the reports over one line.
+fn report(out: &mut impl Write, times: u32, token: &Value, shrinking: bool) {
     let token = match token.is_null() {
         true => json!("nobody-asked-for-this"),
         false => token.clone(),
@@ -329,11 +343,20 @@ fn report(out: &mut impl Write, times: u32, token: &Value) {
                 "params": {"progressToken": "stale", "progress": 9, "message": "not yours"}}),
     );
     for done in 1..=times {
+        let mut params = json!({"progressToken": token, "progress": done, "total": times});
+        let message = match shrinking {
+            true => shrinking_message(done),
+            false => Some(format!("step {done}")),
+        };
+        // Once it has run out the key is left out rather than sent as null: a
+        // report carrying no message is what the spec allows, and the shortest
+        // line a client redrawing them has to draw over a longer one.
+        if let Some(message) = message {
+            params["message"] = json!(message);
+        }
         tell(
             out,
-            &json!({"jsonrpc": "2.0", "method": "notifications/progress",
-                    "params": {"progressToken": token, "progress": done, "total": times,
-                               "message": format!("step {done}")}}),
+            &json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": params}),
         );
     }
     tell(
@@ -341,6 +364,14 @@ fn report(out: &mut impl Write, times: u32, token: &Value) {
         &json!({"jsonrpc": "2.0", "method": "notifications/message",
                 "params": {"level": "warning", "logger": "echo", "data": "nearly there"}}),
     );
+}
+
+/// What the `done`th report says under `ECHO_SERVER_PROGRESS_SHRINK`: a word
+/// less of the same phrase every time, and nothing once it has run out.
+fn shrinking_message(done: u32) -> Option<String> {
+    const PHRASE: [&str; 4] = ["fetching", "the", "remote", "index"];
+    let kept = PHRASE.len().saturating_sub(done.saturating_sub(1) as usize);
+    (kept > 0).then(|| PHRASE[..kept].join(" "))
 }
 
 /// Write one message and make sure it is on its way.
