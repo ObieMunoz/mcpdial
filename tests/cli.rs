@@ -93,6 +93,72 @@ fn stateless_http_and_json_output() {
 }
 
 #[test]
+fn a_json_listing_is_names_and_one_line_until_long_asks_for_the_rest() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("json-listing");
+
+    let o = run(mcpdial(&home).args(["--json", "tools", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(
+        v["tools"],
+        json!([
+            {"name": "echo", "description": "Echo a message back."},
+            {"name": "add", "description": "Add two numbers."},
+        ]),
+        "no inputSchema, no outputSchema, no annotations: {}",
+        o.stdout
+    );
+
+    let o = run(mcpdial(&home).args(["--json", "tools", &s.url, "--long"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(
+        v["tools"][0]["description"],
+        "Echo a message back.\nSecond line."
+    );
+    assert_eq!(v["tools"][0]["inputSchema"]["required"][0], "message");
+    assert_eq!(v["tools"][1]["outputSchema"]["required"][0], "sum");
+
+    // The one tool an agent settles on comes back whole with no flag at all.
+    let o = run(mcpdial(&home).args(["--json", "schema", &s.url, "add"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["inputSchema"]["required"], json!(["a", "b"]));
+
+    let o = run(mcpdial(&home).args(["--json", "prompts", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["prompts"][0]["name"], "summarize");
+    assert!(v["prompts"][0].get("arguments").is_none(), "{}", o.stdout);
+    let o = run(mcpdial(&home).args(["--json", "prompts", &s.url, "--long"]));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["prompts"][0]["arguments"][0]["name"], "text");
+
+    let o = run(mcpdial(&home).args(["--json", "resources", &s.url]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["resources"][0]["uri"], "file:///readme.md");
+    assert_eq!(v["resources"][0]["description"], "The project readme.");
+    assert!(v["resources"][0].get("mimeType").is_none(), "{}", o.stdout);
+    assert_eq!(
+        v["resourceTemplates"][0]["uriTemplate"],
+        "file:///notes/{name}.md"
+    );
+    let o = run(mcpdial(&home).args(["--json", "resources", &s.url, "--long"]));
+    let v: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(v["resources"][0]["mimeType"], "text/markdown");
+
+    let o = run(mcpdial(&home).args(["guide"]));
+    assert!(
+        o.stdout
+            .contains("Two steps: list, then fetch the one you will call."),
+        "the guide spells out the two-step: {}",
+        o.stdout
+    );
+}
+
+#[test]
 fn tool_lists_are_merged_across_pages() {
     let s = start(Mode::Stateless);
     let home = temp_home("paged");
@@ -2117,7 +2183,7 @@ fn prompts_are_listed_paginated_and_expanded() {
         o.stdout
     );
 
-    let o = run(mcpdial(&home).args(["--json", "prompts", &s.url]));
+    let o = run(mcpdial(&home).args(["--json", "prompts", &s.url, "--long"]));
     let v: Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(v["prompts"].as_array().unwrap().len(), 2);
     assert_eq!(v["prompts"][0]["arguments"][0]["name"], "text");

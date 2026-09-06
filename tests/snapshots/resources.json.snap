@@ -5,21 +5,18 @@ exit 0
   "resourceTemplates": [
     {
       "description": "One note, by name.",
-      "mimeType": "text/markdown",
       "name": "note",
       "uriTemplate": "file:///notes/{name}.md"
     }
   ],
   "resources": [
     {
-      "description": "The project readme.\nSecond line.",
-      "mimeType": "text/markdown",
+      "description": "The project readme.",
       "name": "readme",
       "uri": "file:///readme.md"
     },
     {
       "description": "A tiny picture.",
-      "mimeType": "image/png",
       "name": "logo",
       "uri": "file:///logo.png"
     }

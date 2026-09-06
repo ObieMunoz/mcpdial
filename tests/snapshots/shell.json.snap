@@ -1,14 +1,14 @@
 $ mcpdial --json shell web
 exit 1
 --- stdout
-{"tools":[{"description":"Echo a message back.\nSecond line.","inputSchema":{"properties":{"message":{"description":"What to echo","type":"string"}},"required":["message"],"type":"object"},"name":"echo"},{"annotations":{"idempotentHint":true},"description":"Add two numbers.","inputSchema":{"properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"],"type":"object"},"name":"add","outputSchema":{"properties":{"sum":{"type":"number"}},"required":["sum"],"type":"object"}}]}
+{"tools":[{"description":"Echo a message back.","name":"echo"},{"description":"Add two numbers.","name":"add"}]}
 {"content":[{"text":"The sum of 1 and 2 is 3.","type":"text"}],"structuredContent":{"sum":3.0}}
 {"content":[{"text":"The sum of 5 and 6 is 11.","type":"text"}],"structuredContent":{"sum":11.0}}
 {"error":{"hint":"commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, resources, read URI, prompts, prompt NAME, raw METHOD, info, help, quit","kind":"usage","message":"unknown command \"nope\""}}
 {"error":{"code":-32602,"hint":"`tools` lists all 2 tools on this server.","kind":"rpc","message":"MCP error -32602: Tool nope not found"}}
 {"content":[{"text":"The sum of 0 and 0 is 0.","type":"text"}],"structuredContent":{"sum":0.0}}
-{"resourceTemplates":[{"description":"One note, by name.","mimeType":"text/markdown","name":"note","uriTemplate":"file:///notes/{name}.md"}],"resources":[{"description":"The project readme.\nSecond line.","mimeType":"text/markdown","name":"readme","uri":"file:///readme.md"},{"description":"A tiny picture.","mimeType":"image/png","name":"logo","uri":"file:///logo.png"}]}
-{"prompts":[{"arguments":[{"description":"What to summarize","name":"text","required":true},{"description":"terse or thorough","name":"style"}],"description":"Summarize a document.","name":"summarize"},{"description":"Greet someone.","name":"greet"}]}
+{"resourceTemplates":[{"description":"One note, by name.","name":"note","uriTemplate":"file:///notes/{name}.md"}],"resources":[{"description":"The project readme.","name":"readme","uri":"file:///readme.md"},{"description":"A tiny picture.","name":"logo","uri":"file:///logo.png"}]}
+{"prompts":[{"description":"Summarize a document.","name":"summarize"},{"description":"Greet someone.","name":"greet"}]}
 {"messages":[{"content":{"text":"Hello.","type":"text"},"role":"user"}]}
 {"contents":[{"mimeType":"text/markdown","text":"# fake-mcp\nA readme.\n","uri":"file:///readme.md"}]}
 {"capabilities":{"prompts":{},"resources":{},"tools":{}},"protocolVersion":"2025-06-18","serverInfo":{"name":"fake-mcp","version":"1.0"}}

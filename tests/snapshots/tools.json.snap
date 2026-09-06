@@ -4,53 +4,12 @@ exit 0
 {
   "tools": [
     {
-      "description": "Echo a message back.\nSecond line.",
-      "inputSchema": {
-        "properties": {
-          "message": {
-            "description": "What to echo",
-            "type": "string"
-          }
-        },
-        "required": [
-          "message"
-        ],
-        "type": "object"
-      },
+      "description": "Echo a message back.",
       "name": "echo"
     },
     {
-      "annotations": {
-        "idempotentHint": true
-      },
       "description": "Add two numbers.",
-      "inputSchema": {
-        "properties": {
-          "a": {
-            "type": "number"
-          },
-          "b": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "a",
-          "b"
-        ],
-        "type": "object"
-      },
-      "name": "add",
-      "outputSchema": {
-        "properties": {
-          "sum": {
-            "type": "number"
-          }
-        },
-        "required": [
-          "sum"
-        ],
-        "type": "object"
-      }
+      "name": "add"
     }
   ]
 }

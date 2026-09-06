@@ -34,15 +34,21 @@ once and every command carries it.
    `auth`, `server` (name and version), `tools` (count), `checked_at` and
    `age_seconds`. `--no-probe` leaves those last ones out rather than putting other
    keys in their place, so a row means the same thing whichever flag produced it.
-2. **What a server can do.** `mcpdial tools TARGET --json` returns `{"tools": [...]}`
-   with each tool's `name`, `description`, and full `inputSchema`; with no target it
-   returns `{"servers": [...]}`, one probe per saved server, each carrying its own
-   `tools`. For one tool, `mcpdial schema TARGET TOOL` returns just that object, and a
-   name the server does not have is a usage error (exit 2) listing what it does have,
-   since the `tools/list` behind it succeeded and nothing was sent for that tool. A
-   saved server may carry `allow` and `deny` lists of glob patterns (`mcpdial set NAME
-   --json` shows them); `tools` and `ls` then list and count only the permitted tools,
-   and `tools NAME --all` adds the hidden ones with `"denied": true`.
+2. **What a server can do.** Two steps: list, then fetch the one you will call.
+   `mcpdial tools TARGET --json` returns `{"tools": [...]}`, each tool its `name`
+   and the first line of its `description` and nothing else: enough to choose
+   with, small enough to read; with no target it returns `{"servers": [...]}`, one
+   probe per saved server, each carrying its own `tools` listed that same way.
+   `mcpdial schema TARGET TOOL` then returns that one tool as the server wrote it,
+   `inputSchema` and all, and a name the server does not have is a usage error
+   (exit 2) listing what it does have, since the `tools/list` behind it succeeded
+   and nothing was sent for that tool. Take those two in that order rather than
+   `mcpdial tools TARGET --long --json`, which is every tool in full and tens of
+   kilobytes on a large server. `prompts` and `resources` list the same way: a
+   name and one line each, the server's own objects under `--long`. A saved server
+   may carry `allow` and `deny` lists of glob patterns (`mcpdial set NAME --json`
+   shows them); `tools` and `ls` then list and count only the permitted tools, and
+   `tools NAME --all` adds the hidden ones with `"denied": true`.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json`, or
    `mcpdial call TARGET TOOL key=value ... --json`, prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text
@@ -151,6 +157,10 @@ mcpdial prompts TARGET --json     {"prompts":[...]}
 mcpdial prompt TARGET NAME '{"json":"args"}' --json   the prompts/get result
 ```
 
+Both listings are short, as `tools` is: a `uri` or `uriTemplate`, a `name`, and the
+first line of the `description`. `--long` beside `--json` gives the server's entries
+whole, `mimeType` and a prompt's `arguments` included.
+
 A `resourceTemplates` entry carries a `uriTemplate` (RFC 6570) instead of a `uri`; expand
 it yourself before calling `read`. A `resources/read` result holds `contents`, each entry
 carrying either `text` or a base64 `blob`. Without `--json`, `read` writes text to stdout
@@ -159,7 +169,7 @@ terminal: redirect it (`mcpdial read TARGET URI > file`). `prompt` without `--js
 one `role: text` line per message and puts the prompt's description on stderr.
 
 A prompt's `arguments` are names and descriptions with no schema behind them: every value
-is a string. `mcpdial prompts TARGET --long` lists them.
+is a string. `mcpdial prompts TARGET --long` is where they are.
 
 A server that never implemented one of these answers `-32601`. That error carries a `hint`
 naming the missing capability, so a bare method-not-found never has to be decoded.
@@ -248,11 +258,11 @@ Input, one command per line:
 ```
 call TOOL {"json":"args"}     # args optional, default {}
 call TOOL key=value ...       # the same, typed by the tool's schema
-tools                         # list tools
+tools [--long]                # list tools
 schema TOOL                   # one tool's inputSchema
-resources                     # resources, then resource templates
+resources [--long]            # resources, then resource templates
 read URI                      # one resource's contents
-prompts                       # list prompts
+prompts [--long]              # list prompts
 prompt NAME {"json":"args"}   # expand a prompt into its messages
 raw METHOD {"json":"params"}  # any JSON-RPC method; allow and deny lists do not apply
 info                          # the initialize result
@@ -263,7 +273,8 @@ quit
 Lines starting with `#` are ignored. Output with `--json`: one line per command. `call`
 prints the result object; `tools` prints `{"tools":[...]}`; `schema` prints the tool
 object; `resources` prints `{"resources":[...],"resourceTemplates":[...]}`; `prompts`
-prints `{"prompts":[...]}`; `read`, `prompt` and `info` print their results untouched;
+prints `{"prompts":[...]}`, the three listings as short as their commands are and whole
+under `--long`; `read`, `prompt` and `info` print their results untouched;
 errors print `{"error":{...}}`. A usage hint under a failed `call` result goes to stderr
 as `{"hint":"..."}`, so stdout stays one line per command. The process exits 1 at the
 end if any command failed and stdin was not a terminal.
