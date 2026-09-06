@@ -213,19 +213,38 @@ pub fn grouped(entries: &[Entry]) -> Vec<(&'static str, Vec<&Entry>)> {
 /// The config an entry describes. `server` is the registry's own entry for a
 /// `registry` catalog entry, fetched by the caller so this stays pure.
 pub fn convert(entry: &Entry, server: Option<&Value>) -> Result<Resolved> {
-    if let Some(config) = &entry.config {
-        return Ok(Resolved {
+    convert_given(entry, server, &[])
+}
+
+/// [`convert`] with values for what the registry server leaves to the user, as
+/// [`registry::convert_given`] takes them. The saved config records the entry's
+/// id under `source.catalog`, so `browse` can tell it is installed.
+pub fn convert_given(
+    entry: &Entry,
+    server: Option<&Value>,
+    given: &[Option<String>],
+) -> Result<Resolved> {
+    let mut resolved = match &entry.config {
+        Some(config) => Resolved {
             config: config.clone(),
             ..Default::default()
-        });
-    }
-    let Some(server) = server else {
-        return Err(Error::config(format!(
-            "catalog entry {} names a registry server but none was looked up",
-            entry.id
-        )));
+        },
+        None => {
+            let Some(server) = server else {
+                return Err(Error::config(format!(
+                    "catalog entry {} names a registry server but none was looked up",
+                    entry.id
+                )));
+            };
+            registry::convert_given(server, &pick(entry.transport, server), given)?
+        }
     };
-    registry::convert(server, &pick(entry.transport, server), &[])
+    resolved
+        .config
+        .source
+        .get_or_insert_with(Default::default)
+        .catalog = Some(entry.id.clone());
+    Ok(resolved)
 }
 
 /// What to take from the registry entry so the saved server has the transport
@@ -244,18 +263,23 @@ fn pick(transport: Transport, server: &Value) -> Pick {
     }
 }
 
-/// [`convert`], looking the registry server up first when the entry names one.
-pub fn resolve(entry: &Entry, registry: &Registry) -> Result<Resolved> {
-    let server = match &entry.registry {
-        Some(name) => Some(registry.latest(name)?.ok_or_else(|| {
+/// The registry's server for an entry that names one, as [`convert`] takes it;
+/// `None` for an entry that carries its own config.
+pub fn lookup(entry: &Entry, registry: &Registry) -> Result<Option<Value>> {
+    match &entry.registry {
+        Some(name) => Ok(Some(registry.latest(name)?.ok_or_else(|| {
             Error::config(format!(
                 "the registry no longer lists {name}, which catalog entry {} points at",
                 entry.id
             ))
-        })?),
-        None => None,
-    };
-    convert(entry, server.as_ref())
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// [`convert`], looking the registry server up first when the entry names one.
+pub fn resolve(entry: &Entry, registry: &Registry) -> Result<Resolved> {
+    convert(entry, lookup(entry, registry)?.as_ref())
 }
 
 /// Where the catalog is read from.
@@ -458,6 +482,16 @@ mod tests {
             Some("https://mcp.supabase.com/mcp")
         );
         assert!(r.missing.is_empty());
+        let source = r.config.source.as_ref().unwrap();
+        assert_eq!(
+            (
+                source.catalog.as_deref(),
+                source.registry.as_deref(),
+                source.version.as_deref()
+            ),
+            (Some("supabase"), Some("com.supabase/mcp"), Some("0.12.0")),
+            "the catalog id joins the registry's provenance"
+        );
 
         e.transport = Transport::Stdio;
         let r = convert(&e, Some(&server)).unwrap();
@@ -500,7 +534,12 @@ mod tests {
         assert_eq!(first["auth"], "env");
 
         let r = convert(&e, None).unwrap();
-        assert_eq!(r.config, cfg);
+        let mut expected = cfg;
+        expected.source = Some(crate::config::Source {
+            catalog: Some("postgres".into()),
+            ..Default::default()
+        });
+        assert_eq!(r.config, expected, "as it is, plus where it came from");
         assert!(r.notes.is_empty() && r.missing.is_empty());
     }
 

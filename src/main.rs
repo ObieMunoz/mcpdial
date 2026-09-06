@@ -27,6 +27,7 @@ use std::time::Duration;
 
 mod args;
 mod brief;
+mod browse;
 mod env_defaults;
 mod notices;
 mod output;
@@ -264,6 +265,18 @@ enum Cmd {
         #[arg(long)]
         offline: bool,
     },
+    /// Tick catalog servers to save and dial; the ones already saved start ticked
+    Browse {
+        /// The whole MCP registry instead of the catalog (fzf filters it)
+        #[arg(long)]
+        all: bool,
+        /// Use the copies on disk without refreshing them
+        #[arg(long)]
+        offline: bool,
+        /// What fzf's preview pane shows for one entry
+        #[arg(long, value_name = "ID", hide = true)]
+        preview: Option<String>,
+    },
     /// Keep one session open and run commands from stdin (state persists between calls)
     Shell { target: String },
     /// Keep a stdio server running in the background; later commands share its session
@@ -447,7 +460,22 @@ enum TokenCmd {
 }
 
 fn main() -> ExitCode {
-    let mut cli = Cli::parse();
+    let mut cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // A bare `mcpdial` at a terminal with nothing saved yet opens the
+        // checklist; anything else gets clap's help, as ever.
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            let mut browse = Cli::parse_from(["mcpdial", "browse"]);
+            // MCPDIAL_JSON in the environment is a program asking, not a person.
+            let _ = env_defaults::apply(&mut browse);
+            if browse::first_run(&browse) {
+                browse
+            } else {
+                e.exit()
+            }
+        }
+        Err(e) => e.exit(),
+    };
     let defaults = env_defaults::apply(&mut cli);
     let ui = <dyn Presenter>::choose(&cli);
     let json = cli.json;
@@ -1559,6 +1587,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
     }
     let save_dir = cli.save_dir.as_deref();
     let out = Output::choose(&cli)?;
+    let plain = present::wants_plain(&cli);
 
     match cli.cmd {
         Cmd::Add {
@@ -1584,8 +1613,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let mut notes = Vec::new();
             let mut cfg = match (http, stdio, registry) {
                 (None, None, None) if catalog.is_some() => {
-                    let resolved =
-                        from_catalog(ui, &store, &opts, catalog.as_deref().unwrap_or(""))?;
+                    let id = catalog.as_deref().unwrap_or("");
+                    let resolved = from_catalog(ui, &store, &opts, id)?;
+                    let elsewhere = mcpdial::config::saved_from_catalog(&store.servers()?, id)
+                        .filter(|saved| *saved != name && !force)
+                        .map(String::from);
+                    if let Some(saved) = elsewhere {
+                        return Err(Error::usage(format!(
+                            "catalog entry {id} is already saved as {saved}; pass --force to save it again"
+                        ))
+                        .into());
+                    }
                     notes = resolved.notes;
                     resolved.config
                 }
@@ -2491,6 +2529,22 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             }
             Ok(0)
         }
+
+        Cmd::Browse {
+            all,
+            offline,
+            preview,
+        } => browse::run(
+            ui,
+            &store,
+            &opts,
+            browse::Flags {
+                all,
+                offline,
+                preview,
+                interactive: !plain && std::io::stdin().is_terminal(),
+            },
+        ),
 
         Cmd::Completions { shell } => {
             // Building the whole command tree to walk it recurses deeper than

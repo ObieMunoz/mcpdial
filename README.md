@@ -128,6 +128,7 @@ mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor,
 mcpdial export [NAME...] [--format mcpservers|vscode|codex] [--merge FILE]  the same servers in a host's shape, on stdout
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
+mcpdial browse [--all] [--offline]   tick catalog servers to save and dial; the saved ones start ticked
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
@@ -553,6 +554,28 @@ are converted exactly as `--registry` converts them, below, so a required enviro
 variable arrives as a `${VAR}` placeholder with a note; the rest carry their
 configuration in the catalog itself. `--json` prints the entries as objects, so a
 program gets a short, trustworthy list instead of guessing package names.
+
+`mcpdial browse` is the same list as a checklist, the way LazyVim's extras or Mason
+read: one line per entry with a box, the id, the name, the transport, what it asks for
+and the summary, grouped by category. Entries already saved start ticked, found by
+the source `add --catalog` and `add --registry` record. Tick what you want and press
+Enter: each new entry is converted as `add --catalog` converts it, anything the entry
+leaves to you (a directory to serve, a required `${VAR}`) is asked for at the prompt,
+and it is saved under its catalog id, or `id-2` when that name is taken. The new
+servers are then dialed together and their `ls` rows printed, with a `mcpdial login
+NAME` line under any that says `auth required`. Unticking a saved entry removes it,
+after one line asking to confirm. Esc leaves with nothing changed. A bare `mcpdial`
+at a terminal opens the checklist as long as nothing is saved yet.
+
+With [fzf](https://github.com/junegunn/fzf) on `PATH` the list is fzf's, `--multi`
+with a preview pane showing the entry, what it will ask for and the exact `add`
+command; the saved entries sit at the top and marking one removes it. Without fzf a
+small picker of mcpdial's own takes the screen: arrows move, Space ticks, `/` filters,
+Enter applies. `browse --all` swaps the catalog for the whole registry index `search`
+keeps, which fzf filters comfortably; the built-in picker stays with the catalog.
+Under a pipe, or with `--json` or `--plain`, `browse` prints the entries as objects,
+exactly what `catalog --json` prints (`--all` prints the registry's own objects), so a
+program never meets a picker.
 
 The list ships inside the binary and is refreshed from this repository's `main`
 branch at most once a day, cached under `MCPDIAL_HOME/catalog.json`. `--offline`, or

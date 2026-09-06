@@ -781,24 +781,39 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
 /// One saved server's row, dialed now and remembered, so that `add` can say
 /// what `ls` would without dialing every other server.
 pub fn listing_one(store: &Store, opts: &Options, name: &str) -> Result<Listing> {
-    let servers = store.servers()?;
-    let cfg = servers
-        .get(name)
-        .cloned()
-        .ok_or_else(|| Error::usage(format!("no server named {name:?}")))?;
-    let key = probe_keys(store, &servers)[name];
-    let now = now();
-    let probe = probe_each(
-        store,
-        vec![(name.to_string(), cfg)],
-        &opts.for_status(),
-        true,
+    Ok(
+        listing_named(store, opts, std::slice::from_ref(&name.to_string()))?
+            .pop()
+            .expect("one row per name"),
     )
-    .pop()
-    .expect("one probe per server");
-    let row = Listing::probed(probe, now);
-    let _ = store.save_probes(BTreeMap::from([(name.to_string(), row.record(key))]));
-    Ok(row)
+}
+
+/// The rows for some saved servers, dialed together now and remembered, in the
+/// order named: what `browse` shows for what it just saved.
+pub fn listing_named(store: &Store, opts: &Options, names: &[String]) -> Result<Vec<Listing>> {
+    let servers = store.servers()?;
+    let keys = probe_keys(store, &servers);
+    let now = now();
+    let chosen = names
+        .iter()
+        .map(|name| {
+            servers
+                .get(name)
+                .cloned()
+                .map(|cfg| (name.clone(), cfg))
+                .ok_or_else(|| Error::usage(format!("no server named {name:?}")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let rows: Vec<Listing> = probe_each(store, chosen, &opts.for_status(), true)
+        .into_iter()
+        .map(|p| Listing::probed(p, now))
+        .collect();
+    let _ = store.save_probes(
+        rows.iter()
+            .map(|row| (row.name.clone(), row.record(keys[&row.name])))
+            .collect(),
+    );
+    Ok(rows)
 }
 
 /// Human-readable parameter summary from a tool's JSON schema.

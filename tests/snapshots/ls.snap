@@ -1,10 +1,10 @@
 $ mcpdial ls --no-probe
 exit 0
 --- stdout
-NAME  TYPE   AUTH  TIMEOUT  LOCATION
-cat   http   -     -        http://127.0.0.1:PORT/mcp
-echo  stdio  -     -        ECHO_SERVER
-fs    stdio  -     -        ECHO_SERVER
-slow  http   -     5s       http://127.0.0.1:PORT/mcp
-web   http   -     -        http://127.0.0.1:PORT/mcp
+NAME  TYPE   AUTH  SOURCE  TIMEOUT  LOCATION
+cat   http   -     fake    -        http://127.0.0.1:PORT/mcp
+echo  stdio  -     -       -        ECHO_SERVER
+fs    stdio  -     -       -        ECHO_SERVER
+slow  http   -     -       5s       http://127.0.0.1:PORT/mcp
+web   http   -     -       -        http://127.0.0.1:PORT/mcp
 --- stderr

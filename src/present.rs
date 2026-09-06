@@ -240,7 +240,7 @@ impl dyn Presenter + '_ {
     }
 }
 
-fn wants_plain(cli: &Cli) -> bool {
+pub(crate) fn wants_plain(cli: &Cli) -> bool {
     use std::io::IsTerminal;
     let by_env = std::env::var(ENV_PLAIN).is_ok_and(|v| !v.is_empty() && v != "0");
     let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
