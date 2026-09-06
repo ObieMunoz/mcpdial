@@ -87,7 +87,7 @@ A readme.
 }
 --- stderr
 error: unknown command "nope"
-commands: tools, schema TOOL, call TOOL {"arg": "value"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {"x": 1}, info, help, quit
+commands: tools, schema TOOL, call TOOL {"arg": "value"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {"x": 1}, info, help, quit (or exit)
 error: MCP error -32602: Tool nope not found
 `tools` lists all 2 tools on this server.
 error: MCP error -32602: Prompt nope not found
@@ -107,7 +107,7 @@ commands (one per line; # starts a comment):
   raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
   elicit {"arg": "value"}    answers for whatever the server elicits from here on
   info                       the initialize result
-  quit                       close the session
+  quit (or exit)             close the session
 
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.

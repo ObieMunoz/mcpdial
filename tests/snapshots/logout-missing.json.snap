@@ -1,0 +1,5 @@
+$ mcpdial --json logout nobody
+exit 2
+--- stdout
+--- stderr
+{"error":{"kind":"usage","message":"no server named \"nobody\" and no credential saved for it"}}

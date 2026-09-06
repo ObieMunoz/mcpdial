@@ -667,6 +667,12 @@ pub struct Listing {
     pub location: String,
     pub status: Status,
     pub auth: AuthUsed,
+    /// The variable a token was read from, when the row's `auth` is
+    /// [`AuthUsed::Env`]. Never serialized: an `ls --json` row already carries
+    /// `token_env` from what was saved, and this only names the variable in
+    /// the AUTH column that `--no-probe` already names it in.
+    #[serde(skip)]
+    pub token_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -679,13 +685,14 @@ pub struct Listing {
 }
 
 impl Listing {
-    fn probed(p: Probe, checked_at: u64) -> Self {
+    fn probed(p: Probe, token_env: Option<String>, checked_at: u64) -> Self {
         Self {
             name: p.name,
             kind: p.kind,
             location: p.location,
             status: p.status,
             auth: p.auth,
+            token_env,
             server: p.server,
             tools: p.tools.as_ref().map(Vec::len),
             checked_at,
@@ -703,6 +710,7 @@ impl Listing {
             location: cfg.location().to_string(),
             status: serde_json::from_value(rec.status.clone()).ok()?,
             auth: serde_json::from_value(rec.auth.clone()).ok()?,
+            token_env: cfg.token_env.clone(),
             server: rec.server.clone(),
             tools: rec.tools,
             checked_at: rec.checked_at,
@@ -721,6 +729,10 @@ impl Listing {
             tools: self.tools,
         }
     }
+}
+
+fn token_env_of(servers: &BTreeMap<String, ServerConfig>, name: &str) -> Option<String> {
+    servers.get(name).and_then(|cfg| cfg.token_env.clone())
 }
 
 /// What each server's status is a status *of*. Edit the server, or save or drop
@@ -775,7 +787,10 @@ pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Ve
 
     let fresh: Vec<Listing> = probe_each(store, cold, &opts.for_status(), true)
         .into_iter()
-        .map(|p| Listing::probed(p, now))
+        .map(|p| {
+            let token_env = token_env_of(&servers, &p.name);
+            Listing::probed(p, token_env, now)
+        })
         .collect();
     if !fresh.is_empty() {
         // A cache that cannot be written is a slow `ls`, not a failed one.
@@ -821,7 +836,10 @@ pub fn listing_named(store: &Store, opts: &Options, names: &[String]) -> Result<
         .collect::<Result<Vec<_>>>()?;
     let rows: Vec<Listing> = probe_each(store, chosen, &opts.for_status(), true)
         .into_iter()
-        .map(|p| Listing::probed(p, now))
+        .map(|p| {
+            let token_env = token_env_of(&servers, &p.name);
+            Listing::probed(p, token_env, now)
+        })
         .collect();
     let _ = store.save_probes(
         rows.iter()
@@ -1219,6 +1237,7 @@ mod tests {
                 server: Some("fake 1.0".into()),
                 tools: Some(vec![json!({"name": "echo"})]),
             },
+            None,
             100,
         );
 

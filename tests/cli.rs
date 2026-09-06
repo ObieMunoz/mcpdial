@@ -502,6 +502,17 @@ fn saved_servers_and_status_listing() {
     assert_eq!(by_name("envtok")["status"]["state"], "connected");
     assert_eq!(by_name("envtok")["auth"], "env");
 
+    // The AUTH column names the variable a token is read from, in a row that
+    // was dialed as much as in one that was only remembered, so that a dialed
+    // `ls` and `ls --no-probe` say the same thing about the same server.
+    for flags in [
+        &["--timeout", "3", "ls"][..],
+        &["--timeout", "3", "ls", "--refresh"][..],
+    ] {
+        let o = run(mcpdial(&home).env("FAKE_TOKEN", "secret").args(flags));
+        assert!(o.stdout.contains("$FAKE_TOKEN"), "{flags:?}: {}", o.stdout);
+    }
+
     // A different $FAKE_TOKEN is not something the saved status can know about.
     let o =
         run(mcpdial(&home)
@@ -960,6 +971,65 @@ fn manual_token_from_stdin_or_env() {
     assert_eq!(
         run(mcpdial(&home).args(["call", "work", "echo", "{}"])).code,
         1
+    );
+
+    // Removing a credential a saved server no longer has stays the idempotent
+    // success it looks like, for a URL as much as for a name.
+    assert_eq!(run(mcpdial(&home).args(["logout", "work"])).code, 0);
+    assert_eq!(run(mcpdial(&home).args(["logout", &s.url])).code, 0);
+
+    // A name that stands for no server is the typo `rm` refuses, not a logout.
+    let o = run(mcpdial(&home).args(["logout", "nothere"]));
+    assert_eq!(o.code, 2, "{}", o.stderr);
+    assert!(
+        o.stderr.contains("no server named \"nothere\""),
+        "{}",
+        o.stderr
+    );
+    let o = run(mcpdial(&home).args(["--json", "token", "rm", "nothere"]));
+    assert_eq!(o.code, 2, "{}", o.stderr);
+    assert!(o.stdout.is_empty(), "{}", o.stdout);
+    let err: Value = serde_json::from_str(o.stderr.trim()).unwrap();
+    assert_eq!(err["error"]["kind"], "usage");
+}
+
+/// `exit` has always ended the shell; the help the shell prints has to say so,
+/// since a reader who only ever sees `quit` cannot know the other word works.
+#[test]
+fn exit_ends_the_shell_and_the_help_says_both_words() {
+    let home = temp_home("shell-exit");
+    let target = format!("stdio:{}", echo_command());
+
+    let (stdout, stderr, code) = shell(&home, &target, false, "call count\nexit\ncall count\n");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stdout.contains("count=1\n"), "{stdout}");
+    assert!(!stdout.contains("count=2"), "exit stops reading: {stdout}");
+
+    let (_, help, _) = shell(&home, &target, false, "help\n");
+    assert!(help.contains("quit (or exit)"), "{help}");
+}
+
+/// `--force` writes over a saved name, and the receipt says what it wrote over
+/// so an accident is visible rather than silent.
+#[test]
+fn force_says_what_it_replaced() {
+    let home = temp_home("replace");
+    let first = "http://127.0.0.1:1/mcp";
+    let second = "http://127.0.0.1:2/mcp";
+
+    let o = run(mcpdial(&home).args(["add", "web", "--http", first, "--no-probe"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(o.stderr.trim(), format!("saved web (http {first})"));
+
+    let o = run(mcpdial(&home).args(["add", "web", "--http", second, "--no-probe"]));
+    assert_eq!(o.code, 2);
+    assert!(o.stderr.contains("pass --force"), "{}", o.stderr);
+
+    let o = run(mcpdial(&home).args(["add", "web", "--http", second, "--no-probe", "--force"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert_eq!(
+        o.stderr.trim(),
+        format!("saved web (http {second}), replacing http {first}")
     );
 }
 

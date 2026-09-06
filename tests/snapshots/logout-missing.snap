@@ -1,0 +1,5 @@
+$ mcpdial logout nobody
+exit 2
+--- stdout
+--- stderr
+error: no server named "nobody" and no credential saved for it

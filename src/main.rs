@@ -779,10 +779,13 @@ fn from_catalog(
     Ok(resolved)
 }
 
-fn credential_key(store: &Store, target: String) -> String {
-    client::resolve(store, &target)
-        .map(|r| r.name)
-        .unwrap_or(target)
+/// The name a credential is filed under, and whether the target names anything
+/// mcpdial could dial: a saved server, a URL, or a `stdio:` command line.
+fn credential_key(store: &Store, target: String) -> (String, bool) {
+    match client::resolve(store, &target) {
+        Ok(r) => (r.name, true),
+        Err(_) => (target, false),
+    }
 }
 
 fn name_and_args(rest: &str) -> (&str, &str) {
@@ -1407,10 +1410,12 @@ const SHELL_COMMANDS: &[&str] = &[
     "info",
     "help",
     "quit",
+    "exit",
 ];
 
 const SHELL_SUMMARY: &str = "commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, \
-     resources, read URI, prompts, prompt NAME, raw METHOD, elicit {\"x\": 1}, info, help, quit";
+     resources, read URI, prompts, prompt NAME, raw METHOD, elicit {\"x\": 1}, info, help, \
+     quit (or exit)";
 
 const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
@@ -1425,7 +1430,7 @@ const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
   elicit {"arg": "value"}    answers for whatever the server elicits from here on
   info                       the initialize result
-  quit                       close the session
+  quit (or exit)             close the session
 
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed."#;
@@ -1762,7 +1767,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             cfg.allow = validate_patterns(allow, "--allow")?;
             cfg.deny = validate_patterns(deny, "--deny")?;
             validate_location(&cfg)?;
-            if let Some(old) = store.server(&name)?.filter(|_| !force) {
+            let replaced = store.server(&name)?;
+            if let Some(old) = replaced.as_ref().filter(|_| !force) {
                 return Err(Error::usage(format!(
                     "{name} is already saved ({} {}); pass --force to replace it",
                     old.kind(),
@@ -1792,7 +1798,14 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 }
                 print_value(ui, &json!({ "saved": saved }), true);
             } else {
-                ui.err_line(&format!("saved {name} ({summary})"));
+                ui.err_line(&match &replaced {
+                    Some(old) => format!(
+                        "saved {name} ({summary}), replacing {} {}",
+                        old.kind(),
+                        old.location()
+                    ),
+                    None => format!("saved {name} ({summary})"),
+                });
                 for line in tool_lists_lines(&lists) {
                     ui.err_line(&format!("  {line}"));
                 }
@@ -3104,8 +3117,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Logout { target } | Cmd::Token(TokenCmd::Rm { name: target }) => {
-            let name = credential_key(&store, target);
+            let (name, dialable) = credential_key(&store, target);
             let removed = store.remove_credential(&name)?;
+            // Removing a credential a server never had is the idempotent
+            // success it looks like; a name that stands for nothing at all is
+            // the typo `rm` already refuses, and is refused here the same way.
+            if !removed && !dialable {
+                return Err(Error::usage(format!(
+                    "no server named {name:?} and no credential saved for it"
+                ))
+                .into());
+            }
             if cli.json {
                 ui.line(&format!(
                     "{}",
@@ -3120,7 +3142,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Token(TokenCmd::Set { name, env }) => {
-            let key = credential_key(&store, name);
+            let (key, _) = credential_key(&store, name);
             let token = read_secret(ui, env.as_deref(), "token")?;
             let mut cred = store.credential(&key)?.unwrap_or_default();
             cred.access_token = Some(token);
@@ -3136,7 +3158,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Token(TokenCmd::Show { name }) => {
-            let key = credential_key(&store, name);
+            let (key, _) = credential_key(&store, name);
             let Some(cred) = store.credential(&key)? else {
                 return Err(Error::config(format!("no credential saved for {key}")).into());
             };
@@ -3251,7 +3273,10 @@ fn listing_row(l: &Listing) -> Vec<String> {
 
 fn auth_label(l: &Listing) -> String {
     match (l.auth, &l.status) {
-        (client::AuthUsed::Env, _) => "env".into(),
+        (client::AuthUsed::Env, _) => l
+            .token_env
+            .as_ref()
+            .map_or_else(|| "env".into(), |var| format!("${var}")),
         (client::AuthUsed::Saved, _) => "saved".into(),
         (client::AuthUsed::None, Status::AuthRequired) => "needed".into(),
         (client::AuthUsed::None, Status::TokenRejected) => "rejected".into(),

@@ -61,8 +61,9 @@ once and every command carries it.
    content blocks are printed as plain text, one per line, and a result with `isError`
    set is followed by `(tool reported an error)` on stderr.
 4. **Keep state.** `mcpdial shell TARGET --json` reads one command per line from stdin
-   and prints one JSON line per command. Send `quit` or close stdin to finish. When
-   each command has to be its own invocation, `mcpdial start NAME [--idle SECS]`
+   and prints one JSON line per command. Send `quit` (or `exit`) or close stdin to
+   finish. When each command has to be its own invocation,
+   `mcpdial start NAME [--idle SECS]`
    keeps a saved stdio server running in the background and prints
    `started NAME (pid N)` (`--json`: `{"name","pid","socket"}`); every later command
    naming NAME shares that one session until `mcpdial stop NAME`. Requests are
@@ -334,8 +335,12 @@ and `--deny GLOB` (repeatable) save tool allow and deny lists, and `saved` carri
 list that is not empty. `set NAME --allow ... --deny ...` replaces a list, `--clear-allow`
 and `--clear-deny` empty one, and `set NAME` with no flags prints
 `{"name":"x","allow":[...],"deny":[...]}` instead of a receipt. `token show` with no
-saved credential is a config error (exit 2). `login` prints its progress, including the
-authorization URL, as plain lines on stderr in either mode.
+saved credential is a config error (exit 2). `logout` and `token rm` are idempotent for
+any target that can be dialed - a saved name, a URL, a `stdio:` command line - and are
+exit 0 with a `null` receipt when there was nothing to remove; a name that is none of
+those and holds no credential names nothing to log out of, and is a usage error (exit 2)
+as `rm` answers one. `login` prints its progress, including the authorization URL, as
+plain lines on stderr in either mode.
 
 ## Shell protocol
 
@@ -354,7 +359,7 @@ raw METHOD {"json":"params"}  # any JSON-RPC method; allow and deny lists do not
 elicit {"json":"answers"}     # answer whatever the server elicits from here on
 info                          # the initialize result
 help [TOOL]                   # commands, or one tool's parameters
-quit
+quit                          # or exit
 ```
 
 Lines starting with `#` are ignored. Output with `--json`: one line per command. `call`
