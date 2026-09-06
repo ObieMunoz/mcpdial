@@ -1152,6 +1152,11 @@ pub fn under_pty(home: &std::path::Path, args: &[&str], env: &[(&str, &str)]) ->
     cmd.env("MCPDIAL_HOME", home)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("MCPDIAL_PLAIN")
+        // Which terminal the developer runs the suite in is not the terminal
+        // under test; every test that wants one names it in `env`.
+        .env_remove("TERM_PROGRAM")
+        .env_remove("KITTY_WINDOW_ID")
+        .env_remove("TMUX")
         .env("TERM", "xterm")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

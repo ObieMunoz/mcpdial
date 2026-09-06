@@ -192,10 +192,23 @@ presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
 `MCPDIAL_PLAIN` and for `TERM=dumb`, is the same bytes release after release, and
 `Rich`, chosen for a person at a terminal and for the pipe that asked for colour
 with `--color always`, is the one place the output may differ: the `STATUS` column
-of `ls` and the `error:` prefix carry their meaning in colour, and JSON (`schema`,
+of `ls` and the `error:` prefix carry their meaning in colour, JSON (`schema`,
 `info`, `raw`, a tool's `structuredContent`) comes with its keys, strings, numbers,
-booleans and null in colour. `NO_COLOR`, and `--color never`, turn all of it off. A
-snapshot test holds `Plain` to its word; see Development below.
+booleans and null in colour, and a PNG a tool returns is drawn under its placeholder
+line on the terminals that can show one. `NO_COLOR`, and `--color never`, turn the
+colour off. A snapshot test holds `Plain` to its word; see Development below.
+
+An image is drawn only where the terminal names itself in the environment:
+`TERM_PROGRAM=iTerm.app` and `TERM_PROGRAM=WezTerm` get iTerm2's OSC 1337 sequence,
+and `TERM_PROGRAM=ghostty`, `KITTY_WINDOW_ID`, `TERM=xterm-kitty` and
+`TERM=xterm-ghostty` get kitty's APC `_G` chunks. The bytes travel as the PNG the
+server sent, so nothing else - a JPEG, a GIF, an SVG - is drawn, and neither is
+anything inside `tmux` or `screen`, whose passthrough is off by default. A terminal
+that does not say what it is keeps the `[image image/png, 84 KB]` placeholder and
+nothing more, because an escape sequence sent where it is not understood spills the
+base64 across the screen. The placeholder line stays either way, `--save-dir` still
+names the file it wrote in it, and a pipe, `--json` and `--plain` print what they
+always have.
 
 At a terminal, the output of `call`, `read`, `prompt`, `raw`, `schema`, `tools
 --long` and `info` goes through a pager when it is taller than the screen, as
