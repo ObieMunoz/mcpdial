@@ -9,6 +9,7 @@
 //! whole screen. A pipe, `--json` or `--plain` gets the entries as objects,
 //! exactly what `catalog --json` prints, so the agent surface holds.
 
+use crate::pick::on_path;
 use crate::present::Presenter;
 use crate::{listing_row, Failure, EXIT_ERROR, LISTING_HEADERS};
 use mcpdial::catalog::{self, Entry};
@@ -18,8 +19,8 @@ use mcpdial::registry::{self, Pick, Registry, Resolved};
 use mcpdial::{Error, Store};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::{BufRead, IsTerminal, Write};
-use std::path::{Path, PathBuf};
+use std::io::{BufRead, Write};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub struct Flags {
@@ -39,7 +40,7 @@ const PREVIEW_FILE: &str = "browse-preview.json";
 /// Whether a bare `mcpdial` should open the checklist: a person at a
 /// terminal, on both ends, with nothing saved yet.
 pub fn first_run(cli: &crate::Cli) -> bool {
-    if crate::present::wants_plain(cli) || !std::io::stdin().is_terminal() {
+    if !crate::pick::at_a_terminal(cli) {
         return false;
     }
     Store::from_env()
@@ -293,17 +294,6 @@ pub(crate) fn render(items: &[Item], checked: &[bool]) -> Vec<String> {
 }
 
 // -- fzf --------------------------------------------------------------------------
-
-fn on_path(program: &str) -> Option<PathBuf> {
-    let names: &[String] = if cfg!(windows) {
-        &[format!("{program}.exe"), format!("{program}.cmd")]
-    } else {
-        &[program.to_string()]
-    };
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .flat_map(|dir| names.iter().map(move |n| dir.join(n)))
-        .find(|p| p.is_file())
-}
 
 /// The list in fzf, installed entries first with their boxes ticked. Marking a
 /// row flips it: an installed one is removed, another is added. `None` when fzf

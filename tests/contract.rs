@@ -468,6 +468,8 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("ls", &["ls", "--no-probe"]),
         Case::both("catalog", &["catalog"]),
         Case::both("browse", &["browse"]),
+        // The picker needs a person; a program is told so rather than read from.
+        Case::both("pick", &["pick"]),
         Case::both("import", &["import", &host_config]).with_json_force(),
         Case::both("import-empty", &["import", &empty_config]),
         // What a server offers.

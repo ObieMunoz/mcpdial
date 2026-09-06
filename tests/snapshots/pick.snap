@@ -1,0 +1,6 @@
+$ mcpdial pick
+exit 2
+--- stdout
+--- stderr
+error: pick needs a terminal on stdin and stdout, and a build with the rich feature
+`mcpdial ls` names the saved servers, `mcpdial tools NAME` their tools, and `mcpdial call NAME TOOL` makes the call
