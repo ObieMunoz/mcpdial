@@ -11,6 +11,13 @@ commit subjects with `git cliff`; nothing here is written by hand.
 Every pull request title is a conventional commit subject, and the next section is
 built from those at release time.
 
+
+## [0.2.1] - 2026-09-06
+
+### Fixed
+
+- Shorten the model-context-protocol keyword so crates.io accepts it
+
 ## [0.2.0] - 2026-09-06
 
 ### Added
