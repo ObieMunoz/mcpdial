@@ -1,10 +1,11 @@
 //! Request id allocation, bringing a session up on either era of the protocol,
 //! and the methods that matter.
 
+use crate::notify::{self, Notice};
 use crate::protocol::{
-    check, is_modern_error, negotiate, notification, request, rpc_error, with_client_meta, Error,
-    KnownVersion, Result, CLIENT_NAME, CLIENT_VERSION, META_SERVER_INFO,
-    UNSUPPORTED_PROTOCOL_VERSION,
+    check, is_modern_error, negotiate, notification, request, rpc_error, with_client_meta,
+    with_progress_token, Error, KnownVersion, Result, CLIENT_NAME, CLIENT_VERSION,
+    META_SERVER_INFO, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
@@ -16,6 +17,32 @@ use std::path::{Path, PathBuf};
 /// Backstop for a server that mints a fresh cursor forever, which the
 /// repeated-cursor check below cannot catch.
 const MAX_PAGES: usize = 1000;
+
+/// What a caller does with the notifications a server sends while its request
+/// is still in flight.
+///
+/// This is the hook the presentation hangs off: the session routes, the
+/// watcher decides what any of it looks like, and a run with nobody watching
+/// pays for none of it.
+pub trait Watcher {
+    /// Whether the request should carry a `progressToken` at all. Answering
+    /// `true` is what invites the server to report as it goes, so a watcher
+    /// with nowhere to put the answer says `false` and the server is spared
+    /// the work.
+    fn wants_progress(&self) -> bool {
+        false
+    }
+
+    fn notice(&mut self, notice: &Notice<'_>);
+}
+
+/// The watcher for a request nobody is watching: no token goes out, and
+/// anything that arrives anyway is dropped.
+pub struct Unwatched;
+
+impl Watcher for Unwatched {
+    fn notice(&mut self, _notice: &Notice<'_>) {}
+}
 
 pub struct Session<T: Transport> {
     pub transport: T,
@@ -62,15 +89,41 @@ impl<T: Transport> Session<T> {
     /// each one carries the protocol version, the client's identity and its
     /// capabilities itself.
     pub fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.request_watching(method, params, &mut Unwatched)
+    }
+
+    /// A request with somebody listening to what the server says while it runs.
+    ///
+    /// The `progressToken` rides only when `watch` says it wants progress: a
+    /// server handed one is entitled to stream notifications at us, and asking
+    /// for a stream nobody will read is asking a server to do work for nothing.
+    /// Whatever else arrives - a stale token, a `ping`, a notification of a kind
+    /// nothing here renders - is passed over, never raised as an error, and
+    /// never allowed to stand in for the result.
+    pub fn request_watching(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        watch: &mut dyn Watcher,
+    ) -> Result<Value> {
         self.next_id += 1;
+        let id = self.next_id;
+        let token = watch.wants_progress().then(|| json!(id));
+        let params = match token.is_some() {
+            true => Some(with_progress_token(params, id)),
+            false => params,
+        };
         let params = match self.version.is_modern() {
             true => Some(with_client_meta(params, self.version)),
             false => params,
         };
-        let msg = check(
-            self.transport
-                .send(&request(method, self.next_id, params))?,
-        )?;
+        let sent = request(method, id, params);
+        let reply = self.transport.send_watching(&sent, &mut |from_server| {
+            if let Some(notice) = notify::read(from_server, token.as_ref()) {
+                watch.notice(&notice);
+            }
+        })?;
+        let msg = check(reply)?;
         Ok(msg
             .and_then(|mut m| m.get_mut("result").map(Value::take))
             .unwrap_or_else(|| json!({})))
@@ -225,9 +278,22 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.request(
+        self.call_tool_watching(name, arguments, &mut Unwatched)
+    }
+
+    /// The three methods that can take long enough to be worth reporting on are
+    /// the three that take a watcher: a tool call, a prompt, and a resource
+    /// read. Everything else is a listing or a handshake and answers at once.
+    pub fn call_tool_watching(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        watch: &mut dyn Watcher,
+    ) -> Result<Value> {
+        self.request_watching(
             "tools/call",
             Some(json!({ "name": name, "arguments": arguments })),
+            watch,
         )
     }
 
@@ -242,7 +308,11 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn read_resource(&mut self, uri: &str) -> Result<Value> {
-        self.request("resources/read", Some(json!({ "uri": uri })))
+        self.read_resource_watching(uri, &mut Unwatched)
+    }
+
+    pub fn read_resource_watching(&mut self, uri: &str, watch: &mut dyn Watcher) -> Result<Value> {
+        self.request_watching("resources/read", Some(json!({ "uri": uri })), watch)
     }
 
     pub fn list_prompts(&mut self) -> Result<Vec<Value>> {
@@ -250,9 +320,19 @@ impl<T: Transport> Session<T> {
     }
 
     pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
-        self.request(
+        self.get_prompt_watching(name, arguments, &mut Unwatched)
+    }
+
+    pub fn get_prompt_watching(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        watch: &mut dyn Watcher,
+    ) -> Result<Value> {
+        self.request_watching(
             "prompts/get",
             Some(json!({ "name": name, "arguments": arguments })),
+            watch,
         )
     }
 
@@ -1179,5 +1259,97 @@ mod tests {
         let mangled = json!({"contents":[{"uri":"file:///b.png","blob":"not base64!"}]});
         let e = resource_bodies(&mangled).unwrap_err().to_string();
         assert!(e.contains("file:///b.png") && e.contains("base64"), "{e}");
+    }
+
+    /// A transport that talks on the way to its answer, the way a server
+    /// running something slow does.
+    struct Talkative {
+        sent: Vec<Value>,
+        says: Vec<Value>,
+    }
+
+    impl Transport for Talkative {
+        fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+            self.send_watching(payload, &mut |_| {})
+        }
+
+        fn send_watching(
+            &mut self,
+            payload: &Value,
+            watch: &mut dyn FnMut(&Value),
+        ) -> Result<Option<Value>> {
+            self.sent.push(payload.clone());
+            for message in &self.says {
+                watch(message);
+            }
+            Ok(Some(
+                json!({"jsonrpc":"2.0","id":payload["id"],"result":{"ok":true}}),
+            ))
+        }
+    }
+
+    /// A watcher that keeps what it was told, and says it is listening.
+    #[derive(Default)]
+    struct Kept {
+        listening: bool,
+        heard: Vec<String>,
+    }
+
+    impl Watcher for Kept {
+        fn wants_progress(&self) -> bool {
+            self.listening
+        }
+        fn notice(&mut self, notice: &Notice<'_>) {
+            self.heard.push(notice.summary());
+        }
+    }
+
+    fn talkative(says: Vec<Value>) -> Session<Talkative> {
+        Session::new(Talkative {
+            sent: Vec::new(),
+            says,
+        })
+        .offering(KnownVersion::LATEST_LEGACY)
+    }
+
+    #[test]
+    fn a_progress_token_rides_only_when_the_watcher_is_listening() {
+        let mut s = talkative(Vec::new());
+        s.call_tool("echo", json!({})).unwrap();
+        assert!(
+            s.transport.sent[0]["params"]["_meta"].is_null(),
+            "nobody was listening: {}",
+            s.transport.sent[0]
+        );
+
+        let mut listening = Kept {
+            listening: true,
+            ..Kept::default()
+        };
+        s.call_tool_watching("echo", json!({}), &mut listening)
+            .unwrap();
+        let asked = &s.transport.sent[1];
+        assert_eq!(asked["params"]["_meta"]["progressToken"], asked["id"]);
+    }
+
+    #[test]
+    fn what_the_server_says_on_the_way_reaches_the_watcher_and_the_rest_is_dropped() {
+        let says = vec![
+            json!({"jsonrpc":"2.0","method":"notifications/progress",
+                   "params":{"progressToken":1,"progress":1,"total":2,"message":"half"}}),
+            json!({"jsonrpc":"2.0","method":"notifications/progress",
+                   "params":{"progressToken":"someone else","progress":9}}),
+            json!({"jsonrpc":"2.0","method":"notifications/message",
+                   "params":{"level":"warning","data":"careful"}}),
+            json!({"jsonrpc":"2.0","id":"srv","method":"ping"}),
+        ];
+        let mut s = talkative(says);
+        let mut kept = Kept {
+            listening: true,
+            ..Kept::default()
+        };
+        let result = s.call_tool_watching("echo", json!({}), &mut kept).unwrap();
+        assert_eq!(result["ok"], true, "the answer is untouched");
+        assert_eq!(kept.heard, ["1/2 half", "server [warning] careful"]);
     }
 }

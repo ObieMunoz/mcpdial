@@ -165,9 +165,11 @@ default browser UA (or `MCPDIAL_USER_AGENT`), `--protocol-version VERSION` to na
 MCP revision instead of working out which the server speaks,
 `--no-daemon` to dial a server afresh even while `start` has one running,
 `--no-retry` to fail on the first transient HTTP failure instead of sending the
-request once more, `--plain` (or `MCPDIAL_PLAIN=1`) to print at a terminal
-exactly what a pipe would get, and `--no-pager` to print long output straight to
-the terminal.
+request once more, `--progress` to print a line on stderr for every progress
+notification a server sends during a call, `--log-level LEVEL` to move the line a
+server's own log messages print from, `--plain` (or `MCPDIAL_PLAIN=1`) to print at a
+terminal exactly what a pipe would get, and `--no-pager` to print long output
+straight to the terminal.
 
 What a pipe gets is frozen. Everything mcpdial prints goes through one of two
 presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
@@ -201,6 +203,34 @@ mirrors its method and subject into the `Mcp-Method` and `Mcp-Name` headers.
 `--protocol-version VERSION` skips the working out - `2025-11-25` holds a server that
 serves both eras to the handshake, `2025-06-18` suits one that misbehaves when offered
 anything newer - and `add --protocol-version` saves the choice.
+
+### Watching a long call
+
+A crawl, a build or a browser session can run for minutes with nothing on the screen.
+Servers report as they go, in `notifications/progress` and `notifications/message`,
+but only for a request that invited them to: mcpdial sends a `progressToken` on a
+`call`, `prompt` or `read` when there is somewhere for the answer to go, and never
+otherwise.
+
+At a terminal that is one updating line on stderr. Anywhere else `--progress` asks
+for it explicitly, one plain line per notification, so a captured log holds them:
+
+```
+$ mcpdial --progress call crawler crawl '{"url":"https://example.com"}' > pages.json
+progress: 1/12 fetching https://example.com
+progress: 2/12 fetching https://example.com/about
+...
+```
+
+A server's own log messages print on stderr from `warning` up, as `server [warning]
+crawler: rate limited`. `--log-level LEVEL` moves that line - the eight RFC 5424
+names, `debug` through `emergency` - and a server that advertises the `logging`
+capability is told the level as well, so it need not send what would only be
+filtered here.
+
+Under `--json` both arrive on stderr as one object per line,
+`{"notification":{"method":"notifications/progress","params":{...}}}`. stdout is the
+result and nothing else, whatever the server says on the way.
 
 ### Arguments, without the quoting
 

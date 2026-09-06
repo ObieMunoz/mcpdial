@@ -15,7 +15,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How many trailing stderr lines to keep for the post-mortem.
 const STDERR_TAIL: usize = 12;
@@ -85,6 +85,11 @@ impl Framed {
     /// and may supply the reply to a request; otherwise [`answer`] does. The
     /// peer may well be blocked on that reply, so waiting quietly for our own id
     /// would deadlock both ends.
+    ///
+    /// The timeout bounds the exchange, not each message in it: a peer that
+    /// streams progress notifications at us forever would otherwise keep
+    /// resetting a per-message wait and hold the call open for as long as it
+    /// cared to talk.
     pub(crate) fn exchange(
         &mut self,
         payload: &Value,
@@ -106,8 +111,10 @@ impl Framed {
             _ => return Ok(None),
         };
 
+        let deadline = Instant::now() + self.timeout;
         loop {
-            let line = match self.lines.recv_timeout(self.timeout) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = match self.lines.recv_timeout(left) {
                 Ok(l) => l,
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(Error::transport(format!(
@@ -334,6 +341,17 @@ fn wait_up_to(child: &mut Child, dur: Duration) -> Option<std::process::ExitStat
 impl Transport for StdioTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
         self.exchange(payload, &mut |_| None)
+    }
+
+    fn send_watching(
+        &mut self,
+        payload: &Value,
+        watch: &mut dyn FnMut(&Value),
+    ) -> Result<Option<Value>> {
+        self.exchange(payload, &mut |from_server| {
+            watch(from_server);
+            None
+        })
     }
 
     fn close(&mut self) {

@@ -446,6 +446,28 @@ pub fn with_client_meta(params: Option<Value>, version: KnownVersion) -> Value {
     params
 }
 
+/// `params` carrying the `progressToken` that invites the server to report as
+/// it goes. Params that are not an object have nowhere to put it, as with
+/// [`with_client_meta`].
+///
+/// The request's own id is the token: it is unique within the session already,
+/// and it makes a progress notification for a request that has since finished
+/// recognisable as such.
+pub fn with_progress_token(params: Option<Value>, id: u64) -> Value {
+    let mut params = params.unwrap_or_else(|| json!({}));
+    let Some(fields) = params.as_object_mut() else {
+        return params;
+    };
+    let meta = fields
+        .entry("_meta")
+        .or_insert_with(|| json!({}))
+        .as_object_mut();
+    if let Some(meta) = meta {
+        meta.entry("progressToken").or_insert_with(|| json!(id));
+    }
+    params
+}
+
 pub fn request(method: &str, id: u64, params: Option<Value>) -> Value {
     let mut msg = json!({ "jsonrpc": "2.0", "id": id, "method": method });
     if let Some(p) = params {

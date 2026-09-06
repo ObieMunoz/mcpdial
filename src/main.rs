@@ -11,7 +11,10 @@ use mcpdial::session::{
     Media, MediaSink,
 };
 use mcpdial::transport::trace::Trace;
-use mcpdial::{daemon, oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
+use mcpdial::{
+    daemon, oauth, Credential, Error, KnownVersion, Level, ServerConfig, Store, USER_AGENT,
+};
+use notices::Notices;
 use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -23,6 +26,7 @@ use std::time::Duration;
 
 mod args;
 mod env_defaults;
+mod notices;
 mod present;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
@@ -75,6 +79,16 @@ struct Cli {
     /// Trace every message on stderr (and pass a stdio server's stderr through)
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Print a line on stderr for every progress notification a server sends
+    /// during a call, whether or not stderr is a terminal
+    #[arg(long, global = true)]
+    progress: bool,
+
+    /// Show a server's own log notifications from this level up (default
+    /// warning), and ask a server that supports logging to send no less
+    #[arg(long, global = true, value_name = "LEVEL")]
+    log_level: Option<Level>,
 
     /// Append every message and transport event to FILE as JSON Lines, secrets
     /// redacted (MCPDIAL_TRACE=FILE does the same everywhere)
@@ -543,6 +557,17 @@ fn print_tool_result(
         }
     }
     failed
+}
+
+/// One request with somebody listening to what the server says on the way, and
+/// the updating line finished before whatever prints next, however it went.
+fn watched<'a, T>(
+    notices: &mut Notices<'a>,
+    request: impl FnOnce(&mut Notices<'a>) -> Result<T, Error>,
+) -> Result<T, Error> {
+    let outcome = request(notices);
+    notices.finish();
+    outcome
 }
 
 fn dial(store: &Store, opts: &Options, target: &str) -> Result<client::Connection, Failure> {
@@ -1446,9 +1471,13 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         verbose: cli.verbose,
         no_daemon: cli.no_daemon || daemon::disabled_by_env(),
         retry: !cli.no_retry,
+        log_level: cli.log_level,
         trace: Trace::from_flag_or_env(cli.trace.as_deref())?,
         ..Options::default()
     };
+    // Built before the command is matched, because matching moves it out of
+    // `cli`; it borrows nothing from there.
+    let mut notices = Notices::new(ui, &cli);
     if let Some(dir) = &cli.save_dir {
         let renders_media = matches!(
             cli.cmd,
@@ -1967,7 +1996,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         Error::usage("read needs a resource URI"),
                         "usage: read URI   (`resources` lists what this server offers)",
                     )),
-                    "read" => match conn.session.read_resource(rest) {
+                    "read" => match watched(&mut notices, |w| {
+                        conn.session.read_resource_watching(rest, w)
+                    }) {
                         Err(e) => Err(missing_capability(e, "resources", info_cmd)),
                         Ok(mut result) => {
                             let redirect = format!("mcpdial read {} {}", shell_word(&target), rest);
@@ -2002,7 +2033,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             ))
                         } else {
                             args::shell_arguments(args, || Value::Null)
-                                .and_then(|a| conn.session.get_prompt(name, a))
+                                .and_then(|a| {
+                                    watched(&mut notices, |w| {
+                                        conn.session.get_prompt_watching(name, a, w)
+                                    })
+                                })
                                 .map_err(|e| missing_capability(e, "prompts", info_cmd))
                                 .and_then(|mut result| {
                                     let files = MediaFiles {
@@ -2045,7 +2080,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                     hint: shell_call_hint(&mut cache, &mut conn, tool, true),
                                     tool: None,
                                 }),
-                                Ok(a) => match conn.session.call_tool(tool, a) {
+                                Ok(a) => match watched(&mut notices, |w| {
+                                    conn.session.call_tool_watching(tool, a, w)
+                                }) {
                                     Ok(mut result) => {
                                         let files = MediaFiles {
                                             dir: save_dir,
@@ -2255,10 +2292,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Read { target, uri } => {
             let mut conn = dial(&store, &opts, &target)?;
-            let mut result = conn
-                .session
-                .read_resource(&uri)
-                .map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
+            let outcome = conn.session.read_resource_watching(&uri, &mut notices);
+            notices.finish();
+            let mut result =
+                outcome.map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
             let redirect = format!("mcpdial read {} {}", shell_word(&target), shell_word(&uri));
             let files = MediaFiles {
                 dir: save_dir,
@@ -2307,10 +2344,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 None => args::parse_pairs(form.pairs(), &Value::Null)?,
             };
             let mut conn = dial(&store, &opts, &target)?;
-            let mut result = conn
+            let outcome = conn
                 .session
-                .get_prompt(&name, arguments)
-                .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
+                .get_prompt_watching(&name, arguments, &mut notices);
+            notices.finish();
+            let mut result =
+                outcome.map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if !cli.json {
                 if let Some(d) = result["description"].as_str() {
                     ui.err_line(d);
@@ -2626,7 +2665,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     })?
                 }
             };
-            let mut result = match conn.session.call_tool(&tool, arguments) {
+            let outcome = conn
+                .session
+                .call_tool_watching(&tool, arguments, &mut notices);
+            notices.finish();
+            let mut result = match outcome {
                 Ok(result) => result,
                 // The server said no; say what it wanted instead.
                 Err(e) => {

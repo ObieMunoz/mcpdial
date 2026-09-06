@@ -3,12 +3,14 @@
 use super::retry::{self, Failed, Failure, Retry};
 use super::trace::{Kind, TraceEvent, Wire};
 use super::{silent, Logger, Transport};
-use crate::protocol::{decode_body, Error, KnownVersion, Result, META_PROTOCOL_VERSION};
+use crate::protocol::{
+    classify, decode_body, Error, Incoming, KnownVersion, Result, META_PROTOCOL_VERSION,
+};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{self, BufRead, BufReader, Read};
 use std::time::{Duration, Instant};
 
 /// Always send a real browser User-Agent. This is a correctness requirement, not
@@ -341,10 +343,14 @@ fn is_endpoint_event(line: &str) -> bool {
 
 impl HttpTransport {
     /// One delivery of `body`, with its failure classified for [`Retry`].
+    ///
+    /// `watch` sees whatever the server puts on the response stream ahead of
+    /// the answer, as each event is read.
     fn attempt(
         &mut self,
         payload: &Value,
         body: &str,
+        watch: &mut dyn FnMut(&Value),
     ) -> std::result::Result<Option<Value>, Failed> {
         let wire = Wire::Http(&self.url);
         (self.log)(&TraceEvent::Sent {
@@ -392,18 +398,32 @@ impl HttpTransport {
         let location = header(&resp, "location");
         let retry_after = retry::retry_after(header(&resp, "retry-after").as_deref());
 
-        let text = resp.body_mut().read_to_string().map_err(|e| {
+        let broken = |e: &dyn std::fmt::Display| {
             failed(format!("could not read response body: {e}"));
             Failed {
                 error: Error::transport(format!("could not read response body: {e}")),
                 // A session named on the broken reply is state the server now holds;
                 // a retried `initialize` would open a second one beside it.
-                failure: match session_id {
-                    Some(_) => Failure::Final,
-                    None => Failure::Interrupted,
+                failure: match session_id.is_some() {
+                    true => Failure::Final,
+                    false => Failure::Interrupted,
                 },
             }
-        })?;
+        };
+        // A stream is read event by event, so that what the server says on the
+        // way out reaches `watch` while it still means something. Anything else
+        // is one body with nothing in front of the answer, read whole.
+        let (text, streamed_reply) = if streaming(status, &content_type) {
+            let mut read_so_far = String::new();
+            let found = read_stream(&mut resp.body_mut().as_reader(), &mut read_so_far, watch)
+                .map_err(|e| broken(&e))?;
+            (read_so_far, found)
+        } else {
+            (
+                resp.body_mut().read_to_string().map_err(|e| broken(&e))?,
+                None,
+            )
+        };
         (self.log)(&TraceEvent::HttpReply {
             wire,
             method: "POST",
@@ -447,7 +467,12 @@ impl HttpTransport {
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
-        let reply = decode_body(&text, &content_type).map_err(Failed::final_)?;
+        let reply = match streamed_reply {
+            Some(message) => Some(message),
+            // A stream that held no answer decodes exactly as it always did,
+            // error and all, and so does a plain JSON body.
+            None => decode_body(&text, &content_type).map_err(Failed::final_)?,
+        };
         if let Some(message) = &reply {
             (self.log)(&TraceEvent::Received {
                 wire: Wire::Http(&self.url),
@@ -464,11 +489,71 @@ impl HttpTransport {
     }
 }
 
+/// Whether this reply is a stream to be read as it comes rather than a body to
+/// be read whole. A failure is neither: its body is the error message, wanted
+/// entire and wanted now.
+fn streaming(status: u16, content_type: &str) -> bool {
+    (200..300).contains(&status)
+        && content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+}
+
+/// Read an SSE reply event by event, handing everything the server says on the
+/// way to `watch`, and stop at the answer.
+///
+/// Reading the whole body first is what dropped progress: by the time the last
+/// byte arrives there is nothing left to report. Stopping at the answer also
+/// means a server that leaves the stream open afterwards no longer holds the
+/// call for as long as it likes. Everything read lands in `read_so_far`, which
+/// is what the trace records and what decodes the reply if none was found here.
+fn read_stream(
+    stream: &mut impl Read,
+    read_so_far: &mut String,
+    watch: &mut dyn FnMut(&Value),
+) -> io::Result<Option<Value>> {
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    let mut data = String::new();
+    loop {
+        line.clear();
+        let end_of_the_stream = reader.read_line(&mut line)? == 0;
+        read_so_far.push_str(&line);
+        let ends_the_event = end_of_the_stream || line.trim().is_empty();
+        if !ends_the_event {
+            if let Some(value) = line.trim_end_matches(['\r', '\n']).strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.trim());
+            }
+            continue;
+        }
+        if let Ok(msg) = serde_json::from_str::<Value>(&std::mem::take(&mut data)) {
+            match classify(&msg, None) {
+                Incoming::Response => return Ok(Some(msg)),
+                _the_server_talking_to_us => watch(&msg),
+            }
+        }
+        if end_of_the_stream {
+            return Ok(None);
+        }
+    }
+}
+
 impl Transport for HttpTransport {
     fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+        self.send_watching(payload, &mut |_| {})
+    }
+
+    fn send_watching(
+        &mut self,
+        payload: &Value,
+        watch: &mut dyn FnMut(&Value),
+    ) -> Result<Option<Value>> {
         let body = payload.to_string();
         let idempotent = retry::is_idempotent(payload, &self.idempotent_tools);
-        let first = match self.attempt(payload, &body) {
+        let first = match self.attempt(payload, &body, watch) {
             Ok(reply) => return Ok(reply),
             Err(failed) => failed,
         };
@@ -483,7 +568,8 @@ impl Transport for HttpTransport {
             after: &first.failure,
         });
         std::thread::sleep(delay);
-        self.attempt(payload, &body).map_err(|second| second.error)
+        self.attempt(payload, &body, watch)
+            .map_err(|second| second.error)
     }
 
     fn negotiated(&mut self, version: KnownVersion) {
