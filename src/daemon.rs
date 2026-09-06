@@ -184,16 +184,38 @@ mod unix {
                 framed,
             })
         }
-    }
 
-    impl Transport for SocketTransport {
-        fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+        fn relay(
+            &mut self,
+            payload: &Value,
+            watch: &mut dyn FnMut(&Value),
+        ) -> Result<Option<Value>> {
             let Self { name, framed, .. } = self;
             framed.exchange(
                 payload,
                 &mut || Error::transport(format!("the daemon for {name} closed the connection")),
-                &mut |_| None,
+                &mut |from_daemon| {
+                    watch(from_daemon);
+                    None
+                },
             )
+        }
+    }
+
+    impl Transport for SocketTransport {
+        fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+            self.relay(payload, &mut |_| {})
+        }
+
+        /// The daemon passes everything the server says straight down the
+        /// socket, so a notification reaches the caller here exactly as it
+        /// would have from the server's own pipe.
+        fn send_watching(
+            &mut self,
+            payload: &Value,
+            watch: &mut dyn FnMut(&Value),
+        ) -> Result<Option<Value>> {
+            self.relay(payload, watch)
         }
 
         fn close(&mut self) {

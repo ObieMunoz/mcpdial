@@ -12,6 +12,12 @@
 //! call does not finish until both requests are answered, which is what a real
 //! server checking a slow connection does to a client that only listens for its
 //! own id.
+//! Set `ECHO_SERVER_PROGRESS=N` to make it report N times during `tools/call`
+//! before replying: a `notifications/progress` under the request's own
+//! `_meta.progressToken`, or under a token nobody asked for when the request
+//! carried none, and a log message at each end of the severity scale. That is
+//! what a crawler or a build does, and it is behind a flag because a server
+//! that talks during every call would change what every other test reads.
 //! Set `ECHO_SERVER_EXIT_ON_CALL=N` to make it exit with status 9 on its Nth
 //! `tools/call`, before replying, the way a server that crashes mid-call does.
 //! The `count` tool returns how many times it has been called in this process,
@@ -64,6 +70,10 @@ fn main() {
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
         .and_then(|n| n.parse().ok());
+    let reports: u32 = std::env::var("ECHO_SERVER_PROGRESS")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
     let mut count = 0u32;
     let mut calls = 0u32;
     let stdout = io::stdout();
@@ -99,6 +109,10 @@ fn main() {
                 eprintln!("echo_server: crashing on call {calls}");
                 std::process::exit(9);
             }
+        }
+
+        if reports > 0 && method == "tools/call" {
+            report(&mut out, reports, &params["_meta"]["progressToken"]);
         }
 
         // Interrupt the call the client is waiting on. A wrong answer is reported
@@ -231,6 +245,43 @@ fn main() {
         writeln!(out, "{reply}").unwrap();
         out.flush().unwrap();
     }
+}
+
+/// Talk while the client waits, the way a server doing something slow does:
+/// `times` progress notifications, and a log message at each end of the scale
+/// so a client's threshold has something to keep and something to drop.
+///
+/// One report always goes out under a token nobody asked for, and a request
+/// that sent no `progressToken` gets all of them that way: real servers do
+/// both, and a client has to drop them rather than report them.
+fn report(out: &mut impl Write, times: u32, token: &Value) {
+    let token = match token.is_null() {
+        true => json!("nobody-asked-for-this"),
+        false => token.clone(),
+    };
+    tell(
+        out,
+        &json!({"jsonrpc": "2.0", "method": "notifications/message",
+                "params": {"level": "debug", "logger": "echo", "data": "starting"}}),
+    );
+    tell(
+        out,
+        &json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                "params": {"progressToken": "stale", "progress": 9, "message": "not yours"}}),
+    );
+    for done in 1..=times {
+        tell(
+            out,
+            &json!({"jsonrpc": "2.0", "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": done, "total": times,
+                               "message": format!("step {done}")}}),
+        );
+    }
+    tell(
+        out,
+        &json!({"jsonrpc": "2.0", "method": "notifications/message",
+                "params": {"level": "warning", "logger": "echo", "data": "nearly there"}}),
+    );
 }
 
 /// Write one message and make sure it is on its way.

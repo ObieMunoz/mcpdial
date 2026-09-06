@@ -4,6 +4,7 @@
 //! nothing.
 
 use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
+use crate::notify::Level;
 use crate::oauth;
 use crate::protocol::{Error, KnownVersion, Result};
 use crate::schema;
@@ -47,6 +48,10 @@ pub struct Options {
     pub no_daemon: bool,
     /// One more attempt after a transient HTTP failure; `--no-retry` clears it.
     pub retry: bool,
+    /// `--log-level`: the threshold the caller set for a server's own log
+    /// notifications. A server that advertises `logging` is told it, so that it
+    /// does not spend bandwidth on levels that would only be filtered here.
+    pub log_level: Option<Level>,
     /// `--trace FILE` or `$MCPDIAL_TRACE`: where every message and transport
     /// event is appended as JSON Lines, whatever `verbose` says.
     pub trace: Option<Trace>,
@@ -64,6 +69,7 @@ impl Default for Options {
             verbose: false,
             no_daemon: false,
             retry: true,
+            log_level: None,
             trace: None,
         }
     }
@@ -338,12 +344,16 @@ fn handshake(
     transport: impl Transport + 'static,
     auth: AuthUsed,
     pinned: Option<KnownVersion>,
+    log_level: Option<Level>,
 ) -> Result<Connection> {
     let mut session = Session::new(Box::new(transport) as Box<dyn Transport>);
     if let Some(version) = pinned {
         session = session.offering(version);
     }
     let server_info = session.open()?.clone();
+    if let Some(level) = log_level {
+        set_log_level(&mut session, &server_info, level);
+    }
     Ok(Connection {
         name: r.name.clone(),
         config: r.config.clone(),
@@ -351,6 +361,19 @@ fn handshake(
         server_info,
         auth,
     })
+}
+
+/// Tell a server that advertises `logging` which levels are worth sending, so
+/// that the filtering happens where the bandwidth is rather than here.
+///
+/// Best effort by design: the client filters what arrives whatever the server
+/// does with this, so a server that advertised the capability and then refused
+/// the request has cost the call nothing and must not fail it.
+fn set_log_level(session: &mut Session<Box<dyn Transport>>, server_info: &Value, level: Level) {
+    if !server_info["capabilities"]["logging"].is_object() {
+        return;
+    }
+    let _ = session.request("logging/setLevel", Some(json!({ "level": level.as_str() })));
 }
 
 /// The process behind a stdio server, spawned and ready for `initialize`.
@@ -408,14 +431,26 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
             if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger(&r.name))? {
-                return handshake(r, t, AuthUsed::None, pinned);
+                return handshake(r, t, AuthUsed::None, pinned, opts.log_level);
             }
         }
-        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, pinned);
+        return handshake(
+            r,
+            spawn_stdio(r, opts)?,
+            AuthUsed::None,
+            pinned,
+            opts.log_level,
+        );
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
-    match handshake(r, http_transport(r, token, opts, timeout), auth, pinned) {
+    match handshake(
+        r,
+        http_transport(r, token, opts, timeout),
+        auth,
+        pinned,
+        opts.log_level,
+    ) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
@@ -427,6 +462,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
                 http_transport(r, cred.access_token, opts, timeout),
                 auth,
                 pinned,
+                opts.log_level,
             )
         }
         outcome => outcome,

@@ -70,6 +70,11 @@ pub enum Mode {
     /// The first `tools/call` gets a 503; everything else is served, with or
     /// without a session.
     CallUnavailableOnce { stateful: bool },
+    /// Advertises the `logging` capability, answers `logging/setLevel`, and
+    /// streams a `tools/call` reply: progress under whatever `progressToken`
+    /// the request carried plus one under a token nobody asked for, a log
+    /// message at each end of the severity scale, and then the result.
+    Logging,
 }
 
 /// The revision the [`Mode::Modern`] server speaks, and the only one.
@@ -689,22 +694,28 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         Mode::EchoProtocol | Mode::DualEra => params["protocolVersion"].as_str().unwrap_or("?"),
         _ => "2025-06-18",
     };
+    let mut capabilities = json!({"tools":{},"resources":{},"prompts":{}});
+    if matches!(mode, Mode::Logging) {
+        capabilities["logging"] = json!({});
+    }
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
             "protocolVersion":agreed_version,
-            "capabilities":{"tools":{},"resources":{},"prompts":{}},
+            "capabilities":capabilities,
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
         other => answer(mode, &id, other, params, state),
     };
 
-    if stateful {
-        let server_noise_before_the_answer = if method == "tools/call" {
-            ": keep-alive\n\n\
-             event: message\n\
-             data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\
-             \"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n"
-        } else {
-            ""
+    let streams = stateful || matches!(mode, Mode::Logging);
+    if streams {
+        let server_noise_before_the_answer = match (method, mode) {
+            ("tools/call", Mode::Logging) => reporting(&params["_meta"]["progressToken"]),
+            ("tools/call", _) => ": keep-alive\n\n\
+                 event: message\n\
+                 data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\
+                 \"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n"
+                .to_string(),
+            _ => String::new(),
         };
         let sse = format!("{server_noise_before_the_answer}event: message\ndata: {reply}\n\n");
         let mut r = with_headers(
@@ -783,6 +794,32 @@ fn modern(rec: &Recorded, state: &Mutex<State>) -> Resp {
 }
 
 /// What `Mcp-Name` must carry for a request, if anything.
+/// The events a server that talks on the way puts ahead of its answer: two log
+/// messages a threshold has to sort out, progress under the request's own token
+/// (or a made-up one when it sent none), and progress under a token nobody
+/// asked for, which a client must drop rather than show.
+fn reporting(token: &Value) -> String {
+    let ours = match token.is_null() {
+        true => json!("nobody-asked-for-this"),
+        false => token.clone(),
+    };
+    [
+        json!({"jsonrpc":"2.0","method":"notifications/message",
+               "params":{"level":"debug","logger":"fake","data":"starting"}}),
+        json!({"jsonrpc":"2.0","method":"notifications/progress",
+               "params":{"progressToken":ours,"progress":1,"total":2,"message":"step 1"}}),
+        json!({"jsonrpc":"2.0","method":"notifications/progress",
+               "params":{"progressToken":"stale","progress":9,"message":"not yours"}}),
+        json!({"jsonrpc":"2.0","method":"notifications/progress",
+               "params":{"progressToken":ours,"progress":2,"total":2,"message":"step 2"}}),
+        json!({"jsonrpc":"2.0","method":"notifications/message",
+               "params":{"level":"warning","logger":"fake","data":"nearly there"}}),
+    ]
+    .iter()
+    .map(|m| format!("event: message\ndata: {m}\n\n"))
+    .collect()
+}
+
 fn mcp_name_of<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
     match method {
         "tools/call" | "prompts/get" => params["name"].as_str(),
@@ -823,6 +860,9 @@ fn modern_error(status: u16, id: &Value, code: i64, message: &str) -> Resp {
 fn answer(mode: &Mode, id: &Value, method: &str, params: &Value, state: &Mutex<State>) -> Value {
     let id = id.clone();
     match method {
+        "logging/setLevel" if matches!(mode, Mode::Logging) => {
+            json!({"jsonrpc":"2.0","id":id,"result":{}})
+        }
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
         "resources/list" => resources_list(&id, params["cursor"].as_str()),
@@ -1032,6 +1072,51 @@ fn percent_decode(s: &str) -> String {
 }
 
 // -- helpers for driving the binary -------------------------------------------
+
+/// Run mcpdial inside a pseudo-terminal, so stdout and stderr are a terminal as
+/// far as it can tell, and hand back everything that reached the screen: both
+/// streams merged, with the `\r` the terminal adds taken back out.
+///
+/// BSD `script` takes the command as arguments; util-linux wants one string
+/// after `-c`. Unix only - there is no `script` on Windows.
+pub fn under_pty(home: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
+    let bsd = cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ));
+    let mut cmd = Command::new("script");
+    cmd.arg("-q");
+    if bsd {
+        cmd.arg("/dev/null")
+            .arg(env!("CARGO_BIN_EXE_mcpdial"))
+            .args(args);
+    } else {
+        let line: Vec<String> = std::iter::once(env!("CARGO_BIN_EXE_mcpdial"))
+            .chain(args.iter().copied())
+            .map(|a| format!("'{}'", a.replace('\'', r"'\''")))
+            .collect();
+        cmd.args(["-e", "-c", &line.join(" "), "/dev/null"]);
+    }
+    cmd.env("MCPDIAL_HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("MCPDIAL_PLAIN")
+        .env("TERM", "xterm")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn script");
+    // Held open until the command has exited: an end of file on the terminal's
+    // input would be echoed as `^D`, as a typed one is.
+    let stdin = child.stdin.take();
+    let out = child.wait_with_output().unwrap();
+    drop(stdin);
+    out.stdout.iter().copied().filter(|b| *b != b'\r').collect()
+}
 
 pub fn temp_home(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()

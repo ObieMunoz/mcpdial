@@ -145,6 +145,32 @@ result is the server's object, base64 included; with `--json --save-dir DIR` eac
 block's `data` (or an embedded resource's `blob`) is replaced by `"path"` and a `"bytes"`
 count, so the object is small and the file is where it says.
 
+## Progress and server logs
+
+A tool call that runs for minutes is silent unless the server is asked to speak on
+the way. Two notifications carry that, and neither can move what stdout holds:
+
+- **Progress.** `--progress` prints one line on stderr for every
+  `notifications/progress` the server sends during a `call`, `prompt` or `read`,
+  wherever stderr goes, so a captured log holds them: `progress: 3/10 fetching page
+  3`. Without the flag only a person at a terminal is shown anything, as one
+  updating line, and a pipe gets nothing.
+- **Server logs.** A `notifications/message` at `warning` or above prints on stderr
+  as `server [warning] <logger>: <text>`. `--log-level LEVEL` moves that line, and
+  takes one of the eight RFC 5424 names (`debug`, `info`, `notice`, `warning`,
+  `error`, `critical`, `alert`, `emergency`); a server that advertises the `logging`
+  capability is also sent `logging/setLevel` so it need not send what would only be
+  filtered here.
+
+With `--json`, both print as one object per line on stderr,
+`{"notification":{"method":"notifications/progress","params":{...}}}`, so stdout
+stays the result and stderr stays parseable.
+
+A `progressToken` is sent only when there is somewhere for the answer to go:
+`--progress`, or a terminal. A run that nobody is watching asks the server for no
+progress at all, so nothing changes for it. In `shell` the same rules apply per
+command.
+
 ## Resources and prompts
 
 Tools are one third of MCP. `mcpdial info TARGET --json` reports which of the three a
