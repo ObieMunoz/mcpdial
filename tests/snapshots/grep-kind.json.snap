@@ -1,0 +1,16 @@
+$ mcpdial --json grep readme web --resources
+exit 0
+--- stdout
+{
+  "matches": [
+    {
+      "server": "web",
+      "kind": "resource",
+      "name": "file:///readme.md",
+      "description": "The project readme.",
+      "matched": "uri"
+    }
+  ],
+  "skipped": []
+}
+--- stderr

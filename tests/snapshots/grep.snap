@@ -1,0 +1,12 @@
+$ mcpdial grep numbers
+exit 0
+--- stdout
+cat
+  tool  add  Add two numbers.
+imported
+  tool  add  Add two numbers.
+slow
+  tool  add  Add two numbers.
+web
+  tool  add  Add two numbers.
+--- stderr

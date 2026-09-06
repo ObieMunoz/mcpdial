@@ -1,0 +1,6 @@
+$ mcpdial grep readme web --resources
+exit 0
+--- stdout
+web
+  resource  file:///readme.md  The project readme.
+--- stderr

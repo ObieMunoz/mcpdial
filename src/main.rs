@@ -32,6 +32,7 @@ mod brief;
 mod browse;
 mod complete;
 mod env_defaults;
+mod grep;
 mod notices;
 mod output;
 mod present;
@@ -360,6 +361,8 @@ enum Cmd {
         #[arg(long, requires = "check")]
         strict: bool,
     },
+    /// Search tools, resources, prompts and instructions across saved servers
+    Grep(grep::Flags),
     /// Initialize and show server identity and capabilities
     Info {
         #[arg(help = TARGET_HELP)]
@@ -2932,6 +2935,8 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             }
             Ok(0)
         }
+
+        Cmd::Grep(flags) => grep::run(ui, &store, &opts, cli.json, flags),
 
         Cmd::Info { target } => {
             let conn = dial(&store, &opts, &target)?;

@@ -1,0 +1,8 @@
+$ mcpdial --json grep nothing-here web
+exit 1
+--- stdout
+{
+  "matches": [],
+  "skipped": []
+}
+--- stderr
