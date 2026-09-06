@@ -94,6 +94,11 @@ struct Cli {
     #[arg(long, global = true)]
     no_pager: bool,
 
+    /// Print a server's text as it was written instead of rendering its
+    /// markdown, for copying it out of the terminal
+    #[arg(long, global = true)]
+    raw: bool,
+
     /// Colour the terminal output: `always` (for `less -R`), `never`, or `auto`
     /// (at a terminal, unless NO_COLOR is set)
     #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]

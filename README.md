@@ -178,7 +178,8 @@ notification a server sends during a call, `--log-level LEVEL` to move the line 
 server's own log messages print from, `--max-chars N` (or `MCPDIAL_MAX_CHARS=N`) and
 `--output FILE` (`-o`) to keep a large result out of a context window, `--plain` (or
 `MCPDIAL_PLAIN=1`) to print at a terminal exactly what a pipe would get, `--no-pager`
-to print long output straight to the terminal, and `--color always|never|auto` to say
+to print long output straight to the terminal, `--raw` to print a server's text as it
+was written instead of rendering its markdown, and `--color always|never|auto` to say
 when to colour: `auto`, the default, colours at a terminal unless `NO_COLOR` is set,
 and `always` colours into a pipe for `less -R`.
 
@@ -214,6 +215,14 @@ nothing more, because an escape sequence sent where it is not understood spills 
 base64 across the screen. The placeholder line stays either way, `--save-dir` still
 names the file it wrote in it, and a pipe, `--json` and `--plain` print what they
 always have.
+
+Most tool results are markdown, so at a terminal the text `call` and `prompt` print
+is rendered rather than shown with its asterisks and pipes: headings in bold, lists
+as bullets, tables in a box, code in a dim block. Only a block that says it is
+markdown - a heading, a list item, a fenced code block, a table row or a block quote
+in its first lines - is rendered, so a one-line answer is never touched, and the
+rendering keeps every line break a server sent, wrapping only a line wider than the
+screen. `--raw` prints the markdown as it was written, for copying it back out.
 
 At a terminal, the output of `call`, `read`, `prompt`, `raw`, `schema`, `tools
 --long` and `info` goes through a pager when it is taller than the screen, as

@@ -44,6 +44,9 @@ Global options:
       --no-pager
           Print long output straight to the terminal instead of through a pager (MCPDIAL_PAGER= does the same everywhere)
 
+      --raw
+          Print a server's text as it was written instead of rendering its markdown, for copying it out of the terminal
+
       --color <WHEN>
           Colour the terminal output: `always` (for `less -R`), `never`, or `auto` (at a terminal, unless NO_COLOR is set)
 

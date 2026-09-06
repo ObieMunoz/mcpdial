@@ -21,6 +21,8 @@ use style::ColorMode;
 mod image;
 #[cfg(feature = "rich")]
 mod json;
+#[cfg(feature = "rich")]
+mod markdown;
 pub mod style;
 
 /// Set (to anything but `0`) to get what a pipe would get, even at a terminal.
@@ -265,6 +267,7 @@ fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
         color_out: style::color_enabled(cli.color, true),
         color_err: style::color_enabled(cli.color, stderr_is_terminal),
         image: image::protocol(|name| std::env::var(name).ok()),
+        markdown: !cli.raw,
         ..Rich::default()
     })
 }
@@ -366,6 +369,9 @@ pub struct Rich {
     drawings: std::cell::RefCell<Vec<(String, String)>>,
     /// Whether the section since `page_start` has an image in it.
     drew: std::cell::Cell<bool>,
+    /// Whether a server's markdown is rendered rather than shown as written;
+    /// `--raw` is what turns it off.
+    markdown: bool,
     /// What the section since `page_start` has printed, until `page_end`
     /// decides where it goes.
     page: std::cell::RefCell<Option<Vec<u8>>>,
@@ -445,11 +451,25 @@ impl Presenter for Rich {
     /// are shown as escapes: a server that lists `\r` among its valid keys
     /// otherwise overwrites the start of its own error message. Newlines and
     /// tabs are the text's own layout and stay. Text that is a pretty-printed
-    /// JSON document, as `structuredContent` is rendered, is coloured like one.
+    /// JSON document, as `structuredContent` is rendered, is coloured like one;
+    /// text that was written as markdown is rendered as markdown, which is what
+    /// most tool results are.
     fn text(&self, text: &str) {
-        match self.highlighted(text) {
-            Some(painted) => self.line(&painted),
-            None => self.line(&self.shown(text)),
+        if let Some(painted) = self.highlighted(text) {
+            return self.line(&painted);
+        }
+        // A result carrying an image goes out as it is: `shown` splices the
+        // drawing's own escape sequence in, and rendering markdown over that
+        // would mangle it. Otherwise the escaping comes first, so that markdown
+        // never carries an escape sequence of the server's own to the terminal.
+        let drawing_pending = !self.drawings.borrow().is_empty();
+        let shown = self.shown(text);
+        if drawing_pending {
+            return self.line(&shown);
+        }
+        match self.markdown(&shown) {
+            Some(rendered) => self.out(&rendered),
+            None => self.line(&shown),
         }
     }
 
@@ -524,6 +544,19 @@ impl Rich {
     /// pretty-printed JSON document; `None` says to print it as it is.
     fn highlighted(&self, text: &str) -> Option<String> {
         self.color_out.then(|| json::highlighted(text)).flatten()
+    }
+
+    /// `text` rendered when it was written as markdown and `--raw` did not ask
+    /// for it as it came; `None` says to print it as it is. The rendering ends
+    /// in its own newline, so it goes out through `out` rather than `line`.
+    fn markdown(&self, text: &str) -> Option<String> {
+        (self.markdown && markdown::looks_like(text)).then(|| {
+            markdown::rendered(
+                text,
+                &markdown::skin(self.color_out),
+                screen().map(|s| s.cols),
+            )
+        })
     }
 
     /// A table whose STATUS column, when it has one, is coloured by what each
@@ -1102,6 +1135,35 @@ mod tests {
         assert!(shell_command("bat -p").is_none());
         assert!(shell_command("sed s/a/b/ | less").is_some());
         assert!(shell_command("less --pattern='x'").is_some());
+    }
+
+    /// What `text` put on stdout, taken from the page rather than the terminal.
+    /// Every line here is short enough that no screen width wraps it.
+    #[cfg(feature = "rich")]
+    fn shown(rich: &Rich, text: &str) -> String {
+        rich.page_start();
+        rich.text(text);
+        String::from_utf8(rich.page.borrow_mut().take().unwrap_or_default())
+            .expect("the presenter writes UTF-8")
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn markdown_is_rendered_and_anything_else_reaches_the_terminal_as_it_came() {
+        let rich = Rich {
+            markdown: true,
+            ..Default::default()
+        };
+        assert_eq!(shown(&rich, "# T\n- one"), "T\n• one\n");
+        assert_eq!(shown(&rich, "one\ntwo\r"), "one\ntwo\\r\n");
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({"a": 1})).unwrap();
+        assert_eq!(shown(&rich, &pretty), "{\n  \"a\": 1\n}\n");
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn raw_prints_the_markdown_a_server_sent() {
+        assert_eq!(shown(&Rich::default(), "# T\n- one"), "# T\n- one\n");
     }
 
     #[cfg(feature = "rich")]
