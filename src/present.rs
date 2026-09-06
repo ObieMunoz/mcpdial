@@ -15,6 +15,11 @@ use mcpdial::Error;
 use serde_json::Value;
 use std::io::Write;
 
+#[cfg(feature = "rich")]
+mod json;
+#[cfg(feature = "rich")]
+mod style;
+
 /// Set (to anything but `0`) to get what a pipe would get, even at a terminal.
 pub const ENV_PLAIN: &str = "MCPDIAL_PLAIN";
 
@@ -291,12 +296,25 @@ impl Presenter for Rich {
         Plain.bytes(bytes)
     }
 
+    /// A pretty-printed document gets its keys, strings, numbers, booleans and
+    /// null in colour; the layout is untouched.
+    fn json(&self, text: &str) {
+        match self.highlighted(text) {
+            Some(painted) => self.line(&painted),
+            None => self.line(text),
+        }
+    }
+
     /// The control characters that move the cursor or open an escape sequence
     /// are shown as escapes: a server that lists `\r` among its valid keys
     /// otherwise overwrites the start of its own error message. Newlines and
-    /// tabs are the text's own layout and stay.
+    /// tabs are the text's own layout and stay. Text that is a pretty-printed
+    /// JSON document, as `structuredContent` is rendered, is coloured like one.
     fn text(&self, text: &str) {
-        self.line(&visible(text));
+        match self.highlighted(text) {
+            Some(painted) => self.line(&painted),
+            None => self.line(&visible(text)),
+        }
     }
 
     /// Base64 is no use to anyone reading it and raw bytes corrupt a terminal,
@@ -323,6 +341,15 @@ impl Presenter for Rich {
         if self.progressing.replace(false) {
             self.err_line("");
         }
+    }
+}
+
+#[cfg(feature = "rich")]
+impl Rich {
+    /// `text` in colour when colour is wanted and the text is a pretty-printed
+    /// JSON document; `None` says to print it as it is.
+    fn highlighted(&self, text: &str) -> Option<String> {
+        style::wanted().then(|| json::highlighted(text)).flatten()
     }
 }
 
