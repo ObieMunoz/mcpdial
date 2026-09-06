@@ -8,9 +8,10 @@ use mcpdial::registry::{Pick, Registry, Resolved};
 use mcpdial::serve;
 use mcpdial::session::{
     extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
-    Media, MediaSink, ResourceBody,
+    Media, MediaSink,
 };
 use mcpdial::{daemon, oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
+use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -20,6 +21,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod args;
+mod present;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
 const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
@@ -57,6 +59,10 @@ struct Cli {
     /// Emit JSON instead of a readable summary
     #[arg(long, global = true)]
     json: bool,
+
+    /// Print what a pipe would get, even at a terminal (MCPDIAL_PLAIN=1 does the same)
+    #[arg(long, global = true)]
+    plain: bool,
 
     /// Trace every message on stderr (and pass a stdio server's stderr through)
     #[arg(short, long, global = true)]
@@ -390,14 +396,15 @@ enum TokenCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let ui = <dyn Presenter>::choose(&cli);
     let json = cli.json;
-    match run(cli) {
+    match run(ui.as_ref(), cli) {
         Ok(code) => ExitCode::from(code),
         Err(f) => {
             if json {
-                eprintln!("{}", f.to_json());
+                ui.err_line(&f.to_json().to_string());
             } else {
-                f.eprint();
+                f.report(ui.as_ref());
             }
             ExitCode::from(match f.error {
                 Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
@@ -426,11 +433,8 @@ impl Failure {
         }
     }
 
-    fn eprint(&self) {
-        eprintln!("error: {}", self.error);
-        if let Some(hint) = &self.hint {
-            eprintln!("{hint}");
-        }
+    fn report(&self, ui: &dyn Presenter) {
+        ui.error(&self.error.to_string(), self.hint.as_deref());
     }
 
     fn to_json(&self) -> Value {
@@ -465,28 +469,25 @@ fn refuse_denied(cfg: &ServerConfig, name: &str, tool: &str) -> Result<(), Failu
     })
 }
 
-fn print_json(v: &impl serde::Serialize) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(v).expect("a JSON value is serializable")
-    );
+fn print_json(ui: &dyn Presenter, v: &impl serde::Serialize) {
+    ui.json(&serde_json::to_string_pretty(v).expect("a JSON value is serializable"));
 }
 
-fn print_value(v: &Value, compact: bool) {
+fn print_value(ui: &dyn Presenter, v: &Value, compact: bool) {
     if compact {
-        println!("{v}");
+        ui.json(&v.to_string());
     } else {
-        print_json(v);
+        print_json(ui, v);
     }
 }
 
 /// A hint on stderr: prose for a human, `{"hint": ...}` under `--json`, where
 /// every line on either stream has to be an object.
-fn print_hint(hint: &str, json: bool) {
+fn print_hint(ui: &dyn Presenter, hint: &str, json: bool) {
     if json {
-        eprintln!("{}", json!({ "hint": hint }));
+        ui.err_line(&json!({ "hint": hint }).to_string());
     } else {
-        eprintln!("{hint}");
+        ui.err_line(hint);
     }
 }
 
@@ -494,16 +495,22 @@ fn print_hint(hint: &str, json: bool) {
 /// error: a failure whose text is a plain sentence otherwise reads as success
 /// to anyone not checking `$?`. Under `--json` the object carries `isError`
 /// itself. Returns whether the tool reported an error.
-fn print_tool_result(result: &Value, text: &str, json: bool, one_line: bool) -> bool {
+fn print_tool_result(
+    ui: &dyn Presenter,
+    result: &Value,
+    text: &str,
+    json: bool,
+    one_line: bool,
+) -> bool {
     let failed = result["isError"].as_bool().unwrap_or(false);
     if json {
-        print_value(result, one_line);
+        print_value(ui, result, one_line);
     } else {
         if !text.is_empty() {
-            print_text(text);
+            ui.text(text);
         }
         if failed {
-            eprintln!("(tool reported an error)");
+            ui.err_line("(tool reported an error)");
         }
     }
     failed
@@ -559,7 +566,12 @@ fn from_registry(
 
 /// The config a catalog entry describes, from the freshest catalog at hand. A
 /// registry entry goes through the registry exactly as `--registry` would.
-fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Failure> {
+fn from_catalog(
+    ui: &dyn Presenter,
+    store: &Store,
+    opts: &Options,
+    id: &str,
+) -> Result<Resolved, Failure> {
     let loaded = catalog::load(
         store,
         &catalog::Source::from_env(),
@@ -568,7 +580,7 @@ fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Fai
         &opts.user_agent,
     )?;
     if opts.verbose {
-        eprintln!("catalog: {}", loaded.origin);
+        ui.err_line(&format!("catalog: {}", loaded.origin));
     }
     let Some(entry) = catalog::find(&loaded.entries, id) else {
         let ids = loaded.entries.iter().map(|e| e.id.as_str());
@@ -596,45 +608,6 @@ fn from_catalog(store: &Store, opts: &Options, id: &str) -> Result<Resolved, Fai
         ));
     }
     Ok(resolved)
-}
-
-/// The catalog as a person reads it: one block per category, one line per entry.
-fn print_catalog(entries: &[catalog::Entry]) {
-    let width = |pick: fn(&catalog::Entry) -> &str| {
-        entries
-            .iter()
-            .map(|e| pick(e).chars().count())
-            .max()
-            .unwrap_or(0)
-    };
-    let (id_w, name_w) = (width(|e| &e.id), width(|e| &e.name));
-    for (i, (category, group)) in catalog::grouped(entries).iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        println!("{category}");
-        for e in group {
-            println!(
-                "  {:<id_w$}  {:<name_w$}  {:<5}  {:<7}  {}",
-                e.id,
-                e.name,
-                e.transport.as_str(),
-                e.auth.as_str(),
-                e.summary
-            );
-        }
-    }
-}
-
-/// A note on stderr: `note:` before the first line, the rest indented under it.
-fn print_note(note: &str) {
-    let mut lines = note.lines();
-    if let Some(first) = lines.next() {
-        eprintln!("note: {first}");
-    }
-    for line in lines {
-        eprintln!("      {line}");
-    }
 }
 
 fn credential_key(store: &Store, target: String) -> String {
@@ -686,7 +659,7 @@ fn error_json(e: &Error) -> Value {
 
 /// A secret from `$VAR`, or from stdin. Never from an argument, where `ps` and the
 /// shell history would both keep a copy.
-fn read_secret(env: Option<&str>, what: &str) -> Result<String, Error> {
+fn read_secret(ui: &dyn Presenter, env: Option<&str>, what: &str) -> Result<String, Error> {
     if let Some(var) = env {
         return std::env::var(var)
             .ok()
@@ -695,8 +668,7 @@ fn read_secret(env: Option<&str>, what: &str) -> Result<String, Error> {
     }
     let mut stdin = std::io::stdin();
     if stdin.is_terminal() {
-        eprint!("paste the {what} and press enter: ");
-        std::io::stderr().flush().ok();
+        ui.err(&format!("paste the {what} and press enter: "));
     }
     let mut buf = String::new();
     stdin
@@ -955,34 +927,6 @@ fn missing_capability(e: Error, capability: &str, info_cmd: &str) -> Failure {
     }
 }
 
-/// Rendered tool or prompt text on stdout. On a terminal the control characters
-/// that move the cursor or open an escape sequence are shown as escapes instead:
-/// a server that lists `\r` among its valid keys otherwise overwrites the start
-/// of its own error message. Newlines and tabs are the text's own layout and
-/// stay. A pipe gets the text as the server sent it.
-fn print_text(text: &str) {
-    if std::io::stdout().is_terminal() {
-        println!("{}", visible(text));
-    } else {
-        println!("{text}");
-    }
-}
-
-fn visible(text: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '\n' | '\t' => out.push(c),
-            '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
-            c if c.is_control() => write!(out, "\\x{:02x}", c as u32).unwrap(),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 fn advertises(server_info: &Value, capability: &str) -> bool {
     server_info["capabilities"].get(capability).is_some()
 }
@@ -1097,6 +1041,7 @@ fn rendered(
 /// A `prompts/get` result on stdout: the object under `--json`, the messages
 /// otherwise.
 fn emit(
+    ui: &dyn Presenter,
     result: &mut Value,
     json: bool,
     compact: bool,
@@ -1105,17 +1050,18 @@ fn emit(
 ) -> Result<(), Failure> {
     let text = rendered(result, json, files, render)?;
     if json {
-        print_value(result, compact);
+        print_value(ui, result, compact);
     } else if !text.is_empty() {
-        print_text(&text);
+        ui.text(&text);
     }
     Ok(())
 }
 
 /// A `resources/read` result on stdout: the object under `--json`; with a
 /// `--save-dir`, its text and a line per blob filed there; otherwise the bytes
-/// themselves, which is [`write_resource`]'s business.
+/// themselves, which is the presenter's business.
 fn emit_resource(
+    ui: &dyn Presenter,
     result: &mut Value,
     json: bool,
     compact: bool,
@@ -1127,39 +1073,12 @@ fn emit_resource(
         if files.saves() {
             save_media(result, &mut sink)?;
         }
-        print_value(result, compact);
+        print_value(ui, result, compact);
     } else if files.saves() {
-        print!("{}", render_resource(result, &mut sink)?);
+        ui.out(&render_resource(result, &mut sink)?);
     } else {
-        write_resource(&resource_bodies(result)?, redirect)?;
+        ui.resource(&resource_bodies(result)?, redirect)?;
     }
-    Ok(())
-}
-
-/// A resource on stdout, byte for byte. Base64 is no use to anyone reading it and
-/// raw bytes corrupt a terminal, so binary asks for a redirect rather than picking
-/// one of those two ways to be useless.
-fn write_resource(bodies: &[ResourceBody], redirect: &str) -> Result<(), Failure> {
-    let stdout = std::io::stdout();
-    let binary = bodies.iter().any(|b| matches!(b, ResourceBody::Bytes(_)));
-    if binary && stdout.is_terminal() {
-        return Err(Failure::hinted(
-            Error::usage("this resource is binary and stdout is a terminal"),
-            format!(
-                "send it somewhere it can land: {redirect} > file, or {redirect} --save-dir DIR"
-            ),
-        ));
-    }
-    let mut out = stdout.lock();
-    for body in bodies {
-        let bytes = match body {
-            ResourceBody::Text(t) => t.as_bytes(),
-            ResourceBody::Bytes(b) => b.as_slice(),
-        };
-        out.write_all(bytes)
-            .map_err(|e| Failure::from(Error::transport(format!("writing to stdout: {e}"))))?;
-    }
-    out.flush().ok();
     Ok(())
 }
 
@@ -1402,12 +1321,11 @@ impl Input {
     }
 
     /// The next line, or `None` when the session should end.
-    fn next(&mut self) -> Result<Option<String>, Error> {
+    fn next(&mut self, ui: &dyn Presenter) -> Result<Option<String>, Error> {
         match self {
             Input::Pipe { stdin, prompt } => {
-                if let Some(p) = prompt {
-                    eprint!("{p}");
-                    std::io::stderr().flush().ok();
+                if let Some(prompt) = prompt {
+                    ui.err(prompt);
                 }
                 let mut line = String::new();
                 match stdin
@@ -1439,7 +1357,7 @@ impl Input {
                         if *interrupts > 1 {
                             return Ok(None);
                         }
-                        eprintln!("(^C again, or `quit`, to exit)");
+                        ui.err_line("(^C again, or `quit`, to exit)");
                     }
                     Err(rustyline::error::ReadlineError::Eof) => return Ok(None),
                     Err(e) => return Err(Error::usage(e.to_string())),
@@ -1483,7 +1401,7 @@ fn shell_tools<'a>(
         .as_slice()
 }
 
-fn run(cli: Cli) -> Result<u8, Failure> {
+fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
     let store = Store::from_env()?;
     let opts = Options {
         timeout: cli
@@ -1535,7 +1453,8 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let mut notes = Vec::new();
             let mut cfg = match (http, stdio, registry) {
                 (None, None, None) if catalog.is_some() => {
-                    let resolved = from_catalog(&store, &opts, catalog.as_deref().unwrap_or(""))?;
+                    let resolved =
+                        from_catalog(ui, &store, &opts, catalog.as_deref().unwrap_or(""))?;
                     notes = resolved.notes;
                     resolved.config
                 }
@@ -1619,17 +1538,17 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 for (list, patterns) in &lists {
                     saved[list] = json!(patterns);
                 }
-                println!("{}", json!({ "saved": saved }));
+                print_value(ui, &json!({ "saved": saved }), true);
             } else {
-                eprintln!("saved {name} ({summary})");
+                ui.err_line(&format!("saved {name} ({summary})"));
                 for line in tool_lists_lines(&lists) {
-                    eprintln!("  {line}");
+                    ui.err_line(&format!("  {line}"));
                 }
                 for note in &notes {
-                    print_note(note);
+                    ui.note(note);
                 }
                 if let Some(row) = &row {
-                    print_table(&LISTING_HEADERS, &[listing_row(row)]);
+                    ui.table(&LISTING_HEADERS, &[listing_row(row)]);
                 }
             }
             Ok(0)
@@ -1648,7 +1567,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let changing = !allow.is_empty() || !deny.is_empty() || clear_allow || clear_deny;
             if !changing {
                 if cli.json {
-                    print_json(&json!({ "name": name, "allow": cfg.allow, "deny": cfg.deny }));
+                    print_json(
+                        ui,
+                        &json!({ "name": name, "allow": cfg.allow, "deny": cfg.deny }),
+                    );
                 } else {
                     let or = |patterns: &[String], none: &str| {
                         if patterns.is_empty() {
@@ -1657,9 +1579,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             patterns.join(", ")
                         }
                     };
-                    println!("{name}");
-                    println!("  allow: {}", or(&cfg.allow, "(every tool not denied)"));
-                    println!("  deny:  {}", or(&cfg.deny, "(none)"));
+                    ui.line(&name);
+                    ui.line(&format!(
+                        "  allow: {}",
+                        or(&cfg.allow, "(every tool not denied)")
+                    ));
+                    ui.line(&format!("  deny:  {}", or(&cfg.deny, "(none)")));
                 }
                 return Ok(0);
             }
@@ -1683,11 +1608,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let lines = tool_lists_lines(&tool_lists(&cfg));
             store.add_server(&name, cfg)?;
             if cli.json {
-                println!("{}", json!({ "saved": saved }));
+                print_value(ui, &json!({ "saved": saved }), true);
             } else {
-                eprintln!("saved {name} ({summary})");
+                ui.err_line(&format!("saved {name} ({summary})"));
                 for line in lines {
-                    eprintln!("  {line}");
+                    ui.err_line(&format!("  {line}"));
                 }
             }
             Ok(0)
@@ -1712,21 +1637,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 _ => mcpdial::registry::Sync::Auto,
             };
             let registry = Registry::from_env(opts.timeout_or_default(), &opts.user_agent);
-            let at_terminal = std::io::stderr().is_terminal();
-            let mut counting = false;
-            let mut progress = |n: usize| {
-                if at_terminal {
-                    eprint!("\rfetching the registry: {n} servers");
-                    counting = true;
-                }
-            };
+            let mut progress =
+                |n: usize| ui.progress(&format!("fetching the registry: {n} servers"));
             let indexed = mcpdial::registry::index(&store, &registry, sync, &mut progress);
-            if counting {
-                eprintln!();
-            }
+            ui.progress_end();
             let (index, note) = indexed?;
             if let Some(note) = note {
-                print_note(&note);
+                ui.note(&note);
             }
             let loaded = catalog::load(
                 &store,
@@ -1736,7 +1653,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 &opts.user_agent,
             )?;
             if opts.verbose {
-                eprintln!("catalog: {}", loaded.origin);
+                ui.err_line(&format!("catalog: {}", loaded.origin));
             }
             let catalog: Vec<String> = loaded
                 .entries
@@ -1746,15 +1663,15 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let hits = mcpdial::search::rank(&query, &index.servers, &catalog);
             if hits.is_empty() {
                 if cli.json {
-                    print_json(&hits);
+                    print_json(ui, &hits);
                 } else {
-                    eprintln!("no registry entry matches {query:?}");
+                    ui.err_line(&format!("no registry entry matches {query:?}"));
                 }
                 return Ok(EXIT_ERROR);
             }
             let shown: Vec<&Value> = hits.iter().copied().take(limit).collect();
             if cli.json {
-                print_json(&shown);
+                print_json(ui, &shown);
                 return Ok(0);
             }
             let rows: Vec<Vec<String>> = shown
@@ -1779,13 +1696,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     ]
                 })
                 .collect();
-            print_table(&["NAME", "TRANSPORTS", "SOURCE", "DESCRIPTION"], &rows);
+            ui.table(&["NAME", "TRANSPORTS", "SOURCE", "DESCRIPTION"], &rows);
             if hits.len() > shown.len() {
-                eprintln!(
+                ui.err_line(&format!(
                     "{} of {} matches; --limit N shows more",
                     shown.len(),
                     hits.len()
-                );
+                ));
             }
             Ok(0)
         }
@@ -1811,7 +1728,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             // The running commentary is for a human; a program gets one object at the end.
             let say = |line: String| {
                 if !cli.json {
-                    eprintln!("{line}");
+                    ui.err_line(&line);
                 }
             };
             for path in &files {
@@ -1861,9 +1778,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 if !notes.is_empty() {
                     receipt["notes"] = json!(notes);
                 }
-                println!("{receipt}");
+                print_value(ui, &receipt, true);
             } else {
-                eprintln!("imported {} server(s)", imported.len());
+                ui.err_line(&format!("imported {} server(s)", imported.len()));
             }
             Ok(0)
         }
@@ -1874,12 +1791,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let si = &conn.server_info["serverInfo"];
             let interactive = std::io::stdin().is_terminal();
             if interactive {
-                eprintln!(
+                ui.err_line(&format!(
                     "connected to {} {}",
                     si["name"].as_str().unwrap_or("?"),
                     si["version"].as_str().unwrap_or("")
-                );
-                eprintln!("{SHELL_SUMMARY}");
+                ));
+                ui.err_line(SHELL_SUMMARY);
             }
             // A saved server is prompted by its own name. An ad-hoc target is a
             // whole URL or command line, which makes a prompt that wraps the
@@ -1915,7 +1832,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 );
             }
             let info_cmd = "`info`";
-            while let Some(raw) = input.next()? {
+            while let Some(raw) = input.next(ui)? {
                 let text = raw.trim();
                 if text.is_empty() || text.starts_with('#') {
                     continue;
@@ -1926,7 +1843,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 let outcome: Result<(), Failure> = match word {
                     "quit" | "exit" => break,
                     "help" if rest.is_empty() => {
-                        eprintln!("{SHELL_HELP}");
+                        ui.err_line(SHELL_HELP);
                         Ok(())
                     }
                     "help" => match refuse_denied(&r.config, &r.name, rest) {
@@ -1935,7 +1852,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             let tools = shell_tools(&mut cache, &mut conn);
                             match find_tool(tools, rest) {
                                 Some(t) => {
-                                    eprintln!("{}", tool_usage(t, "call", ""));
+                                    ui.err_line(&tool_usage(t, "call", ""));
                                     Ok(())
                                 }
                                 None => Err(no_such_tool(tools, rest)),
@@ -1952,7 +1869,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             let tools = shell_tools(&mut cache, &mut conn);
                             match find_tool(tools, rest) {
                                 Some(t) => {
-                                    print_value(t, cli.json);
+                                    print_value(ui, t, cli.json);
                                     Ok(())
                                 }
                                 None => Err(no_such_tool(tools, rest)),
@@ -1960,15 +1877,15 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         }
                     },
                     "info" => {
-                        print_value(&conn.server_info, cli.json);
+                        print_value(ui, &conn.server_info, cli.json);
                         Ok(())
                     }
                     "tools" => conn.list_tools().map_err(Failure::from).map(|tools| {
                         if cli.json {
-                            println!("{}", json!({ "tools": tools }));
+                            print_value(ui, &json!({ "tools": tools }), true);
                         } else {
-                            println!("{} tool(s):", tools.len());
-                            print_tools(&tools, long);
+                            ui.line(&format!("{} tool(s):", tools.len()));
+                            print_tools(ui, &tools, long);
                         }
                         cache = Some(tools);
                     }),
@@ -1978,16 +1895,16 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             let templates =
                                 conn.session.list_resource_templates().unwrap_or_default();
                             if cli.json {
-                                println!(
+                                ui.line(&format!(
                                     "{}",
                                     json!({"resources": found, "resourceTemplates": templates})
-                                );
+                                ));
                             } else {
-                                println!("{} resource(s):", found.len());
-                                print_resources(&found, long);
+                                ui.line(&format!("{} resource(s):", found.len()));
+                                ui.resources(&found, long);
                                 if !templates.is_empty() {
-                                    println!("\n{} template(s):", templates.len());
-                                    print_resources(&templates, long);
+                                    ui.line(&format!("\n{} template(s):", templates.len()));
+                                    ui.resources(&templates, long);
                                 }
                             }
                             resources = Some(found);
@@ -2006,17 +1923,17 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 dir: save_dir,
                                 stem: resource_stem(rest),
                             };
-                            emit_resource(&mut result, cli.json, true, &files, &redirect)
+                            emit_resource(ui, &mut result, cli.json, true, &files, &redirect)
                         }
                     },
                     "prompts" => match conn.session.list_prompts() {
                         Err(e) => Err(missing_capability(e, "prompts", info_cmd)),
                         Ok(found) => {
                             if cli.json {
-                                println!("{}", json!({ "prompts": found }));
+                                print_value(ui, &json!({ "prompts": found }), true);
                             } else {
-                                println!("{} prompt(s):", found.len());
-                                print_prompts(&found, long);
+                                ui.line(&format!("{} prompt(s):", found.len()));
+                                print_prompts(ui, &found, long);
                             }
                             prompts = Some(found);
                             Ok(())
@@ -2038,7 +1955,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                         dir: save_dir,
                                         stem: file_stem(name),
                                     };
-                                    emit(&mut result, cli.json, true, &files, render_messages)
+                                    emit(ui, &mut result, cli.json, true, &files, render_messages)
                                 })
                         }
                     }
@@ -2074,7 +1991,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                         rendered(&mut result, cli.json, &files, render_content).map(
                                             |out| {
                                                 let failed = print_tool_result(
-                                                    &result, &out, cli.json, true,
+                                                    ui, &result, &out, cli.json, true,
                                                 );
                                                 if failed {
                                                     let argument_error =
@@ -2085,7 +2002,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                                         tool,
                                                         argument_error,
                                                     ) {
-                                                        print_hint(&hint, cli.json);
+                                                        print_hint(ui, &hint, cli.json);
                                                     }
                                                 }
                                             },
@@ -2123,7 +2040,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             parse_object(params, "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
                                 .map_err(Failure::from)
-                                .map(|result| print_value(&result, cli.json))
+                                .map(|result| print_value(ui, &result, cli.json))
                         }
                     }
                     // Only reachable when line editing is off, since a terminal
@@ -2168,9 +2085,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 if let Err(f) = outcome {
                     failures += 1;
                     if cli.json {
-                        println!("{}", f.to_json());
+                        print_value(ui, &f.to_json(), true);
                     } else {
-                        f.eprint();
+                        f.report(ui);
                     }
                 }
             }
@@ -2186,19 +2103,22 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let idle = idle_duration(idle)?;
             let pid = daemon::start(&store, &name, idle, &opts)?;
             if cli.json {
-                print_json(&json!({
-                    "name": name, "pid": pid,
-                    "socket": daemon::socket_path(&store, &name),
-                }));
+                print_json(
+                    ui,
+                    &json!({
+                        "name": name, "pid": pid,
+                        "socket": daemon::socket_path(&store, &name),
+                    }),
+                );
             } else {
-                eprintln!("started {name} (pid {pid})");
+                ui.err_line(&format!("started {name} (pid {pid})"));
             }
             Ok(0)
         }
 
         Cmd::Stop { name } => {
             daemon::stop(&store, &name, &opts)?;
-            eprintln!("stopped {name}");
+            ui.err_line(&format!("stopped {name}"));
             Ok(0)
         }
 
@@ -2210,7 +2130,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             match daemon::serve(&store, &name, &opts, idle) {
                 Ok(()) => Ok(0),
                 Err(e) => {
-                    println!("{}", error_json(&e));
+                    print_value(ui, &error_json(&e), true);
                     Ok(EXIT_ERROR)
                 }
             }
@@ -2234,9 +2154,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                     tool: None,
                 });
             };
-            print_json(t);
+            print_json(ui, t);
             if t.get("outputSchema").is_some() {
-                eprintln!("this tool declares an outputSchema: results carry structuredContent");
+                ui.err_line("this tool declares an outputSchema: results carry structuredContent");
             }
             Ok(0)
         }
@@ -2251,13 +2171,16 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             // none of them must not turn the whole listing into an error.
             let templates = conn.session.list_resource_templates().unwrap_or_default();
             if cli.json {
-                print_json(&json!({ "resources": resources, "resourceTemplates": templates }));
+                print_json(
+                    ui,
+                    &json!({ "resources": resources, "resourceTemplates": templates }),
+                );
             } else {
-                println!("{} resource(s):\n", resources.len());
-                print_resources(&resources, long);
+                ui.line(&format!("{} resource(s):\n", resources.len()));
+                ui.resources(&resources, long);
                 if !templates.is_empty() {
-                    println!("\n{} template(s):\n", templates.len());
-                    print_resources(&templates, long);
+                    ui.line(&format!("\n{} template(s):\n", templates.len()));
+                    ui.resources(&templates, long);
                 }
             }
             Ok(0)
@@ -2274,7 +2197,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: resource_stem(&uri),
             };
-            emit_resource(&mut result, cli.json, false, &files, &redirect)?;
+            emit_resource(ui, &mut result, cli.json, false, &files, &redirect)?;
             Ok(0)
         }
 
@@ -2285,10 +2208,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .list_prompts()
                 .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if cli.json {
-                print_json(&json!({ "prompts": prompts }));
+                print_json(ui, &json!({ "prompts": prompts }));
             } else {
-                println!("{} prompt(s):\n", prompts.len());
-                print_prompts(&prompts, long);
+                ui.line(&format!("{} prompt(s):\n", prompts.len()));
+                print_prompts(ui, &prompts, long);
             }
             Ok(0)
         }
@@ -2323,19 +2246,19 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
             if !cli.json {
                 if let Some(d) = result["description"].as_str() {
-                    eprintln!("{d}");
+                    ui.err_line(d);
                 }
             }
             let files = MediaFiles {
                 dir: save_dir,
                 stem: file_stem(&name),
             };
-            emit(&mut result, cli.json, false, &files, render_messages)?;
+            emit(ui, &mut result, cli.json, false, &files, render_messages)?;
             Ok(0)
         }
 
         Cmd::Guide => {
-            print!("{}", include_str!("../docs/AGENTS.md"));
+            ui.out(include_str!("../docs/AGENTS.md"));
             Ok(0)
         }
 
@@ -2348,13 +2271,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 &opts.user_agent,
             )?;
             if opts.verbose {
-                eprintln!("catalog: {}", loaded.origin);
+                ui.err_line(&format!("catalog: {}", loaded.origin));
             }
             if cli.json {
-                print_json(&loaded.entries);
+                print_json(ui, &loaded.entries);
             } else {
-                print_catalog(&loaded.entries);
-                eprintln!("\nadd one with: mcpdial add NAME --catalog ID");
+                ui.catalog(&loaded.entries);
+                ui.err_line("\nadd one with: mcpdial add NAME --catalog ID");
             }
             Ok(0)
         }
@@ -2369,9 +2292,9 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         Cmd::Rm { name } => {
             if store.remove_server(&name)? {
                 if cli.json {
-                    println!("{}", json!({ "removed": name }));
+                    print_value(ui, &json!({ "removed": name }), true);
                 } else {
-                    eprintln!("removed {name}");
+                    ui.err_line(&format!("removed {name}"));
                 }
                 Ok(0)
             } else {
@@ -2397,7 +2320,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             })
                         })
                         .collect();
-                    print_json(&rows);
+                    print_json(ui, &rows);
                 } else {
                     // A column earns its place only once a server has something for it.
                     let with_source = servers.values().any(|c| c.source.is_some());
@@ -2441,7 +2364,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             row
                         })
                         .collect();
-                    print_table(&headers, &rows);
+                    ui.table(&headers, &rows);
                 }
                 return Ok(0);
             }
@@ -2452,12 +2375,12 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             };
             let listing = client::listing(&store, &opts, freshness)?;
             if cli.json {
-                print_json(&listing);
+                print_json(ui, &listing);
             } else if listing.is_empty() {
-                eprintln!("{NO_SERVERS}");
+                ui.err_line(NO_SERVERS);
             } else {
                 let rows: Vec<Vec<String>> = listing.iter().map(listing_row).collect();
-                print_table(&LISTING_HEADERS, &rows);
+                ui.table(&LISTING_HEADERS, &rows);
             }
             Ok(0)
         }
@@ -2467,28 +2390,28 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         } => {
             let probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
-                print_json(&probes);
+                print_json(ui, &probes);
                 return Ok(0);
             }
             if probes.is_empty() {
-                eprintln!("{NO_SERVERS}");
+                ui.err_line(NO_SERVERS);
                 return Ok(0);
             }
             for (i, p) in probes.iter().enumerate() {
                 if i > 0 {
-                    println!();
+                    ui.line("");
                 }
                 match &p.tools {
                     Some(tools) => {
-                        println!(
+                        ui.line(&format!(
                             "## {}  {}  ({} tools)",
                             p.name,
                             p.server.as_deref().unwrap_or(""),
                             tools.len()
-                        );
-                        print_tools(tools, long);
+                        ));
+                        print_tools(ui, tools, long);
                     }
-                    None => println!(
+                    None => ui.line(&format!(
                         "## {}  {}{}",
                         p.name,
                         p.status.label(),
@@ -2496,7 +2419,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             .detail()
                             .map(|d| format!(": {}", truncate(d)))
                             .unwrap_or_default()
-                    ),
+                    )),
                 }
             }
             Ok(0)
@@ -2514,10 +2437,10 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 conn.list_tools()?
             };
             if cli.json {
-                print_json(&json!({ "tools": tools }));
+                print_json(ui, &json!({ "tools": tools }));
             } else {
-                println!("{} tool(s):\n", tools.len());
-                print_tools(&tools, long);
+                ui.line(&format!("{} tool(s):\n", tools.len()));
+                print_tools(ui, &tools, long);
             }
             Ok(0)
         }
@@ -2526,32 +2449,32 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let conn = dial(&store, &opts, &target)?;
             let init = &conn.server_info;
             if cli.json {
-                print_json(init);
+                print_json(ui, init);
             } else {
                 let si = &init["serverInfo"];
-                println!(
+                ui.line(&format!(
                     "{} {}",
                     si["name"].as_str().unwrap_or("?"),
                     si["version"].as_str().unwrap_or("")
-                );
-                println!(
+                ));
+                ui.line(&format!(
                     "protocol {}",
                     init["protocolVersion"].as_str().unwrap_or("?")
-                );
+                ));
                 let caps: Vec<&str> = init["capabilities"]
                     .as_object()
                     .map(|o| o.keys().map(String::as_str).collect())
                     .unwrap_or_default();
-                println!(
+                ui.line(&format!(
                     "capabilities: {}",
                     if caps.is_empty() {
                         "(none)".into()
                     } else {
                         caps.join(", ")
                     }
-                );
+                ));
                 if let Some(instr) = init["instructions"].as_str() {
-                    println!("\n{}", instr.trim());
+                    ui.line(&format!("\n{}", instr.trim()));
                 }
             }
             Ok(0)
@@ -2629,13 +2552,13 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 stem: file_stem(&tool),
             };
             let text = rendered(&mut result, cli.json, &files, render_content)?;
-            let is_error = print_tool_result(&result, &text, cli.json, false);
+            let is_error = print_tool_result(ui, &result, &text, cli.json, false);
             // A failed result that is really a schema complaint, or a server's way
             // of saying it has no such tool, gets the same answer as the JSON-RPC
             // error other servers would have sent.
             if is_error {
                 if let Some(hint) = hint(&mut conn, reads_as_argument_error(&text)) {
-                    print_hint(&hint, cli.json);
+                    print_hint(ui, &hint, cli.json);
                 }
             }
             Ok(if is_error { EXIT_ERROR } else { 0 })
@@ -2649,7 +2572,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let params = read_json_arg(&params, "params")?;
             let mut conn = dial(&store, &opts, &target)?;
             let result = conn.session.request(&method, Some(params))?;
-            print_json(&result);
+            print_json(ui, &result);
             Ok(0)
         }
 
@@ -2698,7 +2621,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .into());
             };
             let client_secret = (client_secret || client_secret_env.is_some())
-                .then(|| read_secret(client_secret_env.as_deref(), "client secret"))
+                .then(|| read_secret(ui, client_secret_env.as_deref(), "client secret"))
                 .transpose()?;
             let existing = store.credential(&r.name)?;
             let http = oauth::Http::new(opts.timeout_for(&r)?, Some(opts.user_agent.clone()))
@@ -2718,7 +2641,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 open_browser: !no_browser,
                 timeout: Duration::from_secs(300),
             };
-            let notify = |line: &str| eprintln!("{line}");
+            let notify = |line: &str| ui.err_line(line);
             let cred = match grant.as_str() {
                 "client-credentials" => {
                     oauth::login_client_credentials(&http, &url, &login_opts, notify)?
@@ -2728,7 +2651,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             store.save_credential(&r.name, cred.clone())?;
             let refreshable = cred.can_refresh();
             if cli.json {
-                println!(
+                ui.line(&format!(
                     "{}",
                     json!({ "login": {
                         "name": r.name,
@@ -2736,14 +2659,14 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                         "refreshable": refreshable,
                         "registration": cred.registration,
                     } })
-                );
+                ));
             } else {
-                eprintln!(
+                ui.err_line(&format!(
                     "saved token for {} ({}{})",
                     r.name,
                     expiry_label(&cred),
                     if refreshable { ", refreshable" } else { "" }
-                );
+                ));
             }
             Ok(0)
         }
@@ -2752,30 +2675,30 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             let name = credential_key(&store, target);
             let removed = store.remove_credential(&name)?;
             if cli.json {
-                println!(
+                ui.line(&format!(
                     "{}",
                     json!({ "removed_credential": removed.then_some(&name) })
-                );
+                ));
             } else if removed {
-                eprintln!("removed credential for {name}");
+                ui.err_line(&format!("removed credential for {name}"));
             } else {
-                eprintln!("no credential saved for {name}");
+                ui.err_line(&format!("no credential saved for {name}"));
             }
             Ok(0)
         }
 
         Cmd::Token(TokenCmd::Set { name, env }) => {
             let key = credential_key(&store, name);
-            let token = read_secret(env.as_deref(), "token")?;
+            let token = read_secret(ui, env.as_deref(), "token")?;
             let mut cred = store.credential(&key)?.unwrap_or_default();
             cred.access_token = Some(token);
             cred.expires_at = None;
             cred.source = Some("manual".into());
             store.save_credential(&key, cred)?;
             if cli.json {
-                println!("{}", json!({ "saved_credential": key }));
+                print_value(ui, &json!({ "saved_credential": key }), true);
             } else {
-                eprintln!("saved token for {key}");
+                ui.err_line(&format!("saved token for {key}"));
             }
             Ok(0)
         }
@@ -2787,58 +2710,64 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             };
             if cli.json {
                 // Metadata only. The secrets never leave the file through this path.
-                print_json(&json!({
-                    "name": key,
-                    "has_access_token": cred.has_token(),
-                    "has_refresh_token": cred.refresh_token.is_some(),
-                    "expires_at": cred.expires_at,
-                    "expired": cred.is_expired(),
-                    "scope": cred.scope,
-                    "source": cred.source,
-                    "client_id": cred.client_id,
-                    "registration": cred.registration,
-                    "has_client_secret": cred.client_secret.is_some(),
-                    "token_endpoint": cred.token_endpoint,
-                }));
+                print_json(
+                    ui,
+                    &json!({
+                        "name": key,
+                        "has_access_token": cred.has_token(),
+                        "has_refresh_token": cred.refresh_token.is_some(),
+                        "expires_at": cred.expires_at,
+                        "expired": cred.is_expired(),
+                        "scope": cred.scope,
+                        "source": cred.source,
+                        "client_id": cred.client_id,
+                        "registration": cred.registration,
+                        "has_client_secret": cred.client_secret.is_some(),
+                        "token_endpoint": cred.token_endpoint,
+                    }),
+                );
             } else {
-                println!("{key}");
-                println!(
+                ui.line(&key);
+                ui.line(&format!(
                     "  access token:  {}",
                     if cred.has_token() { "present" } else { "none" }
-                );
-                println!("  expiry:        {}", expiry_label(&cred));
-                println!(
+                ));
+                ui.line(&format!("  expiry:        {}", expiry_label(&cred)));
+                ui.line(&format!(
                     "  refresh token: {}",
                     if cred.refresh_token.is_some() {
                         "present"
                     } else {
                         "none"
                     }
-                );
-                println!("  source:        {}", cred.source.as_deref().unwrap_or("?"));
+                ));
+                ui.line(&format!(
+                    "  source:        {}",
+                    cred.source.as_deref().unwrap_or("?")
+                ));
                 if let Some(s) = &cred.scope {
-                    println!("  scope:         {s}");
+                    ui.line(&format!("  scope:         {s}"));
                 }
                 if let Some(c) = &cred.client_id {
-                    println!("  client id:     {c}");
+                    ui.line(&format!("  client id:     {c}"));
                 }
                 if let Some(r) = cred
                     .registration
                     .as_deref()
                     .and_then(oauth::Registration::parse)
                 {
-                    println!("  registered:    {}", r.describe());
+                    ui.line(&format!("  registered:    {}", r.describe()));
                 }
                 if cred.client_secret.is_some() {
-                    println!(
+                    ui.line(&format!(
                         "  client secret: present ({})",
                         cred.token_endpoint_auth_method
                             .as_deref()
                             .unwrap_or(oauth::CLIENT_SECRET_POST)
-                    );
+                    ));
                 }
                 if let Some(t) = &cred.token_endpoint {
-                    println!("  token url:     {t}");
+                    ui.line(&format!("  token url:     {t}"));
                 }
             }
             Ok(0)
@@ -2923,43 +2852,12 @@ fn truncate(s: &str) -> String {
     truncate_at(s.lines().next().unwrap_or(""), 60)
 }
 
-fn print_tools(tools: &[Value], long: bool) {
-    print_named(tools, long, "parameters", describe_params);
+fn print_tools(ui: &dyn Presenter, tools: &[Value], long: bool) {
+    ui.named(tools, long, "parameters", &describe_params);
 }
 
-fn print_prompts(prompts: &[Value], long: bool) {
-    print_named(prompts, long, "arguments", describe_prompt_args);
-}
-
-/// Tools and prompts list identically; only the word for what they take differs.
-fn print_named(items: &[Value], long: bool, takes: &str, describe: impl Fn(&Value) -> Vec<String>) {
-    for item in items {
-        // `tools --all` marks what the allow and deny lists hide.
-        let marker = if item["denied"] == true {
-            " (denied)"
-        } else {
-            ""
-        };
-        let name = format!("{}{marker}", item["name"].as_str().unwrap_or("?"));
-        let desc = item["description"].as_str().unwrap_or("").trim();
-        if long {
-            println!("{name}");
-            for line in desc.lines() {
-                println!("    {}", line.trim_end());
-            }
-            let params = describe(item);
-            if !params.is_empty() {
-                println!("  {takes}:");
-                for p in params {
-                    println!("    {p}");
-                }
-            }
-            println!();
-        } else {
-            let first = desc.lines().next().unwrap_or("");
-            println!("  {name:<28} {}", truncate_at(first, 90));
-        }
-    }
+fn print_prompts(ui: &dyn Presenter, prompts: &[Value], long: bool) {
+    ui.named(prompts, long, "arguments", &describe_prompt_args);
 }
 
 /// A prompt's arguments carry no schema: every one of them is a string.
@@ -2983,66 +2881,6 @@ fn describe_prompt_args(prompt: &Value) -> Vec<String> {
             line
         })
         .collect()
-}
-
-/// Resources and templates print the same way; only the key holding the URI differs.
-fn print_resources(resources: &[Value], long: bool) {
-    for r in resources {
-        let uri = r["uri"]
-            .as_str()
-            .or_else(|| r["uriTemplate"].as_str())
-            .unwrap_or("?");
-        let desc = r["description"].as_str().unwrap_or("").trim();
-        if long {
-            println!("{uri}");
-            for line in desc.lines() {
-                println!("    {}", line.trim_end());
-            }
-            if let Some(mime) = r["mimeType"].as_str() {
-                println!("    type: {mime}");
-            }
-            println!();
-        } else {
-            let summary = match desc.is_empty() {
-                true => r["name"].as_str().unwrap_or(""),
-                false => desc.lines().next().unwrap_or(""),
-            };
-            println!("  {uri:<44} {}", truncate_at(summary, 74));
-        }
-    }
-}
-
-fn truncate_at(s: &str, n: usize) -> String {
-    if s.chars().count() > n {
-        format!("{}...", s.chars().take(n - 3).collect::<String>())
-    } else {
-        s.to_string()
-    }
-}
-
-fn print_table(headers: &[&str], rows: &[Vec<String>]) {
-    let cols = headers.len();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    for row in rows {
-        for (i, cell) in row.iter().enumerate().take(cols) {
-            widths[i] = widths[i].max(cell.chars().count());
-        }
-    }
-    let line = |cells: Vec<&str>| {
-        let mut out = String::new();
-        for (i, c) in cells.iter().enumerate() {
-            if i + 1 == cols {
-                out.push_str(c);
-            } else {
-                out.push_str(&format!("{:<w$}  ", c, w = widths[i]));
-            }
-        }
-        out.trim_end().to_string()
-    };
-    println!("{}", line(headers.to_vec()));
-    for row in rows {
-        println!("{}", line(row.iter().map(String::as_str).collect()));
-    }
 }
 
 #[cfg(test)]
@@ -3089,20 +2927,6 @@ mod tests {
         };
         assert_eq!(nowhere.place(&png).unwrap(), None);
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn visible_escapes_what_would_move_the_cursor_and_keeps_layout() {
-        assert_eq!(
-            visible(
-                "Error: k is invalid. Valid keys are: Enter,\r,\n,ShiftLeft,\0,\x1b[0m,\u{9b}\tend"
-            ),
-            "Error: k is invalid. Valid keys are: Enter,\\r,\n,ShiftLeft,\\0,\\x1b[0m,\\x9b\tend"
-        );
-        assert_eq!(
-            visible("plain text\nsecond line"),
-            "plain text\nsecond line"
-        );
     }
 
     fn complete(helper: &ShellHelper, line: &str) -> (usize, Vec<String>) {
