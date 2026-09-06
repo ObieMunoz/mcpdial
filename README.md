@@ -157,11 +157,12 @@ mcpdial guide                    the usage guide for programs and agents
 mcpdial completions SHELL        a completion script; see Install above
 ```
 
-Global flags: `--json` for machine output, `-v` to trace every message on stderr,
-`--trace FILE` to append every message and transport event to a file as JSON Lines,
-`--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
-environment, `--user-agent` to override the default browser UA, `--protocol-version
-VERSION` to name one MCP revision instead of working out which the server speaks,
+Global flags: `--json` for machine output (or `MCPDIAL_JSON=1`), `-v` to trace every
+message on stderr, `--trace FILE` to append every message and transport event to a file
+as JSON Lines, `--timeout SECS` (or `MCPDIAL_TIMEOUT`), `-H` for extra headers,
+`--token-env VAR` to force a token from the environment, `--user-agent` to override the
+default browser UA (or `MCPDIAL_USER_AGENT`), `--protocol-version VERSION` to name one
+MCP revision instead of working out which the server speaks,
 `--no-daemon` to dial a server afresh even while `start` has one running,
 `--no-retry` to fail on the first transient HTTP failure instead of sending the
 request once more, and `--plain` (or `MCPDIAL_PLAIN=1`) to print at a terminal
@@ -173,10 +174,11 @@ presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
 `Rich`, chosen only for a person at a terminal, is the one place the output may
 differ. A snapshot test holds `Plain` to its word; see Development below.
 
-`--timeout` bounds every wait: the flag on the command line, else the timeout saved
-with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
-installs packages on first launch or runs tools for minutes, `ls --no-probe` shows it,
-and `import` keeps a numeric `timeout` (seconds) it finds in a host's config.
+`--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
+else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
+for a server that installs packages on first launch or runs tools for minutes, `ls
+--no-probe` shows it, and `import` keeps a numeric `timeout` (seconds) it finds in a
+host's config.
 
 mcpdial speaks both eras of the protocol. A session opens with `server/discover`,
 which is all that revision `2026-07-28` has; a server that has never heard of it gets
@@ -661,11 +663,29 @@ host config, and `add --registry` writes them for what an entry marks as require
 The `run` directory is created mode 0700, so only its owner can reach a running
 server through it.
 
-Override the directory with `MCPDIAL_HOME`, or `XDG_CONFIG_HOME`. Removing a server with
-`rm` also removes its credential. `MCPDIAL_REGISTRY` names the registry `search` and
-`add --registry` consult, when it is not the official one; the copy remembers which
-registry it came from, so pointing at another one starts a fresh copy. `MCPDIAL_CATALOG`
-is a URL or file to read the catalog from.
+Removing a server with `rm` also removes its credential. The copy of the registry
+remembers which registry it came from, so pointing `MCPDIAL_REGISTRY` at another one
+starts a fresh copy.
+
+Every environment variable mcpdial reads:
+
+| Variable | What it does |
+|---|---|
+| `MCPDIAL_HOME` | The directory above, instead of the default |
+| `XDG_CONFIG_HOME` | The same one level up: `$XDG_CONFIG_HOME/mcpdial` |
+| `MCPDIAL_JSON=1` | `--json` on every command |
+| `MCPDIAL_TIMEOUT=SECS` | `--timeout SECS` on every command |
+| `MCPDIAL_USER_AGENT=NAME` | `--user-agent NAME` on every command |
+| `MCPDIAL_PLAIN=1` | `--plain` on every command |
+| `MCPDIAL_NO_DAEMON=1` | `--no-daemon` on every command |
+| `MCPDIAL_TRACE=FILE` | `--trace FILE` on every command |
+| `MCPDIAL_REGISTRY=URL` | The registry `search` and `add --registry` consult |
+| `MCPDIAL_CATALOG=URL` | A URL or a file to read the catalog from, instead of the official list |
+
+A flag on the command line beats its variable, which beats the built-in default. The
+`=1` ones are off when unset, empty or `0`, and on for anything else. A
+`MCPDIAL_TIMEOUT` that is not a non-negative number of seconds is exit 2, since a
+typo that silently left every call on 60 seconds would never be found.
 
 "Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
 that ran `login`, applied as the file is created rather than after, so the tokens are

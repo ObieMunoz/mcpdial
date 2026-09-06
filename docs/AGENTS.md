@@ -1,7 +1,8 @@
 # mcpdial for agents
 
 `mcpdial` lets a program talk to any MCP server from a shell. Read this once, then use
-`--json` on every command so output is machine-parseable.
+`--json` on every command so output is machine-parseable, or export `MCPDIAL_JSON=1`
+once and every command carries it.
 
 ## Mental model
 
@@ -17,6 +18,11 @@
   a terminal may be shown something different, and `--json` never is; if a program
   drives mcpdial through a pseudo-terminal, `--plain` or `MCPDIAL_PLAIN=1` gives it the
   piped form anyway.
+- A global flag can be set once in the environment instead of on every command line:
+  `MCPDIAL_JSON=1` for `--json`, `MCPDIAL_TIMEOUT=SECS` for `--timeout` (useful when a
+  stdio server installs packages on first run), `MCPDIAL_USER_AGENT` for `--user-agent`.
+  The flag on the command line wins. A `MCPDIAL_TIMEOUT` that is not a non-negative
+  number of seconds is exit 2, not a silent fall back to the default.
 
 ## Workflow
 

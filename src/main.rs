@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 mod args;
+mod env_defaults;
 mod present;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
@@ -54,10 +55,11 @@ calling from a program or an agent: pass --json everywhere and run `mcpdial guid
 )]
 struct Cli {
     /// Seconds to wait for a reply; else the server's saved timeout, else 60. With `add`, saved.
+    /// (MCPDIAL_TIMEOUT=SECS does the same)
     #[arg(long, global = true, value_name = "SECS")]
     timeout: Option<f64>,
 
-    /// Emit JSON instead of a readable summary
+    /// Emit JSON instead of a readable summary (MCPDIAL_JSON=1 does the same)
     #[arg(long, global = true)]
     json: bool,
 
@@ -74,9 +76,9 @@ struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     trace: Option<PathBuf>,
 
-    /// Override the User-Agent (HTTP only)
-    #[arg(long, global = true, default_value = USER_AGENT, hide_default_value = true)]
-    user_agent: String,
+    /// Override the User-Agent (HTTP only) (MCPDIAL_USER_AGENT does the same)
+    #[arg(long, global = true)]
+    user_agent: Option<String>,
 
     /// Extra HTTP header, repeatable. With `add`, saved to the server.
     #[arg(
@@ -413,10 +415,14 @@ enum TokenCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let defaults = env_defaults::apply(&mut cli);
     let ui = <dyn Presenter>::choose(&cli);
     let json = cli.json;
-    match run(ui.as_ref(), cli) {
+    match defaults
+        .map_err(Failure::from)
+        .and_then(|()| run(ui.as_ref(), cli))
+    {
         Ok(code) => ExitCode::from(code),
         Err(f) => {
             if json {
@@ -1425,7 +1431,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         timeout: cli
             .timeout
             .map(|secs| Duration::from_secs_f64(secs.max(0.0))),
-        user_agent: cli.user_agent.clone(),
+        user_agent: cli
+            .user_agent
+            .clone()
+            .unwrap_or_else(|| USER_AGENT.to_string()),
         extra_headers: parse_headers(&cli.headers)?,
         token_env: cli.token_env.clone(),
         protocol_version: cli.protocol_version,

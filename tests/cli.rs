@@ -299,6 +299,73 @@ fn stdio_adhoc_call_and_timeout() {
 }
 
 #[test]
+fn environment_defaults_stand_in_for_the_global_flags() {
+    let s = start(Mode::Stateless);
+    let home = temp_home("env-defaults");
+    let o = run(mcpdial(&home).args(["add", "web", "--http", &s.url, "--no-probe"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let listing = ["ls", "--no-probe"];
+
+    // Neither flag nor variable is the readable summary it has always been.
+    let o = run(mcpdial(&home).args(listing));
+    assert!(!o.stdout.starts_with('['), "{}", o.stdout);
+    // The variable is the flag.
+    let o = run(mcpdial(&home).env("MCPDIAL_JSON", "1").args(listing));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let saved: Value = serde_json::from_str(&o.stdout).expect(&o.stdout);
+    assert_eq!(saved[0]["name"], "web");
+    // `0` turns it off, as it does for MCPDIAL_PLAIN, and the flag still wins.
+    let o = run(mcpdial(&home).env("MCPDIAL_JSON", "0").args(listing));
+    assert!(!o.stdout.starts_with('['), "{}", o.stdout);
+    let o = run(mcpdial(&home)
+        .env("MCPDIAL_JSON", "0")
+        .args(["--json", "ls", "--no-probe"]));
+    assert!(o.stdout.starts_with('['), "{}", o.stdout);
+
+    // MCPDIAL_TIMEOUT bounds a server that never answers, and the flag beats it:
+    // the seconds in the message say which of the two was used.
+    let stuck = format!("stdio:{}", echo_command());
+    let o = run(mcpdial(&home)
+        .env("ECHO_SERVER_HANG", "1")
+        .env("MCPDIAL_TIMEOUT", "0.5")
+        .args(["info", &stuck]));
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert!(o.stderr.contains("no reply after 0.5s"), "{}", o.stderr);
+    let o = run(mcpdial(&home)
+        .env("ECHO_SERVER_HANG", "1")
+        .env("MCPDIAL_TIMEOUT", "1800")
+        .args(["--timeout", "1", "info", &stuck]));
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert!(o.stderr.contains("no reply after 1s"), "{}", o.stderr);
+
+    // A timeout that is not seconds is refused by name rather than ignored,
+    // before anything is dialed, and in whichever shape was asked for.
+    let o = run(mcpdial(&home).env("MCPDIAL_TIMEOUT", "30s").args(listing));
+    assert_eq!(o.code, 2, "{}", o.stdout);
+    assert!(
+        o.stderr
+            .contains(r#"MCPDIAL_TIMEOUT must be a non-negative number of seconds, got "30s""#),
+        "{}",
+        o.stderr
+    );
+    let o = run(mcpdial(&home)
+        .env("MCPDIAL_TIMEOUT", "30s")
+        .env("MCPDIAL_JSON", "1")
+        .args(listing));
+    assert_eq!(o.code, 2, "{}", o.stdout);
+    let failed: Value = serde_json::from_str(&o.stderr).expect(&o.stderr);
+    assert_eq!(failed["error"]["kind"], "usage");
+
+    // MCPDIAL_USER_AGENT rides the request the way --user-agent does.
+    let o = run(mcpdial(&home)
+        .env("MCPDIAL_USER_AGENT", "probe/1")
+        .args(["info", "web"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let reqs = s.requests.lock().unwrap();
+    assert_eq!(reqs.last().unwrap().header("user-agent"), Some("probe/1"));
+}
+
+#[test]
 fn saved_servers_and_status_listing() {
     let http = start(Mode::Stateful);
     let auth = start(Mode::Auth {

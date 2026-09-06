@@ -27,7 +27,8 @@ mcpdial stop NAME
 
 Rules:
 
-- Always pass `--json`. Results go to stdout; errors go to stderr as `{"error":{...}}`.
+- Always pass `--json`, or export `MCPDIAL_JSON=1` once so every command carries it.
+  Results go to stdout; errors go to stderr as `{"error":{...}}`.
 - Exit 0 success, 1 the server refused or the tool set `isError`, 2 bad usage.
 - Read `tools --json` or `schema` before calling a tool you have not called before. A
   rejected call answers with `error.hint`: the tool's usage line and its parameters.
