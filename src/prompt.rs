@@ -15,13 +15,11 @@
 //! finished call is echoed as that command line so it can go into a script.
 
 use crate::args;
+use crate::pick::{self, Fzf};
 use crate::present::Presenter;
 use mcpdial::schema::{self, Asked, Parameter};
 use mcpdial::{Error, Result};
 use serde_json::Value;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 
 /// Asks for the properties of `schema` that `arguments` has not got, and adds
 /// the answers to it. Nothing is asked unless there is a person to ask and one
@@ -34,26 +32,57 @@ pub fn fill(ui: &dyn Presenter, schema: &Value, arguments: &mut Value, line: &st
     if !ui.asks() {
         return Ok(());
     }
-    let Some(given) = arguments.as_object() else {
-        return Ok(());
-    };
-    let missing: Vec<Parameter<'_>> = schema::parameters(schema)
-        .into_iter()
-        .filter(|p| !given.contains_key(p.name))
-        .collect();
+    let missing = missing(schema, arguments);
     if !missing.iter().any(|p| p.required) {
         return Ok(());
     }
-    let mut asker = Asker::new()?;
-    for p in &missing {
-        if let Some(value) = asker.ask(ui, p, schema)? {
-            arguments[p.name] = value;
-        }
-    }
+    ask_each(ui, schema, arguments, &missing)?;
     ui.aside(&format!(
         "{line} {}",
         args::as_pairs(arguments, schema).join(" ")
     ));
+    Ok(())
+}
+
+/// Asks for every property `arguments` has not got, whether or not any of them
+/// is required: what the picker does, where the call is being composed from
+/// nothing rather than completed. Nothing is echoed, because the picker prints
+/// the whole command line itself once the call has been made.
+pub fn ask_all(ui: &dyn Presenter, schema: &Value, arguments: &mut Value) -> Result<()> {
+    if !ui.asks() {
+        return Ok(());
+    }
+    let missing = missing(schema, arguments);
+    ask_each(ui, schema, arguments, &missing)
+}
+
+/// The properties of `schema` that `arguments` has not got. Anything but an
+/// object has nothing to fill in.
+fn missing<'a>(schema: &'a Value, arguments: &Value) -> Vec<Parameter<'a>> {
+    let Some(given) = arguments.as_object() else {
+        return Vec::new();
+    };
+    schema::parameters(schema)
+        .into_iter()
+        .filter(|p| !given.contains_key(p.name))
+        .collect()
+}
+
+fn ask_each(
+    ui: &dyn Presenter,
+    schema: &Value,
+    arguments: &mut Value,
+    missing: &[Parameter<'_>],
+) -> Result<()> {
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut asker = Asker::new()?;
+    for p in missing {
+        if let Some(value) = asker.ask(ui, p, schema)? {
+            arguments[p.name] = value;
+        }
+    }
     Ok(())
 }
 
@@ -114,7 +143,7 @@ impl Asker {
         question: &str,
     ) -> Result<Option<Value>> {
         let shown: Vec<String> = values.iter().map(|v| schema::plain(v)).collect();
-        match fzf(&format!("{}: ", p.name), &shown) {
+        match pick::fzf(&format!("{}: ", p.name), &shown) {
             Fzf::Picked(answer) => return Ok(chosen(values, &shown, &answer)),
             // Quitting the picker leaves the value out, which for a required
             // one is leaving out the call.
@@ -190,67 +219,13 @@ fn yes_or_no(answer: &str) -> Result<&'static str> {
 /// Which of the values an answer names: its number in the list, or the value
 /// itself as the list shows it.
 fn chosen(values: &[&Value], shown: &[String], answer: &str) -> Option<Value> {
-    let by_number = answer
-        .parse::<usize>()
-        .ok()
-        .filter(|n| (1..=values.len()).contains(n))
-        .map(|n| n - 1);
-    let at = by_number.or_else(|| shown.iter().position(|choice| choice == answer))?;
-    Some(values[at].clone())
+    pick::numbered(shown, answer).map(|at| values[at].clone())
 }
 
 /// Giving up on a question gives up on the call: nothing has been sent, and the
 /// line can be typed again with the arguments on it.
 fn given_up() -> Error {
     Error::usage("cancelled")
-}
-
-/// What `fzf` did with the values it was offered.
-enum Fzf {
-    Picked(String),
-    /// Quit without picking, which is a person saying no to the whole call.
-    Quit,
-    /// Not installed, or would not start: the numbered list stands in.
-    Absent,
-}
-
-/// `fzf` over the values, when it is on the PATH. It is the fuzzy picker the
-/// people who want one already have, which is why there is no crate here.
-fn fzf(prompt: &str, choices: &[String]) -> Fzf {
-    let Some(program) = on_path("fzf") else {
-        return Fzf::Absent;
-    };
-    let started = Command::new(program)
-        .arg(format!("--prompt={prompt}"))
-        .arg("--height=40%")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn();
-    let Ok(mut child) = started else {
-        return Fzf::Absent;
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(choices.join("\n").as_bytes()).ok();
-    }
-    let Ok(picked) = child.wait_with_output() else {
-        return Fzf::Absent;
-    };
-    let answer = String::from_utf8_lossy(&picked.stdout).trim().to_string();
-    match picked.status.success() && !answer.is_empty() {
-        true => Fzf::Picked(answer),
-        false => Fzf::Quit,
-    }
-}
-
-/// `program` where a shell would find it.
-fn on_path(program: &str) -> Option<PathBuf> {
-    let names: Vec<String> = match cfg!(windows) {
-        true => vec![format!("{program}.exe"), program.to_string()],
-        false => vec![program.to_string()],
-    };
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
-        .find(|path| path.is_file())
 }
 
 #[cfg(test)]

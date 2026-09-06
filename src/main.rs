@@ -35,6 +35,7 @@ mod env_defaults;
 mod grep;
 mod notices;
 mod output;
+mod pick;
 mod present;
 mod prompt;
 mod snapshot;
@@ -304,6 +305,8 @@ enum Cmd {
         #[arg(long, value_name = "ID", hide = true)]
         preview: Option<String>,
     },
+    /// Pick a saved server and one of its tools, then print the call it made
+    Pick,
     /// Keep one session open and run commands from stdin (state persists between calls)
     Shell {
         #[arg(help = TARGET_HELP)]
@@ -570,15 +573,20 @@ fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         // A bare `mcpdial` at a terminal with nothing saved yet opens the
-        // checklist; anything else gets clap's help, as ever.
+        // checklist, and with something saved picks one of it; a pipe, a
+        // program and `--json` get clap's help and exit 2, as ever.
         Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            let mut browse = Cli::parse_from(["mcpdial", "browse"]);
-            // MCPDIAL_JSON in the environment is a program asking, not a person.
-            let _ = env_defaults::apply(&mut browse);
-            if browse::first_run(&browse) {
-                browse
-            } else {
-                e.exit()
+            let spelling = |cmd| {
+                let mut cli = Cli::parse_from(["mcpdial", cmd]);
+                // MCPDIAL_JSON in the environment is a program asking, not a person.
+                let _ = env_defaults::apply(&mut cli);
+                cli
+            };
+            let bare = spelling("browse");
+            match browse::first_run(&bare) {
+                true => bare,
+                false if pick::wanted(&bare) => spelling("pick"),
+                false => e.exit(),
             }
         }
         Err(e) => e.exit(),
@@ -2737,6 +2745,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 interactive: !plain && std::io::stdin().is_terminal(),
             },
         ),
+
+        Cmd::Pick => {
+            opts.elicit = elicitation(None, false, cli.json, false)?;
+            pick::run(ui, &store, &opts, &out, &mut notices, save_dir)
+        }
 
         Cmd::Completions { shell } => {
             // Building the whole command tree to walk it recurses deeper than

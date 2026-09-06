@@ -1,0 +1,5 @@
+$ mcpdial --json pick
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"`mcpdial ls` names the saved servers, `mcpdial tools NAME` their tools, and `mcpdial call NAME TOOL` makes the call","kind":"usage","message":"pick needs a terminal on stdin and stdout, and a build with the rich feature"}}

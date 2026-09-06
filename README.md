@@ -129,6 +129,7 @@ mcpdial export [NAME...] [--format mcpservers|vscode|codex] [--merge FILE]  the 
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 mcpdial browse [--all] [--offline]   tick catalog servers to save and dial; the saved ones start ticked
+mcpdial pick                     pick a server and a tool, run it, print the call; what a bare `mcpdial` does
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
@@ -241,6 +242,34 @@ call is printed as the one-line command that would have made it, ready to paste 
 a script. Nothing is asked unless stdin is a terminal: under `--json`, under
 `--plain`, and with anything piped in, a missing argument is the error and the usage
 line it has always been.
+
+A bare `mcpdial` at a terminal, with servers already saved, picks one: the saved
+servers with the status of their last probe, then that server's tools with the first
+line of what each one is for, then the arguments asked for from the tool's schema
+exactly as above. The call runs, the result is shown, and the line that would have
+made the same call outright is printed under it in dim text, quoted so it pastes
+straight into a script:
+
+```
+$ mcpdial
+  1) echo  connected  stdio  5 tools
+server (1-1): 1
+  1) echo   Echo a message back.
+  2) fail   Always returns a tool error.
+tool (1-2): 1
+  message (string, required): hello there
+Echo: hello there
+mcpdial call echo echo 'message=hello there'
+```
+
+`mcpdial pick` is the same thing spelled out, for anyone who aliases the bare form.
+Picking is `fzf` where it is on `PATH` (`--height 40% --reverse`), and the numbered
+list above where it is not; either the number or the line itself answers, and `^D`
+or Esc leaves without sending anything. With nothing saved yet the bare form opens
+`browse` instead. Under a pipe, under `--json` and under `--plain` a bare `mcpdial`
+is the usage error and exit 2 it has always been, and `mcpdial pick` says it needs a
+terminal rather than reading one, so a script that calls either by mistake still
+fails at once instead of waiting for a keystroke.
 
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
@@ -745,7 +774,8 @@ and it is saved under its catalog id, or `id-2` when that name is taken. The new
 servers are then dialed together and their `ls` rows printed, with a `mcpdial login
 NAME` line under any that says `auth required`. Unticking a saved entry removes it,
 after one line asking to confirm. Esc leaves with nothing changed. A bare `mcpdial`
-at a terminal opens the checklist as long as nothing is saved yet.
+at a terminal opens the checklist as long as nothing is saved yet; once something is,
+it picks one of what is saved instead.
 
 With [fzf](https://github.com/junegunn/fzf) on `PATH` the list is fzf's, `--multi`
 with a preview pane showing the entry, what it will ask for and the exact `add`
