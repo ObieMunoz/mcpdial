@@ -3,20 +3,30 @@
 
 use crate::notify::{self, Notice};
 use crate::protocol::{
-    check, classify, is_modern_error, negotiate, notification, request, rpc_error,
-    with_client_meta, with_progress_token, Error, Incoming, KnownVersion, Result, CLIENT_NAME,
-    CLIENT_VERSION, META_SERVER_INFO, PING, UNSUPPORTED_PROTOCOL_VERSION,
+    check, classify, input_required, is_modern_error, negotiate, notification, request, rpc_error,
+    with_client_meta, with_input_responses, with_progress_token, Error, Incoming, InputRequired,
+    KnownVersion, Responder, Result, CLIENT_NAME, CLIENT_VERSION, META_SERVER_INFO, PING,
+    UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Backstop for a server that mints a fresh cursor forever, which the
 /// repeated-cursor check below cannot catch.
 const MAX_PAGES: usize = 1000;
+
+/// How many times one request may go again carrying more input before mcpdial
+/// stops sending it.
+///
+/// 2026-07-28 lets a server answer a request with a demand for input as often as
+/// it likes, and one that always does would keep a client going round for as
+/// long as it had patience. Two rounds cover every flow the spec draws; the rest
+/// is headroom for a server that asks for one thing at a time.
+const MAX_INPUT_ROUNDS: usize = 4;
 
 /// What a caller does with the notifications a server sends while its request
 /// is still in flight.
@@ -35,7 +45,8 @@ pub trait Watcher {
 
     fn notice(&mut self, notice: &Notice<'_>);
 
-    /// The server has asked us something mid-request, and whatever the client
+    /// The server has asked us something - mid-request, or in a 2026-07-28
+    /// result demanding input before it will answer - and whatever the client
     /// installed to answer it may need the screen: an elicitation puts its
     /// question and its prompts on stderr, where a watcher's updating line is.
     /// A watcher drawing one finishes it here, so the question starts clean.
@@ -67,6 +78,18 @@ pub struct Session<T: Transport> {
     /// What `initialize` declares this client can do. Empty until something is
     /// installed that can actually serve a request the server makes back.
     capabilities: Value,
+    /// What answers a 2026-07-28 server's demand for input, and the capabilities
+    /// every request of that era declares to invite the demand. `None` declares
+    /// nothing, which is the only honest thing to send when nothing here can
+    /// answer.
+    answering: Option<Answering>,
+}
+
+/// What serves an [`InputRequired`] demand, kept beside the capabilities that
+/// invite it so that neither can be installed without the other.
+struct Answering {
+    capabilities: Value,
+    respond: Responder,
 }
 
 impl<T: Transport> Session<T> {
@@ -78,6 +101,7 @@ impl<T: Transport> Session<T> {
             version: KnownVersion::LATEST,
             pinned: false,
             capabilities: json!({}),
+            answering: None,
         }
     }
 
@@ -86,11 +110,28 @@ impl<T: Transport> Session<T> {
     /// that then blocks on an answer nobody sends, so this belongs beside
     /// [`crate::Transport::answer_requests`] and nowhere else.
     ///
-    /// 2026-07-28 has no server-initiated request to declare for: what
-    /// elicitation was there is a result the client re-sends instead, so the
-    /// `_meta` capabilities of that era stay empty.
+    /// This is the older era's declaration only. 2026-07-28 has no
+    /// server-initiated request to declare for, and declares [`Self::answering`]
+    /// instead.
     pub fn declaring(mut self, capabilities: Value) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Declare `capabilities` on every 2026-07-28 request, with `respond`
+    /// serving what a server asks for under them.
+    ///
+    /// Before that revision a server's question is a request it sends down the
+    /// connection mid-call, so what answers it goes to the transport and a
+    /// transport with no way to send a reply refuses to take it - which is why
+    /// Streamable HTTP declared nothing. From 2026-07-28 the question comes back
+    /// as a *result* instead, answered by sending the request again, so what
+    /// answers it lives here and every transport can carry the answer.
+    pub fn answering(mut self, capabilities: Value, respond: Responder) -> Self {
+        self.answering = Some(Answering {
+            capabilities,
+            respond,
+        });
         self
     }
 
@@ -109,6 +150,16 @@ impl<T: Transport> Session<T> {
         self.version
     }
 
+    /// What every 2026-07-28 request declares this client can be asked for:
+    /// exactly what [`Self::answering`] installed something to serve, and
+    /// nothing when it installed nothing.
+    fn declares(&self) -> Value {
+        match &self.answering {
+            Some(a) => a.capabilities.clone(),
+            None => json!({}),
+        }
+    }
+
     /// Send a request and return its `result`. JSON-RPC errors become [`crate::Error::Rpc`].
     ///
     /// From 2026-07-28 on there is no handshake standing behind a request, so
@@ -118,7 +169,97 @@ impl<T: Transport> Session<T> {
         self.request_watching(method, params, &mut Unwatched)
     }
 
-    /// A request with somebody listening to what the server says while it runs.
+    /// A request with somebody listening to what the server says while it runs,
+    /// sent again for as long as the server answers with a demand for input
+    /// rather than a result.
+    ///
+    /// Each round is a request in its own right, with its own id, as
+    /// 2026-07-28 requires: the demand carries everything the retry needs, which
+    /// is what lets a server ask a question without holding a connection or a
+    /// session open to hear the answer.
+    pub fn request_watching(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        watch: &mut dyn Watcher,
+    ) -> Result<Value> {
+        let mut result = self.send(method, params.clone(), watch)?;
+        for _ in 0..MAX_INPUT_ROUNDS {
+            let Some(asked) = self.asked_for_input(&result) else {
+                return Ok(result);
+            };
+            let answers = self.answer(method, &asked, watch)?;
+            let again = with_input_responses(params.clone(), answers, asked.state.as_deref());
+            result = self.send(method, Some(again), watch)?;
+        }
+        match self.asked_for_input(&result) {
+            None => Ok(result),
+            Some(_) => Err(Error::transport(format!(
+                "{method} asked for input {MAX_INPUT_ROUNDS} times running and is still asking; \
+                 mcpdial stopped rather than go round again"
+            ))),
+        }
+    }
+
+    /// One request and the result it answered with, whatever kind of result that
+    /// is.
+    ///
+    /// `raw` is what this is for: it was asked to send one request, and a result
+    /// demanding input is a fact about the server worth seeing rather than
+    /// something to answer behind the caller's back.
+    pub fn request_once(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
+        self.send(method, params, &mut Unwatched)
+    }
+
+    /// A demand for input, if that is what the server answered with. Only
+    /// 2026-07-28 has one to send, and the spec confines it to `tools/call`,
+    /// `resources/read` and `prompts/get`; an older server's result is a result
+    /// whatever `resultType` it happens to carry.
+    fn asked_for_input(&self, result: &Value) -> Option<InputRequired> {
+        match self.version.is_modern() {
+            true => input_required(result),
+            false => None,
+        }
+    }
+
+    /// Serve every request a demand carries, under the keys it named them by.
+    ///
+    /// The spec has a server ask only for what the request declared, so anything
+    /// else is a server asking for something that was never promised, and saying
+    /// so beats sending a retry it will only refuse.
+    fn answer(
+        &mut self,
+        method: &str,
+        asked: &InputRequired,
+        watch: &mut dyn Watcher,
+    ) -> Result<Map<String, Value>> {
+        if asked.requests.is_empty() {
+            return Ok(Map::new());
+        }
+        let Some(answering) = self.answering.as_mut() else {
+            return Err(Error::transport(format!(
+                "{method} came back asking for input, which mcpdial had declared it could not \
+                 supply"
+            )));
+        };
+        // Whatever answers is about to write to stderr, where a watcher's
+        // updating line is.
+        watch.interrupted();
+        let mut answers = Map::new();
+        for (key, asking) in &asked.requests {
+            let wants = asking["method"].as_str().unwrap_or_default();
+            let answer = (answering.respond)(wants, &asking["params"]).ok_or_else(|| {
+                Error::transport(format!(
+                    "{method} asked for {wants:?} first, which mcpdial does not answer"
+                ))
+            })?;
+            answers.insert(key.clone(), answer);
+        }
+        Ok(answers)
+    }
+
+    /// One round trip: the request as the era wants it sent, and whatever the
+    /// server answered.
     ///
     /// The `progressToken` rides only when `watch` says it wants progress: a
     /// server handed one is entitled to stream notifications at us, and asking
@@ -126,7 +267,7 @@ impl<T: Transport> Session<T> {
     /// Whatever else arrives - a stale token, a `ping`, a notification of a kind
     /// nothing here renders - is passed over, never raised as an error, and
     /// never allowed to stand in for the result.
-    pub fn request_watching(
+    fn send(
         &mut self,
         method: &str,
         params: Option<Value>,
@@ -140,7 +281,7 @@ impl<T: Transport> Session<T> {
             false => params,
         };
         let params = match self.version.is_modern() {
-            true => Some(with_client_meta(params, self.version)),
+            true => Some(with_client_meta(params, self.version, &self.declares())),
             false => params,
         };
         let sent = request(method, id, params);
@@ -1411,5 +1552,182 @@ mod tests {
         s.call_tool_watching("echo", json!({}), &mut kept).unwrap();
         assert_eq!(kept.interruptions, 1, "the elicitation, and not the ping");
         assert_eq!(kept.heard, ["1/2 half"], "neither request is a notice");
+    }
+
+    /// A 2026-07-28 server that will not answer until it has been told one more
+    /// thing: it demands input on its first `rounds` requests and then answers
+    /// with what it was told, so a test reads the retry off the result.
+    struct Demanding {
+        sent: Vec<Value>,
+        rounds: usize,
+        /// Whether the demand names a request to serve, or is the bare state a
+        /// server shedding load sends.
+        asks: bool,
+    }
+
+    impl Transport for Demanding {
+        fn send(&mut self, payload: &Value) -> Result<Option<Value>> {
+            self.sent.push(payload.clone());
+            let id = payload["id"].clone();
+            if self.sent.len() <= self.rounds {
+                let mut demand = json!({
+                    "resultType": "input_required",
+                    "requestState": format!("state-{}", self.sent.len()),
+                });
+                if self.asks {
+                    demand["inputRequests"] = json!({"confirm": {
+                        "method": "elicitation/create",
+                        "params": {"message": "confirm before running"}}});
+                }
+                return Ok(Some(json!({"jsonrpc":"2.0","id":id,"result":demand})));
+            }
+            Ok(Some(json!({"jsonrpc":"2.0","id":id,"result":{
+                "resultType": "complete",
+                "told": payload["params"]["inputResponses"].clone(),
+                "state": payload["params"]["requestState"].clone(),
+                "declared": payload["params"]["_meta"][META_CLIENT_CAPABILITIES].clone(),
+            }})))
+        }
+    }
+
+    fn accepting() -> Responder {
+        Box::new(|method, params| {
+            (method == "elicitation/create").then(
+                || json!({"action": "accept", "content": {"asked": params["message"].clone()}}),
+            )
+        })
+    }
+
+    fn demanding(rounds: usize, asks: bool) -> Session<Demanding> {
+        Session::new(Demanding {
+            sent: Vec::new(),
+            rounds,
+            asks,
+        })
+        .offering(KnownVersion::V2026_07_28)
+        .answering(json!({"elicitation": {"form": {}, "url": {}}}), accepting())
+    }
+
+    /// The whole of the Multi Round-Trip Request pattern: the demand is
+    /// answered, the same call goes again carrying the answers under the keys
+    /// the server named them by and its state back untouched, and the id is a
+    /// new one because the two are independent requests.
+    #[test]
+    fn a_demand_for_input_is_answered_and_the_call_goes_again_carrying_it() {
+        let mut s = demanding(1, true);
+        let mut kept = Kept::default();
+        let result = s
+            .call_tool_watching("echo", json!({"message": "hi"}), &mut kept)
+            .unwrap();
+
+        assert_eq!(s.transport.sent.len(), 2);
+        let (first, again) = (&s.transport.sent[0], &s.transport.sent[1]);
+        assert_ne!(first["id"], again["id"], "two independent requests");
+        assert_eq!(again["params"]["arguments"]["message"], "hi", "the call");
+        assert_eq!(
+            again["params"]["inputResponses"]["confirm"],
+            json!({"action": "accept", "content": {"asked": "confirm before running"}})
+        );
+        assert_eq!(again["params"]["requestState"], "state-1");
+        assert_eq!(result["told"]["confirm"]["action"], "accept");
+        assert_eq!(
+            result["declared"],
+            json!({"elicitation": {"form": {}, "url": {}}}),
+            "what the request declared is what invited the demand"
+        );
+        assert_eq!(kept.interruptions, 1, "stderr is about to be written to");
+    }
+
+    /// A server shedding load asks for nothing and only wants the request again.
+    #[test]
+    fn a_demand_that_asks_for_nothing_is_the_request_again_with_the_state() {
+        let mut s = demanding(1, false);
+        let mut kept = Kept::default();
+        let result = s.call_tool_watching("echo", json!({}), &mut kept).unwrap();
+        assert_eq!(s.transport.sent.len(), 2);
+        assert_eq!(s.transport.sent[1]["params"]["requestState"], "state-1");
+        assert!(s.transport.sent[1]["params"]["inputResponses"].is_null());
+        assert!(result["told"].is_null());
+        assert_eq!(kept.interruptions, 0, "nobody was asked anything");
+    }
+
+    /// A server may demand input as often as it likes, so something has to stop:
+    /// a client that answered for ever would hang the caller just as surely as
+    /// one that blocked.
+    #[test]
+    fn a_server_that_never_stops_asking_is_given_up_on() {
+        let mut s = demanding(usize::MAX, true);
+        let e = s.call_tool("echo", json!({})).unwrap_err().to_string();
+        assert!(
+            e.contains("tools/call") && e.contains("still asking"),
+            "{e}"
+        );
+        assert_eq!(s.transport.sent.len(), MAX_INPUT_ROUNDS + 1);
+    }
+
+    /// The rule #118 fixed, carried into this era: a capability is declared only
+    /// where something can honour it, and a demand that arrives anyway is
+    /// refused at once rather than answered with a retry the server will only
+    /// ask again about.
+    #[test]
+    fn nothing_is_declared_and_nothing_answered_where_nothing_can_answer() {
+        let mut s = Session::new(Demanding {
+            sent: Vec::new(),
+            rounds: 1,
+            asks: true,
+        })
+        .offering(KnownVersion::V2026_07_28);
+
+        let e = s.call_tool("echo", json!({})).unwrap_err().to_string();
+        assert!(e.contains("declared it could not supply"), "{e}");
+        assert_eq!(s.transport.sent.len(), 1, "no retry it cannot answer");
+        assert_eq!(
+            s.transport.sent[0]["params"]["_meta"][META_CLIENT_CAPABILITIES],
+            json!({}),
+        );
+    }
+
+    /// Something the client was never promised for is named rather than sent
+    /// back half-answered.
+    #[test]
+    fn a_kind_of_request_mcpdial_does_not_serve_is_named() {
+        let mut s = Session::new(Demanding {
+            sent: Vec::new(),
+            rounds: 1,
+            asks: true,
+        })
+        .offering(KnownVersion::V2026_07_28)
+        .answering(json!({"roots": {}}), Box::new(|_, _| None));
+
+        let e = s.call_tool("echo", json!({})).unwrap_err().to_string();
+        assert!(e.contains("\"elicitation/create\""), "{e}");
+    }
+
+    /// Only 2026-07-28 has a demand for input to send. An older server's result
+    /// is its answer, whatever `resultType` it happens to carry.
+    #[test]
+    fn an_older_servers_result_is_its_answer_whatever_it_calls_itself() {
+        let mut s = Session::new(Demanding {
+            sent: Vec::new(),
+            rounds: 1,
+            asks: true,
+        })
+        .offering(KnownVersion::LATEST_LEGACY)
+        .answering(json!({"elicitation": {"form": {}}}), accepting());
+
+        let result = s.call_tool("echo", json!({})).unwrap();
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(s.transport.sent.len(), 1);
+    }
+
+    /// `raw` sends one request and shows what came back, demand and all.
+    #[test]
+    fn raw_sends_one_request_and_hands_back_what_it_answered() {
+        let mut s = demanding(1, true);
+        let result = s
+            .request_once("tools/call", Some(json!({"name": "echo"})))
+            .unwrap();
+        assert_eq!(result["resultType"], "input_required");
+        assert_eq!(s.transport.sent.len(), 1);
     }
 }

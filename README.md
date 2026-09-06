@@ -561,7 +561,10 @@ region (1) us 2) eu): 2
 
 Unattended there is nobody to ask, so the request is **declined** rather than left
 hanging: a decline is the answer the spec has for "the value is not coming", and the
-server carries on without it. To answer without a human, hand the values over up front:
+server carries on without it. Unattended is whatever a missing argument treats as
+unattended - a pipe on any stream, `--json`, `--plain`, `MCPDIAL_PLAIN` or a dumb
+terminal - so one rule covers both questions. To answer without a human, hand the values
+over up front:
 
 ```
 $ mcpdial call deploy release '{"app":"api"}' --elicit '{"confirm": true, "region": "eu"}'
@@ -574,9 +577,20 @@ value the schema's own bounds forbid, is declined without being sent. In the she
 is a different thing: its address is printed, opened in a browser unless `--no-browser`,
 and accepted at once, because the rest happens out of band.
 
-`initialize` declares only what can really answer, so a server that checks does not ask
-for what it will not get. Over Streamable HTTP a mid-POST question cannot be replied to
-yet, so nothing is declared there; stdio servers, `mcpdial start` included, are answered.
+mcpdial declares only what can really answer, so a server that checks does not ask for
+what it will not get. Which servers can be answered depends on how they ask. Before
+revision `2026-07-28` the question is a request sent while the call is still running, and
+only a transport that can carry a reply back gets a declaration: stdio does, `mcpdial
+start` included; Streamable HTTP does not, because the reply would need a second POST
+while the first is still open.
+
+`2026-07-28` turns the question into a returned value - `resultType: "input_required"`,
+with the requests to answer and an opaque `requestState` - and the answer into the same
+call sent again, carrying `inputResponses` and that state. A fresh request is something
+every transport can send, so on that revision **Streamable HTTP is answered too**. A
+server that keeps asking is given up on after four rounds rather than answered for ever,
+and `raw` prints the `input_required` result as it came, since it was asked to send one
+request.
 
 ### Keeping a stdio server running between calls
 

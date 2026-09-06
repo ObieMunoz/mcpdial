@@ -634,7 +634,11 @@ mod tests {
         crate::protocol::request(
             method,
             1,
-            Some(with_client_meta(Some(params), KnownVersion::V2026_07_28)),
+            Some(with_client_meta(
+                Some(params),
+                KnownVersion::V2026_07_28,
+                &json!({}),
+            )),
         )
     }
 

@@ -58,6 +58,14 @@ pub enum Mode {
     /// and every request checked against the headers it must mirror its body into.
     /// `initialize` is not a method it has.
     Modern,
+    /// A 2026-07-28 server that will not run a tool until it has been told one
+    /// more thing. A `tools/call` carrying no `inputResponses` is answered with
+    /// `input_required`, an elicitation under the key `confirm` and a
+    /// `requestState`; one carrying them is answered with what it carried, so a
+    /// test reads the client's decision off the tool's own output.
+    /// `insatiable` never has enough: it demands again however it is answered,
+    /// which is the server a client has to stop itself going round with.
+    ModernInput { insatiable: bool },
     /// A 2026-07-28 server that will not speak that revision with us: `server/discover`
     /// is refused with the versions it does speak, and it serves the handshake for them.
     DualEra,
@@ -657,8 +665,8 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
-    if matches!(mode, Mode::Modern) {
-        return modern(rec, state);
+    if matches!(mode, Mode::Modern | Mode::ModernInput { .. }) {
+        return modern(mode, rec, state);
     }
 
     let stateful = matches!(
@@ -766,7 +774,7 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
 
 /// The revision that took the handshake out: it holds no session, checks the
 /// headers every request must mirror its body into, and knows no `initialize`.
-fn modern(rec: &Recorded, state: &Mutex<State>) -> Resp {
+fn modern(mode: &Mode, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if rec.method != "POST" {
         return Response::from_string("Method Not Allowed").with_status_code(405);
     }
@@ -821,9 +829,41 @@ fn modern(rec: &Recorded, state: &Mutex<State>) -> Resp {
         "initialize" => {
             return modern_error(404, &id, -32601, "Method not found: initialize");
         }
+        "tools/call" if matches!(mode, Mode::ModernInput { .. }) => {
+            let insatiable = matches!(mode, Mode::ModernInput { insatiable: true });
+            demand_or_answer(insatiable, &id, params, meta)
+        }
         other => answer(&Mode::Modern, &id, other, params, state),
     };
     json_resp(200, &reply)
+}
+
+/// The Multi Round-Trip Request half of a 2026-07-28 server: a call that has
+/// not been told what it needs is answered with the demand, and one that has is
+/// answered with what it was told.
+///
+/// The result quotes what came back and what the request declared, so a test
+/// reads all three facts - the answer, the state echoed untouched, and the
+/// capability that invited the ask - off the tool's own output.
+fn demand_or_answer(insatiable: bool, id: &Value, params: &Value, meta: &Value) -> Value {
+    let answered = &params["inputResponses"]["confirm"];
+    if insatiable || answered.is_null() {
+        return json!({"jsonrpc":"2.0","id":id,"result":{
+            "resultType":"input_required",
+            "inputRequests":{"confirm":{"method":"elicitation/create","params":{
+                "mode":"form",
+                "message":"confirm before running",
+                "requestedSchema":{"type":"object","required":["confirm"],"properties":{
+                    "confirm":{"type":"boolean","description":"Really run it?"}}}}}},
+            "requestState":"opaque-state"}});
+    }
+    let declared = &meta["io.modelcontextprotocol/clientCapabilities"];
+    let text = format!(
+        "elicited {answered}; state {}; declared {declared}",
+        params["requestState"]
+    );
+    json!({"jsonrpc":"2.0","id":id,"result":{
+        "resultType":"complete","content":[{"type":"text","text":text}]}})
 }
 
 /// What `Mcp-Name` must carry for a request, if anything.
@@ -1229,4 +1269,214 @@ pub fn run(cmd: &mut Command) -> Out {
         stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
     }
+}
+
+// -- the wall clock ----------------------------------------------------------
+//
+// A prompt is the one thing in this tool that can hang its caller for ever, so
+// the tests that are not about a person typing run the command with an open
+// pipe on its stdin - one nothing is ever written to and nobody ever closes -
+// and give it a wall clock to finish inside. A command that stops to ask a
+// question there never finishes, so it is the clock that fails, whether or not
+// the output happens to look right.
+
+/// Long enough for a debug build to spawn a server and finish a call on a busy
+/// machine, and far short of for ever, which is how long a prompt with nobody
+/// in front of it takes.
+pub const BOUND: Duration = Duration::from_secs(20);
+
+/// Everything a run printed, on either stream, and what it exited with.
+pub struct Finished {
+    pub code: i32,
+    pub output: String,
+    pub took: Duration,
+}
+
+/// Runs `child` to its end, or kills it once [`BOUND`] is up and fails. `held`
+/// is its stdin, kept open for as long as it lives and never written to: a read
+/// of that blocks for ever, which is exactly what a prompt would do here.
+pub fn within_bound(
+    mut child: std::process::Child,
+    held: Option<std::process::ChildStdin>,
+    printed: &Printed,
+) -> Finished {
+    let started = std::time::Instant::now();
+    let mut waited = None;
+    while started.elapsed() < BOUND {
+        if let Some(status) = child.try_wait().expect("wait for mcpdial") {
+            waited = Some(status);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let took = started.elapsed();
+    printed.drained();
+    let Some(status) = waited else {
+        child.kill().ok();
+        child.wait().ok();
+        panic!(
+            "still running after {BOUND:?}: it stopped to ask a question that nobody \
+             can answer.\nwhat it had printed:\n{}",
+            printed.text()
+        );
+    };
+    drop(held);
+    Finished {
+        code: status.code().unwrap_or(-1),
+        output: printed.text(),
+        took,
+    }
+}
+
+/// Both of a child's streams, drained as they come. Draining matters twice
+/// over: a child that fills a pipe buffer must not be mistaken for one that
+/// stopped to ask something, and a question has to be readable before it is
+/// answered.
+pub struct Printed {
+    kept: Arc<Mutex<Vec<u8>>>,
+    readers: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Printed {
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.kept.lock().unwrap()).replace('\r', "")
+    }
+
+    /// Waits, briefly, for both streams to reach their end. A command that has
+    /// exited has printed everything it is going to, but the threads reading it
+    /// may not have caught up, and what they have not read yet is not something
+    /// to judge it by.
+    pub fn drained(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if self
+                .readers
+                .lock()
+                .unwrap()
+                .iter()
+                .all(JoinHandle::is_finished)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits for `needle` to be printed, and fails once [`BOUND`] is up.
+    pub fn wait_for(&self, needle: &str) -> String {
+        let started = std::time::Instant::now();
+        loop {
+            let so_far = self.text();
+            if so_far.contains(needle) {
+                return so_far;
+            }
+            assert!(
+                started.elapsed() < BOUND,
+                "{needle:?} was not printed inside {BOUND:?}; what was:\n{so_far}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+pub fn both_streams(child: &mut std::process::Child) -> Printed {
+    let kept = Arc::new(Mutex::new(Vec::new()));
+    let mut readers = Vec::new();
+    for stream in [
+        Box::new(child.stdout.take().expect("stdout is piped")) as Box<dyn Read + Send>,
+        Box::new(child.stderr.take().expect("stderr is piped")),
+    ] {
+        let filling = Arc::clone(&kept);
+        let mut stream = stream;
+        readers.push(thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(read) = stream.read(&mut buf) {
+                if read == 0 {
+                    break;
+                }
+                filling.lock().unwrap().extend_from_slice(&buf[..read]);
+            }
+        }));
+    }
+    Printed {
+        kept,
+        readers: Mutex::new(readers),
+    }
+}
+
+/// `cmd` run with an open pipe on stdin that nothing is ever written to.
+pub fn with_a_silent_pipe_on_stdin(cmd: &mut Command) -> Finished {
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn mcpdial");
+    let held = child.stdin.take();
+    let printed = both_streams(&mut child);
+    within_bound(child, held, &printed)
+}
+
+/// `script` gives what it runs a pseudo-terminal for stdin and stdout both, so
+/// `Rich` is chosen and a prompt is possible. BSD `script` takes the command as
+/// arguments; util-linux wants one string after `-c`, and `-e` to hand the
+/// command's exit status on. Either way the line runs under `sh`, so a pipeline
+/// written into it is a pipeline.
+pub fn pty_line(home: &std::path::Path, line: &str, env: &[(&str, &str)]) -> Command {
+    let bsd = cfg!(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ));
+    let mut cmd = Command::new("script");
+    cmd.arg("-q");
+    if bsd {
+        cmd.args(["/dev/null", "sh", "-c", line]);
+    } else {
+        cmd.args(["-e", "-c", line, "/dev/null"]);
+    }
+    cmd.env("MCPDIAL_HOME", home)
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("MCPDIAL_PLAIN")
+        .env_remove("MCPDIAL_JSON")
+        .env_remove("MCPDIAL_TIMEOUT")
+        .env_remove("NO_COLOR")
+        .env("TERM", "xterm")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
+/// The command line that reaches mcpdial inside the pseudo-terminal, with the
+/// binary named in full because a test's PATH is not the developer's.
+pub fn pty_args(args: &[&str]) -> String {
+    std::iter::once(env!("CARGO_BIN_EXE_mcpdial"))
+        .chain(args.iter().copied())
+        .map(|word| format!("'{}'", word.replace('\'', r"'\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `args` run at a pseudo-terminal, under [`BOUND`]. A question put to a
+/// terminal nobody is typing at waits for ever, so the clock is the assertion.
+pub fn within_a_pty(home: &std::path::Path, args: &[&str], env: &[(&str, &str)]) -> Finished {
+    let mut child = pty_line(home, &pty_args(args), env)
+        .spawn()
+        .expect("spawn script");
+    let held = child.stdin.take();
+    let printed = both_streams(&mut child);
+    within_bound(child, held, &printed)
+}
+
+pub fn no_pty() -> bool {
+    if cfg!(unix) {
+        return false;
+    }
+    eprintln!("skipped: needs `script` to make a pseudo-terminal");
+    true
 }
