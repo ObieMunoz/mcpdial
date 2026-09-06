@@ -1,5 +1,5 @@
 $ mcpdial schema web nah
-exit 1
+exit 2
 --- stdout
 --- stderr
-error: MCP error -32602: Tool nah not found; available: echo, add
+error: no tool named "nah"; available: echo, add

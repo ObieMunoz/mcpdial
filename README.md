@@ -692,7 +692,14 @@ exit=1
 Pass `--json` on every command. Results go to stdout; errors go to stderr as a single
 object with a `kind` to branch on (`rpc`, `http`, `transport`, `auth`, `config`,
 `usage`) and the status or code behind it. `schema TARGET TOOL` returns one tool's
-input schema. Arguments can come from a file (`@args.json`) or stdin (`-`), or be
+input schema, and a tool the server does not have is a `usage` error (exit 2) listing
+what it does have: the `tools/list` behind it succeeded and nothing was sent for that
+tool. `tools TARGET --json` returns `{"tools": [...]}` and `tools --json` with no
+target returns `{"servers": [...]}`, one probe per saved server. Every `ls --json` row
+carries what was saved — `location`, `headers`, `token_env`, `credential`, `source`,
+`timeout`, `allow`, `deny` — whether or not the servers were dialed; `--no-probe`
+leaves the status fields out rather than putting different ones in their place.
+Arguments can come from a file (`@args.json`) or stdin (`-`), or be
 `key=value` pairs typed from that schema, so quoting is never a problem. `shell --json`
 gives one JSON line per command, errors included, in order.
 
