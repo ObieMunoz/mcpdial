@@ -1,6 +1,6 @@
 //! The agent contract: what a program gets from mcpdial, byte for byte.
 //!
-//! Every command in the README's command list is run against the fake HTTP
+//! Every command in `docs/reference.md`'s command list is run against the fake HTTP
 //! server and `examples/echo_server.rs`, once under a pipe and once under
 //! `--json`, and its exit code, stdout and stderr are compared with the file
 //! of the same name under `tests/snapshots/`. Ports, temp paths, pids and

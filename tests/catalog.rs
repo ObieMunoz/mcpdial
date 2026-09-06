@@ -179,7 +179,7 @@ fn a_failed_refresh_falls_back_to_the_embedded_copy_silently() {
     );
 
     // The readable form of the shipped list has every category, and the ids
-    // the README names.
+    // the catalog documentation names.
     let o = run(mcpdial(&home)
         .arg("catalog")
         .env("MCPDIAL_CATALOG", unreachable));
