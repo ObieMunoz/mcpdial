@@ -17,24 +17,45 @@ fn offered(s: &common::FakeServer) -> Vec<String> {
         .collect()
 }
 
+/// The version header on every request that is neither the handshake nor the
+/// `server/discover` that decides whether there is going to be one.
 fn headers_after_the_handshake(s: &common::FakeServer) -> Vec<Option<String>> {
     s.requests
         .lock()
         .unwrap()
         .iter()
-        .filter(|r| r.json()["method"] != "initialize")
+        .filter(|r| {
+            !matches!(
+                r.json()["method"].as_str(),
+                Some("initialize" | "server/discover")
+            )
+        })
         .map(|r| r.header("mcp-protocol-version").map(str::to_string))
         .collect()
 }
 
+fn methods(s: &common::FakeServer) -> Vec<String> {
+    s.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|r| Some(r.json()["method"].as_str()?.to_string()))
+        .collect()
+}
+
 #[test]
-fn the_newest_version_is_offered_and_a_server_that_takes_it_runs_on_it() {
+fn the_newest_version_with_a_handshake_is_offered_and_a_server_that_takes_it_runs_on_it() {
     let s = start(Mode::EchoProtocol);
     let home = temp_home("echo-protocol");
 
     let o = run(mcpdial(&home).args(["info", &s.url]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert!(o.stdout.contains("protocol 2025-11-25"), "{}", o.stdout);
+    assert_eq!(
+        methods(&s),
+        ["server/discover", "initialize", "notifications/initialized"],
+        "the era is settled first, then the handshake the answer calls for"
+    );
 
     let o = run(mcpdial(&home).args(["--json", "info", &s.url]));
     assert_eq!(o.code, 0, "{}", o.stderr);

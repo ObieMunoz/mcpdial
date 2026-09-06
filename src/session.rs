@@ -1,8 +1,10 @@
-//! Request id allocation, the initialize handshake, and the methods that matter.
+//! Request id allocation, bringing a session up on either era of the protocol,
+//! and the methods that matter.
 
 use crate::protocol::{
-    check, negotiate, notification, request, Error, KnownVersion, Result, CLIENT_NAME,
-    CLIENT_VERSION,
+    check, is_modern_error, negotiate, notification, request, rpc_error, with_client_meta, Error,
+    KnownVersion, Result, CLIENT_NAME, CLIENT_VERSION, META_SERVER_INFO,
+    UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
@@ -18,10 +20,14 @@ const MAX_PAGES: usize = 1000;
 pub struct Session<T: Transport> {
     pub transport: T,
     next_id: u64,
-    /// The `result` of `initialize`, once it has run.
+    /// What the server said about itself: the `server/discover` result, or the
+    /// `initialize` one, once [`Session::open`] has run.
     pub server_info: Value,
-    /// The version agreed at `initialize`; until then, the one it will offer.
+    /// The version the session runs on; until it is up, the one it will try.
     version: KnownVersion,
+    /// Set by [`Session::offering`]: the caller named a revision, so the era is
+    /// not worked out from how the server answers and not changed behind them.
+    pinned: bool,
 }
 
 impl<T: Transport> Session<T> {
@@ -31,13 +37,16 @@ impl<T: Transport> Session<T> {
             next_id: 0,
             server_info: Value::Null,
             version: KnownVersion::LATEST,
+            pinned: false,
         }
     }
 
-    /// Offer `version` at `initialize` instead of the newest one, for a server
-    /// that misbehaves when offered something it has never heard of.
+    /// Speak `version` rather than working out what the server wants, for a
+    /// server that misbehaves when offered something it has never heard of, or
+    /// one that serves both eras and should be held to the older.
     pub fn offering(mut self, version: KnownVersion) -> Self {
         self.version = version;
+        self.pinned = true;
         self
     }
 
@@ -48,8 +57,16 @@ impl<T: Transport> Session<T> {
     }
 
     /// Send a request and return its `result`. JSON-RPC errors become [`crate::Error::Rpc`].
+    ///
+    /// From 2026-07-28 on there is no handshake standing behind a request, so
+    /// each one carries the protocol version, the client's identity and its
+    /// capabilities itself.
     pub fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value> {
         self.next_id += 1;
+        let params = match self.version.is_modern() {
+            true => Some(with_client_meta(params, self.version)),
+            false => params,
+        };
         let msg = check(
             self.transport
                 .send(&request(method, self.next_id, params))?,
@@ -64,13 +81,104 @@ impl<T: Transport> Session<T> {
         Ok(())
     }
 
-    /// The handshake. Stateless servers ignore `notifications/initialized`;
-    /// stateful ones refuse everything that follows if it is missing.
+    /// Bring the session up and return what the server said about itself.
+    ///
+    /// 2026-07-28 removed the handshake: `server/discover` is all there is to ask,
+    /// and what `initialize` used to settle once now rides on every request. Which
+    /// era a server speaks cannot be asked in the abstract, so it is read off how
+    /// it answers the newer request - which is also the request a server that
+    /// speaks the newer revision wanted first anyway.
+    pub fn open(&mut self) -> Result<&Value> {
+        if !self.version.is_modern() {
+            return self.initialize();
+        }
+        let refused = match self.discover() {
+            Ok(()) => return Ok(&self.server_info),
+            Err(e) => e,
+        };
+        match self.instead_of_discovering(&refused)? {
+            Some(version) => {
+                self.version = version;
+                self.initialize()
+            }
+            None => Err(refused),
+        }
+    }
+
+    /// Which revision to try `initialize` with after `server/discover` was
+    /// refused, or `None` to let the refusal stand.
+    ///
+    /// A `-32022` is a server that does speak 2026-07-28 saying it will not speak
+    /// it with us, and naming what it will; the newest of those with a handshake
+    /// is the one to fall back to, because the only modern revision mcpdial has
+    /// is the one just refused. The other two codes that revision defines are a
+    /// server complaining about the request, which falling back would only hide.
+    /// Anything else that reads as "no such method here" - a JSON-RPC error of
+    /// any other code, or the status an endpoint gives a request it has no route
+    /// for - is a server from before `server/discover` existed. A refused
+    /// credential, an unreachable host, or a transport mcpdial does not speak is
+    /// none of these and stays the answer.
+    fn instead_of_discovering(&self, refused: &Error) -> Result<Option<KnownVersion>> {
+        let answered = rpc_error(refused);
+        let code = answered.as_ref().and_then(|e| e["code"].as_i64());
+        if code == Some(UNSUPPORTED_PROTOCOL_VERSION) {
+            let named = answered.map_or(Value::Null, |e| e["data"]["supported"].clone());
+            let usable = (!self.pinned)
+                .then(|| newest_with_a_handshake(&named))
+                .flatten();
+            return usable
+                .ok_or_else(|| speaks_neither(&named, self.version))
+                .map(Some);
+        }
+        if self.pinned || code.is_some_and(is_modern_error) {
+            return Ok(None);
+        }
+        let reads_as_no_such_method = match refused {
+            Error::Rpc { .. } => true,
+            Error::Http { status, .. } => matches!(status, 400 | 404 | 405),
+            _ => false,
+        };
+        Ok(reads_as_no_such_method.then_some(KnownVersion::LATEST_LEGACY))
+    }
+
+    /// `server/discover`: identity, capabilities and supported versions in one
+    /// request, and the whole of what 2026-07-28 has instead of a handshake.
+    ///
+    /// What it answers is kept in the shape the `initialize` result had, with the
+    /// agreed `protocolVersion` and a top-level `serverInfo`, so that everything
+    /// reading it keeps reading it. What the revision added stays where the
+    /// server put it, under `supportedVersions`, `resultType` and `_meta`.
+    fn discover(&mut self) -> Result<()> {
+        let mut found = self.request("server/discover", None)?;
+        let Some(fields) = found.as_object_mut() else {
+            return Err(Error::transport(format!(
+                "server/discover answered with {found}, which is not a discovery result"
+            )));
+        };
+        let named_itself = fields
+            .get("_meta")
+            .map(|meta| meta[META_SERVER_INFO].clone())
+            .filter(Value::is_object);
+        if let Some(info) = named_itself {
+            fields.entry("serverInfo").or_insert(info);
+        }
+        fields.insert("protocolVersion".into(), json!(self.version.as_str()));
+        self.server_info = found;
+        Ok(())
+    }
+
+    /// The handshake, for a server from 2025-11-25 or earlier. Stateless servers
+    /// ignore `notifications/initialized`; stateful ones refuse everything that
+    /// follows if it is missing.
     ///
     /// A server that answers with a version we do not speak is an error here, and
     /// the notification is withheld: the spec has the client disconnect instead.
     pub fn initialize(&mut self) -> Result<&Value> {
-        let offered = self.version;
+        // A revision with no `initialize` cannot be offered at one, and settling
+        // the version before the request is also what keeps the per-request
+        // metadata of the newer era off a handshake that has no place for it.
+        let offered = self.version.min(KnownVersion::LATEST_LEGACY);
+        self.version = offered;
         let info = self.request(
             "initialize",
             Some(json!({
@@ -157,6 +265,35 @@ impl<T: Transport> Drop for Session<T> {
     fn drop(&mut self) {
         self.transport.close();
     }
+}
+
+/// The newest revision mcpdial speaks out of the ones an `UnsupportedProtocolVersion`
+/// error named, ignoring any that has no handshake to reach it by.
+fn newest_with_a_handshake(supported: &Value) -> Option<KnownVersion> {
+    supported
+        .as_array()?
+        .iter()
+        .filter_map(|v| KnownVersion::parse(v.as_str()?))
+        .filter(|v| !v.is_modern())
+        .max()
+}
+
+/// A server and a client with no revision in common, named from both sides so
+/// that the fix is on the screen rather than a code to look up.
+fn speaks_neither(supported: &Value, tried: KnownVersion) -> Error {
+    let named = match supported.as_array() {
+        Some(versions) if !versions.is_empty() => versions
+            .iter()
+            .map(|v| v.as_str().unwrap_or("?").to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "nothing".to_string(),
+    };
+    Error::transport(format!(
+        "the server refused protocol version {tried} and speaks {named}, which mcpdial does \
+         not.\n\
+         Hint: offer one it accepts with --protocol-version VERSION."
+    ))
 }
 
 /// The bytes behind an `image` or `audio` block, an embedded `resource` block with
@@ -402,7 +539,10 @@ fn render_blocks(blocks: &[Value], sink: &mut MediaSink) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Error;
+    use crate::protocol::{
+        Error, HEADER_MISMATCH, META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION,
+        METHOD_NOT_FOUND, MISSING_REQUIRED_CLIENT_CAPABILITY,
+    };
     use std::collections::VecDeque;
 
     /// A transport that replays canned replies and records what was sent.
@@ -430,6 +570,12 @@ mod tests {
         })
     }
 
+    /// A session already settled on a revision from before 2026-07-28, for the
+    /// wire shapes that have no per-request metadata in them.
+    fn legacy(replies: Vec<Option<Value>>) -> Session<Fake> {
+        fake(replies).offering(KnownVersion::LATEST_LEGACY)
+    }
+
     #[test]
     fn initialize_sends_the_mandatory_notification() {
         let mut s = fake(vec![Some(
@@ -455,8 +601,8 @@ mod tests {
         )]);
         assert_eq!(
             s.version(),
-            KnownVersion::V2025_11_25,
-            "the offer, until then"
+            KnownVersion::V2026_07_28,
+            "the newest, until a server says otherwise"
         );
         s.initialize().unwrap();
         assert_eq!(
@@ -510,6 +656,179 @@ mod tests {
         assert_eq!(s.transport.told, None);
     }
 
+    fn discovered(result: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "result": result})
+    }
+
+    fn refused(code: i64, message: &str, data: Value) -> Value {
+        json!({"jsonrpc":"2.0","id":1,"error":{"code":code,"message":message,"data":data}})
+    }
+
+    #[test]
+    fn a_server_that_answers_discover_needs_no_handshake() {
+        let mut s = fake(vec![Some(discovered(json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28"],
+            "capabilities": {"tools": {}},
+            "instructions": "Weather, mostly.",
+            "_meta": {META_SERVER_INFO: {"name": "modern-mcp", "version": "2.0"}},
+        })))]);
+
+        let info = s.open().unwrap().clone();
+        assert_eq!(s.version(), KnownVersion::V2026_07_28);
+        assert_eq!(s.transport.sent.len(), 1, "no handshake, no notification");
+        assert_eq!(s.transport.sent[0]["method"], "server/discover");
+
+        // Read where `initialize` used to answer, so that nothing downstream cares.
+        assert_eq!(info["protocolVersion"], "2026-07-28");
+        assert_eq!(info["serverInfo"]["name"], "modern-mcp");
+        assert_eq!(info["capabilities"]["tools"], json!({}));
+        // And what the revision added is left where the server put it.
+        assert_eq!(info["supportedVersions"][0], "2026-07-28");
+        assert_eq!(info["resultType"], "complete");
+    }
+
+    #[test]
+    fn every_request_on_the_newest_revision_carries_its_own_metadata() {
+        let mut s = fake(vec![
+            Some(discovered(json!({"capabilities": {}}))),
+            Some(json!({"jsonrpc":"2.0","id":2,"result":{"tools":[]}})),
+        ]);
+        s.open().unwrap();
+        s.list_tools().unwrap();
+
+        for sent in &s.transport.sent {
+            let meta = &sent["params"]["_meta"];
+            assert_eq!(meta[META_PROTOCOL_VERSION], "2026-07-28", "{sent}");
+            assert_eq!(meta[META_CLIENT_INFO]["name"], CLIENT_NAME, "{sent}");
+            assert_eq!(meta[META_CLIENT_CAPABILITIES], json!({}), "{sent}");
+        }
+    }
+
+    #[test]
+    fn a_server_that_never_heard_of_discover_gets_the_handshake_instead() {
+        let mut s = fake(vec![
+            Some(
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}),
+            ),
+            Some(
+                json!({"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"old"}}}),
+            ),
+        ]);
+        let info = s.open().unwrap().clone();
+        assert_eq!(info["serverInfo"]["name"], "old");
+        assert_eq!(s.version(), KnownVersion::V2025_06_18);
+
+        let sent = &s.transport.sent;
+        assert_eq!(sent[0]["method"], "server/discover");
+        assert_eq!(sent[1]["method"], "initialize");
+        assert_eq!(sent[1]["params"]["protocolVersion"], "2025-11-25");
+        assert!(
+            sent[1]["params"]["_meta"].is_null(),
+            "the handshake has nowhere to put per-request metadata"
+        );
+        assert_eq!(sent[2]["method"], "notifications/initialized");
+    }
+
+    #[test]
+    fn a_server_that_names_the_revisions_it_speaks_is_taken_at_its_word() {
+        let mut s = fake(vec![
+            Some(refused(
+                UNSUPPORTED_PROTOCOL_VERSION,
+                "Unsupported protocol version",
+                json!({"supported": ["2025-06-18", "2025-11-25"], "requested": "2026-07-28"}),
+            )),
+            Some(json!({"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25"}})),
+        ]);
+        s.open().unwrap();
+        assert_eq!(s.version(), KnownVersion::V2025_11_25, "the newest of them");
+        assert_eq!(
+            s.transport.sent[1]["params"]["protocolVersion"],
+            "2025-11-25"
+        );
+    }
+
+    #[test]
+    fn a_server_speaking_only_revisions_we_do_not_have_is_told_so() {
+        let mut s = fake(vec![Some(refused(
+            UNSUPPORTED_PROTOCOL_VERSION,
+            "Unsupported protocol version",
+            json!({"supported": ["2027-01-01"], "requested": "2026-07-28"}),
+        ))]);
+        let e = s.open().unwrap_err().to_string();
+        assert!(e.contains("2027-01-01") && e.contains("2026-07-28"), "{e}");
+        assert!(e.contains("--protocol-version"), "{e}");
+        assert_eq!(s.transport.sent.len(), 1, "no handshake was attempted");
+    }
+
+    #[test]
+    fn the_other_errors_of_the_newest_revision_are_not_a_reason_to_fall_back() {
+        for code in [HEADER_MISMATCH, MISSING_REQUIRED_CLIENT_CAPABILITY] {
+            let mut s = fake(vec![Some(refused(code, "no", Value::Null))]);
+            let e = s.open().unwrap_err();
+            assert!(
+                matches!(e, Error::Rpc { code: c, .. } if c == code),
+                "{e:?}"
+            );
+            assert_eq!(s.transport.sent.len(), 1, "the server said it speaks this");
+        }
+    }
+
+    #[test]
+    fn a_pinned_revision_is_the_one_spoken_and_nothing_falls_back_behind_it() {
+        let mut old = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}),
+        )])
+        .offering(KnownVersion::LATEST_LEGACY);
+        old.open().unwrap();
+        assert_eq!(old.transport.sent[0]["method"], "initialize", "no probing");
+
+        let mut new = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}),
+        )])
+        .offering(KnownVersion::V2026_07_28);
+        assert!(new.open().is_err());
+        assert_eq!(new.transport.sent.len(), 1, "no handshake behind the pin");
+    }
+
+    #[test]
+    fn only_a_refusal_that_reads_as_no_such_method_reaches_for_the_handshake() {
+        let s = fake(vec![]);
+        let http = |status, body: &str| Error::Http {
+            status,
+            body: body.to_string(),
+            www_authenticate: None,
+        };
+        let means = |e| s.instead_of_discovering(&e).unwrap();
+
+        let no_such_method = Error::Rpc {
+            code: METHOD_NOT_FOUND,
+            message: "Method not found".into(),
+            data: None,
+        };
+        assert_eq!(means(no_such_method), Some(KnownVersion::LATEST_LEGACY));
+        let no_session = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"No valid session ID provided"},"id":null}"#;
+        assert_eq!(
+            means(http(400, no_session)),
+            Some(KnownVersion::LATEST_LEGACY)
+        );
+        assert_eq!(means(http(405, "")), Some(KnownVersion::LATEST_LEGACY));
+
+        // A credential, a policy block, a socket: none of them is an era.
+        assert_eq!(means(http(401, "")), None);
+        assert_eq!(means(http(403, "")), None);
+        assert_eq!(means(http(500, "")), None);
+        assert_eq!(means(Error::transport("could not reach it")), None);
+    }
+
+    #[test]
+    fn a_discovery_result_that_is_not_an_object_is_a_transport_error() {
+        let mut s = fake(vec![Some(json!({"jsonrpc":"2.0","id":1,"result":"fine"}))]);
+        let e = s.open().unwrap_err();
+        assert!(matches!(e, Error::Transport(_)), "{e:?}");
+        assert!(e.to_string().contains("discovery result"), "{e}");
+    }
+
     #[test]
     fn ids_increase_and_results_are_unwrapped() {
         let mut s = fake(vec![
@@ -527,7 +846,7 @@ mod tests {
 
     #[test]
     fn a_paginated_list_is_read_to_the_end() {
-        let mut s = fake(vec![
+        let mut s = legacy(vec![
             Some(
                 json!({"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"a"}],"nextCursor":"c1"}}),
             ),

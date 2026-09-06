@@ -79,7 +79,8 @@ struct Cli {
     #[arg(long, global = true, value_name = "VAR")]
     token_env: Option<String>,
 
-    /// MCP protocol version to offer at initialize instead of the newest. With `add`, saved.
+    /// MCP protocol revision to speak, instead of working out which the server does.
+    /// With `add`, saved.
     #[arg(long, global = true, value_name = "VERSION")]
     protocol_version: Option<KnownVersion>,
     /// Fail on the first transient HTTP failure instead of sending the request once more

@@ -49,6 +49,13 @@ pub enum Mode {
     /// Protocol 2024-11-05: the URL serves `GET` alone, streaming an `endpoint` event
     /// that names where requests are POSTed.
     LegacySse,
+    /// Revision 2026-07-28: `server/discover` in place of the handshake, no session,
+    /// and every request checked against the headers it must mirror its body into.
+    /// `initialize` is not a method it has.
+    Modern,
+    /// A 2026-07-28 server that will not speak that revision with us: `server/discover`
+    /// is refused with the versions it does speak, and it serves the handshake for them.
+    DualEra,
     /// Accepts every request and answers none of them, until the server is dropped.
     BlackHole,
     /// Stateless, but the first request to `/mcp` gets a 503, like a load balancer
@@ -64,6 +71,9 @@ pub enum Mode {
     /// without a session.
     CallUnavailableOnce { stateful: bool },
 }
+
+/// The revision the [`Mode::Modern`] server speaks, and the only one.
+pub const MODERN_VERSION: &str = "2026-07-28";
 
 /// The client the administrator registered out of band. The secret carries the
 /// characters that have to survive form encoding in either placement.
@@ -609,6 +619,10 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
+    if matches!(mode, Mode::Modern) {
+        return modern(rec, state);
+    }
+
     let stateful = matches!(
         mode,
         Mode::Stateful | Mode::StatefulNoDelete | Mode::CallUnavailableOnce { stateful: true }
@@ -645,6 +659,16 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return unavailable();
     }
 
+    if matches!(mode, Mode::DualEra) && method == "server/discover" {
+        return json_resp(
+            400,
+            &json!({"jsonrpc":"2.0","id":id,"error":{
+                "code":-32022,"message":"Unsupported protocol version",
+                "data":{"supported":["2025-11-25","2025-06-18"],
+                        "requested":msg["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"]}}}),
+        );
+    }
+
     if stateful && method != "initialize" {
         if rec.header("mcp-session-id") != Some("sess-1") {
             return json_resp(
@@ -662,7 +686,7 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
 
     let params = &msg["params"];
     let agreed_version = match mode {
-        Mode::EchoProtocol => params["protocolVersion"].as_str().unwrap_or("?"),
+        Mode::EchoProtocol | Mode::DualEra => params["protocolVersion"].as_str().unwrap_or("?"),
         _ => "2025-06-18",
     };
     let reply = match method {
@@ -670,6 +694,135 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
             "protocolVersion":agreed_version,
             "capabilities":{"tools":{},"resources":{},"prompts":{}},
             "serverInfo":{"name":"fake-mcp","version":"1.0"}}}),
+        other => answer(mode, &id, other, params, state),
+    };
+
+    if stateful {
+        let server_noise_before_the_answer = if method == "tools/call" {
+            ": keep-alive\n\n\
+             event: message\n\
+             data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\
+             \"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n"
+        } else {
+            ""
+        };
+        let sse = format!("{server_noise_before_the_answer}event: message\ndata: {reply}\n\n");
+        let mut r = with_headers(
+            Response::from_string(sse),
+            &[("Content-Type", "text/event-stream")],
+        );
+        if method == "initialize" {
+            r = with_headers(r, &[("Mcp-Session-Id", "sess-1")]);
+        }
+        r
+    } else {
+        json_resp(200, &reply)
+    }
+}
+
+/// The revision that took the handshake out: it holds no session, checks the
+/// headers every request must mirror its body into, and knows no `initialize`.
+fn modern(rec: &Recorded, state: &Mutex<State>) -> Resp {
+    if rec.method != "POST" {
+        return Response::from_string("Method Not Allowed").with_status_code(405);
+    }
+    let msg = rec.json();
+    let Some(id) = msg.get("id").cloned() else {
+        return Response::from_string("").with_status_code(202);
+    };
+    let method = msg["method"].as_str().unwrap_or("");
+    let params = &msg["params"];
+    let meta = &params["_meta"];
+
+    let declared = meta["io.modelcontextprotocol/protocolVersion"].as_str();
+    if declared.is_none()
+        || meta
+            .get("io.modelcontextprotocol/clientCapabilities")
+            .is_none()
+    {
+        return modern_error(
+            400,
+            &id,
+            -32602,
+            "every request carries protocolVersion and clientCapabilities in _meta",
+        );
+    }
+    for (header, body) in [
+        ("mcp-protocol-version", declared),
+        ("mcp-method", Some(method)),
+        ("mcp-name", mcp_name_of(method, params)),
+    ] {
+        if let Err(complaint) = agree(rec.header(header), body, header) {
+            return modern_error(400, &id, -32020, &complaint);
+        }
+    }
+    if declared != Some(MODERN_VERSION) {
+        return json_resp(
+            400,
+            &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,
+                "message":"Unsupported protocol version",
+                "data":{"supported":[MODERN_VERSION],"requested":declared}}}),
+        );
+    }
+
+    let reply = match method {
+        "server/discover" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "resultType":"complete",
+            "supportedVersions":[MODERN_VERSION],
+            "capabilities":{"tools":{},"resources":{},"prompts":{}},
+            "instructions":"Echoes what you give it.",
+            "_meta":{"io.modelcontextprotocol/serverInfo":{"name":"modern-mcp","version":"2.0"}}}}),
+        // The handshake is what this revision removed, so it is an unknown method,
+        // and an unknown method is a 404 here rather than a 200 carrying the error.
+        "initialize" => {
+            return modern_error(404, &id, -32601, "Method not found: initialize");
+        }
+        other => answer(&Mode::Modern, &id, other, params, state),
+    };
+    json_resp(200, &reply)
+}
+
+/// What `Mcp-Name` must carry for a request, if anything.
+fn mcp_name_of<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => params["name"].as_str(),
+        "resources/read" => params["uri"].as_str(),
+        _ => None,
+    }
+}
+
+/// Whether a mirrored header says what the body says, decoding the base64 the
+/// spec wraps a value in when it cannot go on the wire as it is.
+fn agree(sent: Option<&str>, body: Option<&str>, header: &str) -> Result<(), String> {
+    let sent = sent.map(|v| {
+        match v
+            .strip_prefix("=?base64?")
+            .and_then(|v| v.strip_suffix("?="))
+        {
+            Some(encoded) => {
+                String::from_utf8_lossy(&STANDARD.decode(encoded).expect("base64")).into_owned()
+            }
+            None => v.to_string(),
+        }
+    });
+    match (sent.as_deref(), body) {
+        (a, b) if a == b => Ok(()),
+        (a, b) => Err(format!("{header} header is {a:?} and the body says {b:?}")),
+    }
+}
+
+fn modern_error(status: u16, id: &Value, code: i64, message: &str) -> Resp {
+    json_resp(
+        status,
+        &json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
+    )
+}
+
+/// The methods both eras of the protocol have in common, answered the same way
+/// whichever one asked.
+fn answer(mode: &Mode, id: &Value, method: &str, params: &Value, state: &Mutex<State>) -> Value {
+    let id = id.clone();
+    match method {
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
         "resources/list" => resources_list(&id, params["cursor"].as_str()),
@@ -703,28 +856,6 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         other => {
             json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}})
         }
-    };
-
-    if stateful {
-        let server_noise_before_the_answer = if method == "tools/call" {
-            ": keep-alive\n\n\
-             event: message\n\
-             data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\
-             \"params\":{\"level\":\"info\",\"data\":\"working\"}}\n\n"
-        } else {
-            ""
-        };
-        let sse = format!("{server_noise_before_the_answer}event: message\ndata: {reply}\n\n");
-        let mut r = with_headers(
-            Response::from_string(sse),
-            &[("Content-Type", "text/event-stream")],
-        );
-        if method == "initialize" {
-            r = with_headers(r, &[("Mcp-Session-Id", "sess-1")]);
-        }
-        r
-    } else {
-        json_resp(200, &reply)
     }
 }
 
