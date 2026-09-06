@@ -573,16 +573,23 @@ session open and reads commands from stdin, one per line:
 
 ```
 $ mcpdial shell chrome
-chrome> call list_pages
+connected  chrome-devtools-mcp 0.6.0  26 tools  3 resources
+chrome ● > call list_pages
 ## Pages
 1: about:blank [selected]
-chrome> call navigate_page {"pageId":1,"url":"https://example.com"}
+chrome ● > call navigate_page {"pageId":1,"url":"https://example.com"}
 Successfully navigated to https://example.com.
-chrome> call list_pages
+chrome ● > call list_pages
 ## Pages
 1: Example Domain (https://example.com/) [selected]
-chrome> quit
+chrome ● > quit
 ```
+
+The dot says how the session is: green while it is healthy, yellow once the saved token
+has under ten minutes left, red after the transport drops, in which case the next
+command dials the server again and says so in one dim line. The glyph changes with it -
+full, half, hollow - so it still reads with `NO_COLOR` set. None of that reaches a pipe,
+where the prompt is `chrome> ` and the bytes are what they have always been.
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
 `resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `show`, `save`, `retry`,
