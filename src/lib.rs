@@ -29,6 +29,7 @@ pub mod oauth;
 pub mod protocol;
 pub mod registry;
 pub mod search;
+pub mod serve;
 pub mod session;
 pub mod transport;
 

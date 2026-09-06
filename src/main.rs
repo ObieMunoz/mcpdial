@@ -5,6 +5,7 @@ use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
 use mcpdial::protocol::METHOD_NOT_FOUND;
 use mcpdial::registry::{Pick, Registry, Resolved};
+use mcpdial::serve;
 use mcpdial::session::{
     extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
     Media, MediaSink, ResourceBody,
@@ -284,6 +285,33 @@ enum Cmd {
         /// JSON object of params: inline, @file, or - for stdin
         #[arg(default_value = "{}")]
         params: String,
+    },
+    /// Expose a saved server to a client that must not see its credentials
+    Serve {
+        target: String,
+        /// Address to listen on; port 0 picks a free one and reports it
+        #[arg(
+            long,
+            value_name = "ADDR",
+            default_value = "127.0.0.1:0",
+            conflicts_with = "stdio"
+        )]
+        listen: String,
+        /// Speak MCP on this process's own stdin and stdout instead of listening
+        #[arg(long)]
+        stdio: bool,
+        /// Allow --listen on an address other than loopback
+        #[arg(long, conflicts_with = "stdio")]
+        listen_any: bool,
+        /// Env var holding the bearer token clients must present
+        #[arg(long, value_name = "VAR", conflicts_with = "stdio")]
+        bearer_env: Option<String>,
+        /// Expose only tools matching this glob, on top of the server's own lists
+        #[arg(long, value_name = "PATTERN")]
+        allow: Vec<String>,
+        /// Never expose tools matching this glob, repeatable; beats --allow
+        #[arg(long, value_name = "PATTERN")]
+        deny: Vec<String>,
     },
     /// Print the usage guide written for programs and agents that call mcpdial
     Guide,
@@ -2610,6 +2638,29 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             print_json(&result);
             Ok(0)
         }
+
+        Cmd::Serve {
+            target,
+            listen,
+            stdio,
+            listen_any,
+            bearer_env,
+            allow,
+            deny,
+        } => Ok(serve::run(
+            store,
+            opts,
+            &target,
+            serve::Settings {
+                listen,
+                stdio,
+                listen_any,
+                bearer_env,
+                allow,
+                deny,
+                json: cli.json,
+            },
+        )?),
 
         Cmd::Login {
             target,
