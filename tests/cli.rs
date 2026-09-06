@@ -3823,6 +3823,17 @@ fn a_directory_the_process_cannot_write_to_leaves_no_snapshot_behind() {
     std::fs::create_dir(&sealed).unwrap();
     std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500)).unwrap();
 
+    // Mode bits do not restrain root, which is what a container runs the suite
+    // as, so the premise is checked rather than assumed: a directory this
+    // process can still write to is not the one the test is about.
+    let probe = sealed.join("writable");
+    if std::fs::write(&probe, "").is_ok() {
+        std::fs::remove_file(&probe).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!("skipped: this process writes to a directory it has no write bit on");
+        return;
+    }
+
     let path = sealed.join("tools.json");
     let o = run(mcpdial(&home).args(["tools", &s.url, "--snapshot", path.to_str().unwrap()]));
     assert_eq!(o.code, 2, "{}", o.stderr);
