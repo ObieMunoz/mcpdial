@@ -1,0 +1,6 @@
+$ mcpdial tasks echo
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32601: Method not found: tasks/list
+this server offers no background tasks; `mcpdial info echo` lists what it does offer.

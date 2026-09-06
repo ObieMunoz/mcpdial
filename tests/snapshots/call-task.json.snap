@@ -1,0 +1,12 @@
+$ mcpdial --json call echo echo {"message":"as a task"} --task
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: as a task",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

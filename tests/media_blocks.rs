@@ -276,7 +276,7 @@ fn save_dir_is_checked_before_anything_is_sent() {
     assert_eq!(o.code, 2, "{}", o.stderr);
     assert!(
         o.stderr
-            .contains("--save-dir applies to call, prompt, read and shell"),
+            .contains("--save-dir applies to call, prompt, read, shell and tasks"),
         "{}",
         o.stderr
     );

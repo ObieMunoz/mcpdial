@@ -40,6 +40,15 @@
 //! Set `ECHO_SERVER_ANNOTATED=1` to add an `erase` tool that says what calling it
 //! does: a `title`, `annotations` marking it destructive and open-world, and
 //! `execution.taskSupport`. Behind a flag for the same reason `typed` is.
+//! Set `ECHO_SERVER_TASKS=none` to speak 2025-11-25 and nothing else: the
+//! revision has the tasks utility, this server does not offer it, and every
+//! `tasks/*` is refused with `-32601`.
+//! Set `ECHO_SERVER_TASKS=1` to speak 2025-11-25, declare the tasks utility, and
+//! add a `slow` tool whose `execution.taskSupport` is `required`. A `tools/call`
+//! carrying `params.task` is answered with a task object rather than a result;
+//! `tasks/get` reports `working` twice and `completed` after that, and
+//! `tasks/result` hands back what the tool would have returned. `slow` called
+//! without a task is refused with `-32601`, as the spec has it.
 //! Set `ECHO_SERVER_ELICIT=form` (or `url`) to make every `tools/call` ask the
 //! client for one more fact first, the way a server missing a confirmation or a
 //! region does, and answer with whatever the client replied. The call blocks on
@@ -48,7 +57,52 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, Lines, StdinLock, Write};
+
+/// One task in flight: what the tool will say when it is done, and how many
+/// times it has been asked about.
+struct Task {
+    text: String,
+    asked: u32,
+    cancelled: bool,
+    /// Milliseconds this server agreed to hold the task for, which is what the
+    /// call asked for unless that was longer than it is willing to keep one.
+    ttl: u64,
+}
+
+/// How many polls a task stays `working` for before it finishes.
+const POLLS_BEFORE_DONE: u32 = 2;
+
+/// The longest this server holds a task, however long it was asked for.
+const LONGEST_TTL: u64 = 60_000;
+
+impl Task {
+    fn status(&self) -> &'static str {
+        match (self.cancelled, self.asked >= POLLS_BEFORE_DONE) {
+            (true, _) => "cancelled",
+            (_, true) => "completed",
+            _ => "working",
+        }
+    }
+
+    /// The task object every one of the four methods answers with. `pollInterval`
+    /// is short because a test waits it out for real.
+    fn described(&self, id: &str) -> Value {
+        json!({"taskId": id, "status": self.status(),
+               "statusMessage": format!("asked {} times", self.asked),
+               "createdAt": "2026-01-01T00:00:00Z", "lastUpdatedAt": "2026-01-01T00:00:00Z",
+               "ttl": self.ttl, "pollInterval": 10})
+    }
+}
+
+/// A tool that will not run in the foreground at all: the shape a client has to
+/// notice before it sends a call that would only be refused.
+fn slow_tool() -> Value {
+    json!({"name": "slow", "description": "Echo a message, eventually.",
+    "execution": {"taskSupport": "required"},
+    "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}}})
+}
 
 /// One property of every type a schema can name, and nothing else allowed, so a
 /// client coercing `key=value` text has something to coerce it against.
@@ -91,6 +145,12 @@ fn main() {
     let types = std::env::var_os("ECHO_SERVER_TYPES").is_some();
     let annotated = std::env::var_os("ECHO_SERVER_ANNOTATED").is_some();
     let elicit = std::env::var("ECHO_SERVER_ELICIT").ok();
+    let asked_for_tasks = std::env::var("ECHO_SERVER_TASKS").ok();
+    // The revision that has tasks at all, which is not the same as offering them.
+    let modern = asked_for_tasks.is_some();
+    let tasks = asked_for_tasks.as_deref().is_some_and(|how| how != "none");
+    let mut running: BTreeMap<String, Task> = BTreeMap::new();
+    let mut started = 0u32;
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
@@ -206,10 +266,14 @@ fn main() {
         let reply = match method {
             "initialize" => {
                 let mut result = json!({
-                    "protocolVersion": "2025-06-18",
+                    "protocolVersion": if modern { "2025-11-25" } else { "2025-06-18" },
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "echo-server", "version": "0.0.1"},
                 });
+                if tasks {
+                    result["capabilities"]["tasks"] = json!({
+                        "requests": {"tools": {"call": true}}, "list": true, "cancel": true});
+                }
                 if let Some(t) = &tag {
                     result["instructions"] = json!(format!("tag={t}"));
                 }
@@ -240,6 +304,9 @@ fn main() {
                         .unwrap()
                         .push(annotated_tool());
                 }
+                if tasks {
+                    listed["tools"].as_array_mut().unwrap().push(slow_tool());
+                }
                 ok(id, listed)
             }
             "prompts/list" if prompts => ok(
@@ -257,6 +324,54 @@ fn main() {
                     ]}),
                 ),
                 other => err(id, -32602, &format!("Prompt {other} not found")),
+            },
+            // A call carrying a task is answered with the task, and the tool's
+            // own answer is kept until `tasks/result` comes for it.
+            "tools/call" if tasks && !params["task"].is_null() => {
+                started += 1;
+                let name = format!("t-{started}");
+                let said = params["arguments"]["message"].as_str().unwrap_or("");
+                running.insert(
+                    name.clone(),
+                    Task {
+                        text: format!("Echo: {said}"),
+                        asked: 0,
+                        cancelled: false,
+                        ttl: params["task"]["ttl"]
+                            .as_u64()
+                            .unwrap_or(LONGEST_TTL)
+                            .min(LONGEST_TTL),
+                    },
+                );
+                ok(id, running[&name].described(&name))
+            }
+            "tasks/get" if tasks => match running.get_mut(task_id(params)) {
+                Some(task) => {
+                    task.asked += 1;
+                    ok(id, task.described(task_id(params)))
+                }
+                None => err(id, -32602, &format!("Task {} not found", task_id(params))),
+            },
+            "tasks/list" if tasks => ok(
+                id,
+                json!({"tasks": running.iter().map(|(name, task)| task.described(name))
+                       .collect::<Vec<_>>()}),
+            ),
+            "tasks/cancel" if tasks => match running.get_mut(task_id(params)) {
+                Some(task) => {
+                    task.cancelled = true;
+                    ok(id, task.described(task_id(params)))
+                }
+                None => err(id, -32602, &format!("Task {} not found", task_id(params))),
+            },
+            // The result outlives the task the way a real server's does: the
+            // entry stays, so asking twice answers twice.
+            "tasks/result" if tasks => match running.get(task_id(params)) {
+                Some(task) => ok(
+                    id,
+                    json!({"content": [{"type": "text", "text": task.text}]}),
+                ),
+                None => err(id, -32602, &format!("Task {} not found", task_id(params))),
             },
             "tools/call" => match params["name"].as_str().unwrap_or("") {
                 // Real servers validate against the schema before running anything.
@@ -303,6 +418,12 @@ fn main() {
                         json!({"content": [{"type": "text", "text": format!("count={count}")}]}),
                     )
                 }
+                // What the spec has a `required` tool answer a call with no task.
+                "slow" if tasks => err(
+                    id,
+                    -32601,
+                    "Tool slow must be called as a task: pass params.task",
+                ),
                 other if unknown_tool_is_a_result => ok(
                     id,
                     json!({"isError": true, "content": [{"type": "text",
@@ -419,6 +540,11 @@ fn elicitation(url_mode: bool) -> Value {
         },
         "required": ["confirm", "region"],
     }})
+}
+
+/// Which task a `tasks/*` request is about.
+fn task_id(params: &Value) -> &str {
+    params["taskId"].as_str().unwrap_or("")
 }
 
 fn ok(id: Value, result: Value) -> Value {

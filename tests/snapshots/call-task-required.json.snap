@@ -1,0 +1,13 @@
+$ mcpdial --json call echo slow {"message":"eventually"}
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: eventually",
+      "type": "text"
+    }
+  ]
+}
+--- stderr
+note: slow only runs as a task; starting one and waiting for it

@@ -7,6 +7,7 @@
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
 //! config.json       how mcpdial itself behaves: where credentials are kept
 //! probes.json       what `ls` last saw: one status per server, with its timestamp
+//! tasks.json        which background tasks were started here, see [`crate::tasks`]
 //! run/NAME.sock     where a server kept alive by `start` listens, see [`crate::daemon`]
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
 //! ```
@@ -428,6 +429,14 @@ struct ProbesFile {
     probes: BTreeMap<String, ProbeRecord>,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TasksFile {
+    /// Server name, then task id: a task id is only unique to the server that
+    /// minted it, and every reader here wants one server's tasks anyway.
+    #[serde(default)]
+    tasks: BTreeMap<String, BTreeMap<String, TaskRecord>>,
+}
+
 /// The config directory and the files in it.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -480,6 +489,9 @@ impl Store {
     }
     pub fn probes_path(&self) -> PathBuf {
         self.dir.join("probes.json")
+    }
+    pub fn tasks_path(&self) -> PathBuf {
+        self.dir.join("tasks.json")
     }
     /// Where running daemons listen, one socket per server. Created by the
     /// daemon, and only for its owner to enter.
@@ -722,6 +734,101 @@ impl Store {
             write_json(&path, &file, false)?;
         }
         Ok(())
+    }
+
+    // -- background tasks started here ---------------------------------------
+
+    /// What this machine noted starting against `server`, minus whatever has
+    /// outlived the ttl the server promised to keep it for.
+    ///
+    /// Expiry is applied on the way out rather than by a sweep: a note is a
+    /// guess about a server's memory, and the guess goes stale on a clock
+    /// nobody has to be running for.
+    pub fn tasks(&self, server: &str) -> Result<BTreeMap<String, TaskRecord>> {
+        let mut mine = read_json::<TasksFile>(&self.tasks_path())?
+            .tasks
+            .remove(server)
+            .unwrap_or_default();
+        mine.retain(|_, task| !task.is_expired());
+        Ok(mine)
+    }
+
+    /// Note a task just started, keeping every other note in the file: two
+    /// invocations may be starting tasks at the same moment, and the one that
+    /// writes second must not lose the first one's id.
+    pub fn remember_task(&self, server: &str, id: &str, task: TaskRecord) -> Result<()> {
+        self.rewrite_tasks(|file| {
+            file.tasks
+                .entry(server.to_string())
+                .or_default()
+                .insert(id.to_string(), task);
+            true
+        })
+    }
+
+    /// Drop notes for tasks that are over: the ones named here, seen terminal or
+    /// gone from the server that was holding them, and any that have outlived
+    /// their ttl while nothing was looking.
+    ///
+    /// Called with nothing to name, this is that sweep on its own, which is why
+    /// every reader can afford to make it.
+    pub fn forget_tasks(&self, server: &str, ids: &[String]) -> Result<()> {
+        self.rewrite_tasks(|file| {
+            let Some(mine) = file.tasks.get_mut(server) else {
+                return false;
+            };
+            let before = mine.len();
+            for id in ids {
+                mine.remove(id);
+            }
+            mine.retain(|_, task| !task.is_expired());
+            let dropped = before - mine.len();
+            if mine.is_empty() {
+                file.tasks.remove(server);
+            }
+            dropped > 0
+        })
+    }
+
+    /// Read, change and write the notes under the lock, so a concurrent
+    /// invocation's write is either wholly before this one or wholly after it.
+    /// A change that changed nothing is not written at all.
+    fn rewrite_tasks(&self, change: impl FnOnce(&mut TasksFile) -> bool) -> Result<()> {
+        let path = self.tasks_path();
+        let _lock = FileLock::acquire(&path)?;
+        let mut file = read_json::<TasksFile>(&path)?;
+        if !change(&mut file) {
+            return Ok(());
+        }
+        write_json(&path, &file, false)
+    }
+}
+
+/// One background task this machine started and has not seen finish.
+///
+/// The task itself is the server's; this is only the note that says a task id
+/// exists, what it was, and how long the server said it would hold it. Nothing
+/// here is authoritative: `tasks/get` is, and every reader asks it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TaskRecord {
+    /// The tool the task is running, which no `tasks/get` result carries.
+    pub tool: String,
+    /// Unix seconds when the call that started it was answered.
+    pub started_at: u64,
+    /// Seconds the server said it would keep the task for, from `started_at`.
+    pub ttl: u64,
+}
+
+impl TaskRecord {
+    /// Whether the server is entitled to have forgotten this task by now. A
+    /// note that has outlived its ttl is the stale one: it names an id no
+    /// request will be spent on again.
+    pub fn is_expired(&self) -> bool {
+        self.started_at.saturating_add(self.ttl) < now()
+    }
+
+    pub fn age(&self) -> u64 {
+        now().saturating_sub(self.started_at)
     }
 }
 

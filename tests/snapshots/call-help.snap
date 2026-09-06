@@ -28,6 +28,15 @@ Options:
       --strict
           With --check: hold TOOL to the object the snapshot holds
 
+      --task
+          Have the server run TOOL in the background, and poll until it finishes
+
+      --detach
+          Start TOOL in the background, print the task id, and exit
+
+      --ttl <SECS>
+          Seconds the server is asked to keep a --task or --detach task for (default 3600)
+
   -h, --help
           Print help (see a summary with '-h')
 

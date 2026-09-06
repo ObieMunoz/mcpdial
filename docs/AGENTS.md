@@ -206,6 +206,65 @@ A `progressToken` is sent only when there is somewhere for the answer to go:
 progress at all, so nothing changes for it. In `shell` the same rules apply per
 command.
 
+## Background tasks
+
+A call that takes minutes need not hold the invocation. On protocol 2025-11-25, a
+server that declares `capabilities.tasks.requests.tools.call` will run a `tools/call`
+in the background and answer with a task object instead of a result.
+
+```
+mcpdial call TARGET TOOL ARGS --task [--ttl SECS]     poll to the end, print the result
+mcpdial call TARGET TOOL ARGS --detach [--ttl SECS]   print the task id, exit 0
+mcpdial tasks TARGET --json                           {"server","tasks":[...],"forgotten":[...]}
+mcpdial tasks TARGET get ID --json                    the task object, plus "tool" when known
+mcpdial tasks TARGET result ID --json                 blocks, then prints as `call` does
+mcpdial tasks TARGET cancel ID --json                 the task object, now cancelled
+```
+
+`--task` polls `tasks/get` at the server's own `pollInterval` (1s when it names none,
+30s at most) and then fetches `tasks/result`, so the exit code is `call`'s: 0, or 1
+when the result carries `isError` or the task ended `failed` or `cancelled`. A tool
+whose `execution.taskSupport` is `"required"` is started as a task whether or not
+`--task` was given, with a `note:` on stderr, so a call is never refused for the want
+of a flag. `--ttl SECS` asks the server to hold the task for that long, an hour by
+default; the server answers with what it agreed to.
+
+`--detach` prints the task id alone on stdout — `id=$(mcpdial call ... --detach)` — and
+the whole task object under `--json`, whose `taskId`, `pollInterval` and `ttl` save a
+first `tasks get`. A task object carries `taskId`, `status` (`working`,
+`input_required`, `completed`, `failed`, `cancelled`), `statusMessage`, `createdAt`,
+`lastUpdatedAt`, `ttl` and `pollInterval`; mcpdial adds `tool` beside them when this
+machine is the one that started the task, and never changes a key the server sent.
+
+The task belongs to the server. Nothing runs in the background here, so killing
+mcpdial mid-poll leaves the task running and `tasks TARGET result ID` still collects
+it. That is also why `--detach` against a **stdio** server is exit 2 until
+`mcpdial start NAME` is holding that process open: a task detached from a server this
+command spawned would die with the command. HTTP servers need nothing, though one that
+scopes tasks to an HTTP session may not recognise an id from another invocation, and
+says so.
+
+What lives on this machine is only a note, in `~/.config/mcpdial/tasks.json`: the ids
+started here, the tool each was, and the ttl the server agreed to. `tasks/get` is the
+only authority on a task's state. Notes are dropped as soon as anything sees a task
+reach a terminal status, when the server answers that it has never heard of the id
+(that id appears once under `forgotten`), and in any case once the ttl has passed —
+so a note whose server is gone does not accumulate and is never asked about again.
+
+Failure modes, all of them exit 1 with the usual `{"error":{...}}` on stderr except
+where noted:
+
+| What happened | What you get |
+|---|---|
+| The server offers no tasks | `-32601` with a hint naming `mcpdial info TARGET` |
+| The session is on a revision without tasks | Exit 2 saying which revision has them |
+| A task id the server does not hold | The server's own error, hinted with `mcpdial tasks TARGET` |
+| A task waiting on `input_required` | Exit 1: nothing polling it can answer; call the tool without `--task` |
+| `--detach` from a stdio server with no `start` | Exit 2, nothing sent, hint naming `mcpdial start NAME` |
+
+2026-07-28 moves tasks into an extension with a different shape; mcpdial does not speak
+that yet and says so rather than guessing.
+
 ## Resources and prompts
 
 Tools are one third of MCP. `mcpdial info TARGET --json` reports which of the three a

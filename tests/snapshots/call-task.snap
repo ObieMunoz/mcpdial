@@ -1,0 +1,5 @@
+$ mcpdial call echo echo {"message":"as a task"} --task
+exit 0
+--- stdout
+Echo: as a task
+--- stderr

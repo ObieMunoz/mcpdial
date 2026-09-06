@@ -1,0 +1,6 @@
+$ mcpdial call echo echo {} --detach
+exit 2
+--- stdout
+--- stderr
+error: echo is a stdio server dialed for this command alone; a task detached from it would end when this process does
+`mcpdial start echo` keeps it running so a detached task survives, or use --task to wait for this one.

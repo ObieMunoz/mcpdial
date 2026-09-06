@@ -140,6 +140,12 @@ mcpdial grep PATTERN [TARGET] [--tools] [--resources] [--prompts] [--instruction
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
 mcpdial call TARGET TOOL ... --check FILE [--strict]   refuse to call a tool that drifted
+mcpdial call TARGET TOOL ... --task [--ttl SECS]      the server runs it; poll until it finishes
+mcpdial call TARGET TOOL ... --detach [--ttl SECS]    the server runs it; print the id and exit
+mcpdial tasks TARGET             the background tasks that server is running
+mcpdial tasks TARGET get ID      one task's status, without waiting
+mcpdial tasks TARGET result ID   wait for one, then print its result as `call` would
+mcpdial tasks TARGET cancel ID   ask the server to stop one
 mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
 mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
@@ -321,6 +327,54 @@ filtered here.
 Under `--json` both arrive on stderr as one object per line,
 `{"notification":{"method":"notifications/progress","params":{...}}}`. stdout is the
 result and nothing else, whatever the server says on the way.
+
+### Starting a call and coming back for it
+
+Protocol 2025-11-25 lets the server run a tool call in the background and hand back a
+task id instead of a result. `--task` starts one and polls it to the end, at the
+interval the server asks for, showing whatever it says about itself on stderr at a
+terminal:
+
+```
+$ mcpdial call crawler crawl '{"url":"https://example.com"}' --task
+```
+
+The exit code is `call`'s: 0, or 1 when the result carries `isError` or the task ended
+`failed` or `cancelled`. A tool whose own metadata says `execution.taskSupport:
+"required"` is started as a task without being asked, with a note on stderr saying so,
+rather than refused.
+
+`--detach` starts the task, prints the id on stdout, and exits 0:
+
+```
+$ id=$(mcpdial call crawler crawl '{"url":"https://example.com"}' --detach)
+$ # ... do something else ...
+$ mcpdial tasks crawler get $id
+task t-4f9
+status working
+tool crawl
+message 12 of 40 pages
+$ mcpdial tasks crawler result $id > pages.json
+```
+
+`--ttl SECS` asks the server to keep the task for that long (an hour by default); what
+it agreed to is what mcpdial notes. `mcpdial tasks TARGET` lists what the server is
+running, `cancel ID` asks it to stop, and every one of them takes `--json`.
+
+The task is the server's, not mcpdial's: nothing runs in the background here, and
+killing mcpdial mid-poll leaves the task running for `tasks TARGET result` to collect.
+That is also the catch for a stdio server, whose process this command spawned and
+would take with it, so `--detach` against one is refused until [`start`](#keeping-a-stdio-server-running-between-calls)
+is holding it open. An HTTP server needs nothing: it was always somewhere else. One
+that scopes tasks to an HTTP session may still not recognise an id from a different
+invocation, and says so when asked.
+
+What is kept on this machine is a note, in `tasks.json`: which ids were started here,
+which tool each was, and how long the server said it would keep it. It is read to know
+what to ask about and to put a tool name beside a status that carries none; `tasks/get`
+is the only thing that says what state a task is in. Notes are dropped as soon as
+anything sees the task finish, and dropped anyway once the ttl has passed, so a note
+whose server has forgotten it does not accumulate.
 
 ### Arguments, without the quoting
 
@@ -1018,6 +1072,7 @@ host config, and `add --registry` writes them for what an entry marks as require
 ~/.config/mcpdial/config.json        how mcpdial behaves: where credentials are kept
 ~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
 ~/.config/mcpdial/registry/          a copy of the registry's list, for `search`
+~/.config/mcpdial/tasks.json         background task ids started here (a note, not the truth)
 ~/.config/mcpdial/run/NAME.sock      where a server kept running by `start` listens
 ```
 
