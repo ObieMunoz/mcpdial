@@ -303,3 +303,102 @@ fn save_dir_is_checked_before_anything_is_sent() {
         o.stderr
     );
 }
+
+/// What the terminal showed, with the carriage returns it adds taken back out
+/// and the newline that ends the last line with them: every assertion below is
+/// about what the line holds, not that it is a line.
+fn on_screen(home: &Path, args: &[&str], env: &[(&str, &str)]) -> String {
+    let shown = common::under_pty(home, args, env);
+    String::from_utf8_lossy(&shown)
+        .strip_suffix('\n')
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// iTerm2 and WezTerm draw the PNG below its placeholder, in one OSC 1337
+/// sequence; kitty and Ghostty in APC `_G` chunks; every other terminal, and
+/// every pipe, gets the placeholder alone.
+#[test]
+fn a_png_is_drawn_inline_only_on_a_terminal_that_says_it_can() {
+    if !cfg!(unix) || !cfg!(feature = "rich") {
+        eprintln!("skipped: needs `script` to make a pseudo-terminal, and the rich feature");
+        return;
+    }
+    let home = temp_home("media-inline");
+    let target = echo_target();
+    let call = ["call", target.as_str(), "shot"];
+    let encoded = STANDARD.encode(shot_png());
+    let placeholder = "done\n[image image/png, 4 KB]\n";
+
+    for program in ["iTerm.app", "WezTerm"] {
+        let shown = on_screen(&home, &call, &[("TERM_PROGRAM", program)]);
+        assert!(
+            shown.starts_with(&format!("{placeholder}\u{1b}]1337;File=inline=1;size=4096")),
+            "{program}: {}",
+            &shown[..shown.len().min(120)]
+        );
+        assert!(shown.ends_with(&format!(":{encoded}\u{7}")), "{program}");
+    }
+
+    for (var, value) in [
+        ("TERM_PROGRAM", "ghostty"),
+        ("KITTY_WINDOW_ID", "1"),
+        ("TERM", "xterm-kitty"),
+    ] {
+        let shown = on_screen(&home, &call, &[(var, value)]);
+        assert!(
+            shown.starts_with(&format!("{placeholder}\u{1b}_Ga=T,f=100,m=1;")),
+            "{var}={value}: {}",
+            &shown[..shown.len().min(120)]
+        );
+        assert!(shown.ends_with("\u{1b}\\"), "{var}={value}");
+        let carried: String = shown[placeholder.len()..]
+            .split("\u{1b}\\")
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| chunk.split_once(';').unwrap().1)
+            .collect();
+        assert_eq!(carried, encoded, "{var}={value}");
+    }
+
+    // A prompt's message carries its role in front of the placeholder.
+    let shown = on_screen(
+        &home,
+        &["prompt", target.as_str(), "poster"],
+        &[("TERM_PROGRAM", "iTerm.app"), ("ECHO_SERVER_PROMPTS", "1")],
+    );
+    assert!(
+        shown.contains(
+            "user: Caption this.\nuser: [image image/png, 4 KB]\n\u{1b}]1337;File=inline=1;size=4096"
+        ),
+        "{}",
+        &shown[..shown.len().min(160)]
+    );
+
+    for env in [
+        vec![],
+        vec![("TERM_PROGRAM", "Apple_Terminal")],
+        // A multiplexer's passthrough is not something to guess at.
+        vec![
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TMUX", "/tmp/tmux/default,1,0"),
+        ],
+        // Nothing is drawn for the reader that asked for the piped bytes.
+        vec![("TERM_PROGRAM", "iTerm.app"), ("MCPDIAL_PLAIN", "1")],
+    ] {
+        let shown = on_screen(&home, &call, &env);
+        assert_eq!(shown, placeholder.trim_end(), "{env:?}");
+    }
+}
+
+/// The agent surface: a pipe is the placeholder whatever terminal spawned it.
+#[test]
+fn a_pipe_is_never_drawn_on_however_the_terminal_names_itself() {
+    let home = temp_home("media-inline-piped");
+    for (var, value) in [("TERM_PROGRAM", "iTerm.app"), ("KITTY_WINDOW_ID", "1")] {
+        let o = run(echo(&home)
+            .env(var, value)
+            .args(["call", &echo_target(), "shot"]));
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        assert_eq!(o.stdout, "done\n[image image/png, 4 KB]\n", "{var}={value}");
+    }
+}

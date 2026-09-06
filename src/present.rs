@@ -10,12 +10,15 @@
 
 use crate::{Cli, Failure};
 use mcpdial::catalog;
-use mcpdial::session::ResourceBody;
+use mcpdial::session::{Media, ResourceBody};
 use mcpdial::Error;
 use serde_json::Value;
 use std::io::Write;
+use std::path::Path;
 use style::ColorMode;
 
+#[cfg(feature = "rich")]
+mod image;
 #[cfg(feature = "rich")]
 mod json;
 pub mod style;
@@ -44,6 +47,12 @@ pub trait Presenter {
     fn text(&self, text: &str) {
         self.line(text);
     }
+
+    /// A media block on its way to stdout, with the file its bytes landed in
+    /// when one did. A terminal that can show the image keeps it here, to draw
+    /// under the placeholder line when the text goes out; everywhere else,
+    /// including every pipe, this is nothing at all.
+    fn draw(&self, _media: &Media, _saved_to: Option<&Path>) {}
 
     /// A resource's bodies on stdout, byte for byte. `redirect` is the command
     /// that produced them, for a refusal to name.
@@ -255,6 +264,7 @@ fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
         no_pager: cli.no_pager,
         color_out: style::color_enabled(cli.color, true),
         color_err: style::color_enabled(cli.color, stderr_is_terminal),
+        image: image::protocol(|name| std::env::var(name).ok()),
         ..Rich::default()
     })
 }
@@ -342,6 +352,15 @@ pub struct Rich {
     /// Whether SGR sequences go to stdout, and whether they go to stderr.
     color_out: bool,
     color_err: bool,
+    /// Which escape sequence draws an image here, for the terminals that have
+    /// one. `Presenter::choose` decides that stdout is a person's terminal;
+    /// `image::protocol` decides only which terminal it is.
+    image: Option<image::Protocol>,
+    /// Each drawing waiting to go out, under the placeholder line it belongs
+    /// to, in the order the result's blocks were rendered.
+    drawings: std::cell::RefCell<Vec<(String, String)>>,
+    /// Whether the section since `page_start` has an image in it.
+    drew: std::cell::Cell<bool>,
     /// What the section since `page_start` has printed, until `page_end`
     /// decides where it goes.
     page: std::cell::RefCell<Option<Vec<u8>>>,
@@ -389,13 +408,21 @@ impl Presenter for Rich {
         let Some(page) = self.page.borrow_mut().take() else {
             return;
         };
-        let screen = terminal_size();
-        let rows = rows_on(&String::from_utf8_lossy(&page), screen.map(|s| s.0));
-        let pager = pager_for(rows, screen.map(|s| s.1), self.no_pager, |name| {
-            std::env::var(name).ok()
-        });
-        if pager.is_some_and(|pager| run_pager(&pager, &page)) {
-            return;
+        // A drawing the section never printed - output that went to a file, or
+        // a resource whose bodies leave raw - belongs to nothing after it.
+        self.drawings.borrow_mut().clear();
+        // A pager reads the page through a pipe and writes it back out its own
+        // way, which no image escape survives, so a page with one in it goes
+        // straight to the screen however tall it is.
+        if !self.drew.replace(false) {
+            let screen = screen();
+            let rows = rows_on(&String::from_utf8_lossy(&page), screen.map(|s| s.cols));
+            let pager = pager_for(rows, screen.map(|s| s.rows), self.no_pager, |name| {
+                std::env::var(name).ok()
+            });
+            if pager.is_some_and(|pager| run_pager(&pager, &page)) {
+                return;
+            }
         }
         Plain.bytes(&page).ok();
     }
@@ -417,8 +444,29 @@ impl Presenter for Rich {
     fn text(&self, text: &str) {
         match self.highlighted(text) {
             Some(painted) => self.line(&painted),
-            None => self.line(&visible(text)),
+            None => self.line(&self.shown(text)),
         }
+    }
+
+    /// The image is kept rather than drawn now: the placeholder line it goes
+    /// under has not been printed yet. Bytes that are not a PNG, and a terminal
+    /// with no way to show one, keep the placeholder alone.
+    fn draw(&self, media: &Media, saved_to: Option<&Path>) {
+        let Some(protocol) = self.image else {
+            return;
+        };
+        let screen = screen();
+        let Some(drawing) = image::drawing(
+            protocol,
+            &media.bytes,
+            screen.map(|s| s.cols),
+            screen.and_then(|s| s.cell),
+        ) else {
+            return;
+        };
+        self.drawings
+            .borrow_mut()
+            .push((mcpdial::session::describe(media, saved_to), drawing));
     }
 
     /// Base64 is no use to anyone reading it and raw bytes corrupt a terminal,
@@ -480,6 +528,30 @@ impl Rich {
                 cell.to_string()
             }
         })
+    }
+
+    /// A server's text with the cursor-moving characters escaped, and each
+    /// drawing on the line under the placeholder it belongs to. The placeholder
+    /// is the whole of the line for a tool result and the end of it for a
+    /// prompt's message, which carries the role in front. Both sides come from
+    /// the same `describe`, and each drawing is used once, so a server that
+    /// writes a placeholder out as text of its own costs at most the line an
+    /// image was going to sit on anyway.
+    fn shown(&self, text: &str) -> String {
+        let mut drawings = self.drawings.borrow_mut();
+        let mut out = String::with_capacity(text.len());
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&visible(line));
+            if let Some(at) = drawings.iter().position(|(under, _)| line.ends_with(under)) {
+                out.push('\n');
+                out.push_str(&drawings.remove(at).1);
+                self.drew.set(true);
+            }
+        }
+        out
     }
 
     fn error_prefix(&self) -> String {
@@ -649,11 +721,22 @@ fn shell_command(pager: &str) -> Option<std::process::Command> {
     Some(command)
 }
 
-/// The terminal on stdout as (columns, rows), when it can be asked. The
-/// `ioctl` is declared here rather than through a crate: std links libc
-/// already, and this is the one call needed.
+/// What the terminal on stdout says about itself.
+#[cfg(feature = "rich")]
+#[derive(Clone, Copy)]
+struct Screen {
+    cols: usize,
+    rows: usize,
+    /// The pixels one cell takes, from the terminals that report their own size
+    /// in pixels as well as in cells. An image is measured against it.
+    cell: Option<(usize, usize)>,
+}
+
+/// The terminal on stdout, when it can be asked. The `ioctl` is declared here
+/// rather than through a crate: std links libc already, and this is the one
+/// call needed.
 #[cfg(all(feature = "rich", unix))]
-fn terminal_size() -> Option<(usize, usize)> {
+fn screen() -> Option<Screen> {
     use std::os::raw::{c_int, c_ulong};
     #[repr(C)]
     struct WinSize {
@@ -674,7 +757,13 @@ fn terminal_size() -> Option<(usize, usize)> {
     // SAFETY: TIOCGWINSZ fills one `struct winsize`, which `WinSize` lays out
     // as C does, and touches nothing else.
     let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut size as *mut WinSize) };
-    (rc == 0 && size.rows > 0).then_some((size.cols as usize, size.rows as usize))
+    if rc != 0 || size.rows == 0 {
+        return None;
+    }
+    let (cols, rows) = (size.cols as usize, size.rows as usize);
+    let cell = (cols > 0 && size.x_pixels > 0 && size.y_pixels > 0)
+        .then(|| (size.x_pixels as usize / cols, size.y_pixels as usize / rows));
+    Some(Screen { cols, rows, cell })
 }
 
 /// Linux numbers its ioctls; the BSDs, and Darwin with them, encode the size
@@ -710,9 +799,10 @@ const TIOCGWINSZ: std::os::raw::c_ulong = 0x5468;
 ))]
 const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
 
-/// A console's height is not asked for, so nothing is paged on Windows.
+/// A console's size is not asked for, so nothing is paged on Windows and no
+/// image is measured against the screen there.
 #[cfg(all(feature = "rich", not(unix)))]
-fn terminal_size() -> Option<(usize, usize)> {
+fn screen() -> Option<Screen> {
     None
 }
 
@@ -1003,6 +1093,102 @@ mod tests {
         assert!(shell_command("bat -p").is_none());
         assert!(shell_command("sed s/a/b/ | less").is_some());
         assert!(shell_command("less --pattern='x'").is_some());
+    }
+
+    #[cfg(feature = "rich")]
+    fn shot() -> Media {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(4096, 0);
+        Media {
+            kind: "image".into(),
+            mime_type: "image/png".into(),
+            bytes,
+        }
+    }
+
+    #[cfg(feature = "rich")]
+    fn drawing_terminal() -> Rich {
+        Rich {
+            image: Some(image::Protocol::Iterm2),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_drawing_goes_under_the_placeholder_line_it_belongs_to() {
+        let rich = drawing_terminal();
+        rich.draw(&shot(), None);
+        let shown = rich.shown("done\n[image image/png, 4 KB]\nand after");
+        let (before, rest) = shown.split_once('\n').unwrap();
+        let (placeholder, rest) = rest.split_once('\n').unwrap();
+        let (drawn, after) = rest.split_once('\n').unwrap();
+        assert_eq!(
+            (before, placeholder, after),
+            ("done", "[image image/png, 4 KB]", "and after")
+        );
+        assert!(
+            drawn.starts_with("\x1b]1337;File=inline=1;size=4096"),
+            "{drawn:?}"
+        );
+        assert!(drawn.ends_with('\x07'), "{drawn:?}");
+        assert!(rich.drew.get(), "a page with an image in it is not paged");
+        // Used once: a second result gets nothing left over from the first.
+        assert_eq!(
+            rich.shown("[image image/png, 4 KB]"),
+            "[image image/png, 4 KB]"
+        );
+        // A prompt's message carries its role in front of the placeholder.
+        rich.draw(&shot(), None);
+        assert!(rich
+            .shown("user: [image image/png, 4 KB]")
+            .starts_with("user: [image image/png, 4 KB]\n\x1b]1337;File="));
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_terminal_with_no_way_to_draw_leaves_the_placeholder_alone() {
+        let rich = Rich::default();
+        rich.draw(&shot(), None);
+        assert_eq!(
+            rich.shown("[image image/png, 4 KB]"),
+            "[image image/png, 4 KB]"
+        );
+        assert!(!rich.drew.get());
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn anything_but_a_png_keeps_the_placeholder_on_a_terminal_that_could_draw() {
+        let rich = drawing_terminal();
+        let jpeg = Media {
+            kind: "image".into(),
+            mime_type: "image/jpeg".into(),
+            bytes: b"\xff\xd8\xff\xe0".to_vec(),
+        };
+        rich.draw(&jpeg, None);
+        assert_eq!(
+            rich.shown("[image image/jpeg, 4 B]"),
+            "[image image/jpeg, 4 B]"
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn escaping_is_untouched_by_the_drawings_beside_it() {
+        let rich = drawing_terminal();
+        let text = "Valid keys are: Enter,\r,\n,\0,\x1b[0m\tend";
+        assert_eq!(rich.shown(text), visible(text));
+        rich.draw(&shot(), Some(Path::new("shots/shot-1.png")));
+        assert_eq!(
+            rich.shown("[image saved to shots/shot-1.png, 4 KB]\r"),
+            "[image saved to shots/shot-1.png, 4 KB]\\r",
+            "a placeholder the server's own text ran into is not one of ours"
+        );
+        // The same line, and now it is: `--save-dir` names the file and draws it.
+        assert!(rich
+            .shown("[image saved to shots/shot-1.png, 4 KB]")
+            .contains("\x1b]1337;File="));
     }
 
     #[cfg(feature = "rich")]

@@ -1232,6 +1232,15 @@ fn placeholders(_: &Media) -> Result<Option<PathBuf>, Error> {
     Ok(None)
 }
 
+/// A media block's bytes filed where `--save-dir` says, and offered to the
+/// presenter, which draws them at a terminal that can show an image and does
+/// nothing anywhere else.
+fn filed(ui: &dyn Presenter, files: &MediaFiles, media: &Media) -> Result<Option<PathBuf>, Error> {
+    let path = files.place(media)?;
+    ui.draw(media, path.as_deref());
+    Ok(path)
+}
+
 /// A tool or prompt name as a file name: anything a shell or a filesystem would
 /// argue with becomes `_`.
 fn file_stem(name: &str) -> String {
@@ -1280,12 +1289,13 @@ type Render = fn(&Value, &mut MediaSink) -> Result<String, Error>;
 /// so the media moves into it as `path` and `bytes` instead, and the text is only
 /// for `call`'s argument-error check.
 fn rendered(
+    ui: &dyn Presenter,
     result: &mut Value,
     json: bool,
     files: &MediaFiles,
     render: Render,
 ) -> Result<String, Failure> {
-    let mut sink = |m: &Media| files.place(m);
+    let mut sink = |m: &Media| filed(ui, files, m);
     if json {
         if files.saves() {
             save_media(result, &mut sink)?;
@@ -1308,7 +1318,7 @@ fn emit(
     files: &MediaFiles,
     render: Render,
 ) -> Result<(), Failure> {
-    let text = rendered(result, json, files, render)?;
+    let text = rendered(ui, result, json, files, render)?;
     let payload = if json {
         Payload::Json {
             value: result,
@@ -1340,7 +1350,7 @@ fn emit_resource(
     files: &MediaFiles,
     redirect: &str,
 ) -> Result<(), Failure> {
-    let mut sink = |m: &Media| files.place(m);
+    let mut sink = |m: &Media| filed(ui, files, m);
     if json {
         if files.saves() {
             save_media(result, &mut sink)?;
@@ -2321,7 +2331,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                             dir: save_dir,
                                             stem: file_stem(tool),
                                         };
-                                        rendered(&mut result, cli.json, &files, render_content)
+                                        rendered(ui, &mut result, cli.json, &files, render_content)
                                             .and_then(|text| {
                                                 let failed = ui.paged(|| {
                                                     print_tool_result(
@@ -3000,7 +3010,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: file_stem(&tool),
             };
-            let text = rendered(&mut result, cli.json, &files, render_content)?;
+            let text = rendered(ui, &mut result, cli.json, &files, render_content)?;
             let is_error =
                 ui.paged(|| print_tool_result(ui, &out, &result, &text, cli.json, false))?;
             // A failed result that is really a schema complaint, or a server's way
