@@ -1046,6 +1046,11 @@ pub fn temp_home(tag: &str) -> PathBuf {
 pub fn mcpdial(home: &std::path::Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_mcpdial"));
     c.env("MCPDIAL_HOME", home).env_remove("XDG_CONFIG_HOME");
+    // The environment defaults for the global flags, so that a developer who
+    // exported one is running the suite CI runs.
+    for var in ["MCPDIAL_JSON", "MCPDIAL_TIMEOUT", "MCPDIAL_USER_AGENT"] {
+        c.env_remove(var);
+    }
     c
 }
 
