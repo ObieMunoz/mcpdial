@@ -20,7 +20,8 @@
 //! environment variable, not part of the entry).
 
 use crate::config::ServerConfig;
-use serde_json::Value;
+use crate::transport::stdio::split_command;
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -237,6 +238,49 @@ fn convert(name: &str, entry: &Value, scope: &str) -> Option<Found> {
         scope: scope.to_string(),
         notes,
     })
+}
+
+/// One saved server as a host entry, the inverse of [`convert`]: the stdio
+/// command line split back into `command` and `args` by the same splitter that
+/// runs it, `env`, `cwd`, `headers` and a numeric `timeout` as they are.
+///
+/// Nothing secret is in it, and nothing is invented: a `token_env` has no field
+/// in this shape and is left to the caller, which knows whether the host reads
+/// `${VAR}` in a header or names the variable itself.
+pub fn to_host_entry(config: &ServerConfig) -> Value {
+    let mut entry = serde_json::Map::new();
+    if let Some(url) = &config.http {
+        entry.insert("type".into(), json!("http"));
+        entry.insert("url".into(), json!(url));
+        if !config.headers.is_empty() {
+            entry.insert("headers".into(), json!(config.headers));
+        }
+    } else {
+        let line = config.stdio.as_deref().unwrap_or_default();
+        let argv = split_command(line).unwrap_or_else(|_| vec![line.to_string()]);
+        let (command, args) = argv
+            .split_first()
+            .map_or((line, &[][..]), |(c, rest)| (c.as_str(), rest));
+        entry.insert("command".into(), json!(command));
+        if !args.is_empty() {
+            entry.insert("args".into(), json!(args));
+        }
+        if !config.env.is_empty() {
+            entry.insert("env".into(), json!(config.env));
+        }
+        if let Some(cwd) = &config.cwd {
+            entry.insert("cwd".into(), json!(cwd));
+        }
+    }
+    if let Some(seconds) = config.timeout {
+        // Seconds, as every host writes them, and whole ones without a fraction.
+        let value = match seconds.fract() == 0.0 && seconds.abs() < 1e15 {
+            true => json!(seconds as i64),
+            false => json!(seconds),
+        };
+        entry.insert("timeout".into(), value);
+    }
+    Value::Object(entry)
 }
 
 /// VS Code's `inputs` array, by id: what the host would have prompted for.
@@ -796,6 +840,43 @@ mod tests {
             ["npx", "-y", "fs", "/tmp/my dir"],
             "quoting round-trips"
         );
+    }
+
+    #[test]
+    fn a_host_entry_read_back_is_the_same_server() {
+        let doc = json!({
+            "mcpServers": {
+                "fs": {"command": "npx", "args": ["-y", "fs", "/tmp/my dir", "it's"],
+                       "env": {"DEBUG": "1"}, "cwd": "/p", "timeout": 120},
+                "wiki": {"type": "http", "url": "https://x/mcp", "headers": {"X-A": "1"},
+                         "timeout": 2.5}
+            }
+        });
+        let imported = extract(&doc);
+        let exported: Vec<Value> = imported.iter().map(|f| to_host_entry(&f.config)).collect();
+        let again: Vec<Found> = imported
+            .iter()
+            .zip(&exported)
+            .map(|(f, entry)| convert(&f.name, entry, "mcpServers").unwrap())
+            .collect();
+        assert_eq!(imported, again, "import, export, import: the same servers");
+
+        assert_eq!(
+            exported[0]["args"],
+            json!(["-y", "fs", "/tmp/my dir", "it's"])
+        );
+        assert_eq!(exported[0]["timeout"], json!(120), "seconds, not 120.0");
+        assert!(exported[0].get("type").is_none(), "a command means stdio");
+        assert_eq!(exported[1]["type"], "http");
+        assert_eq!(exported[1]["timeout"], json!(2.5));
+
+        // What has no field in the shape is left out rather than guessed at.
+        let mut config = imported[1].config.clone();
+        config.token_env = Some("API_TOKEN".into());
+        config.deny = vec!["delete_*".into()];
+        let entry = to_host_entry(&config);
+        assert!(!entry.to_string().contains("API_TOKEN"), "{entry}");
+        assert!(!entry.to_string().contains("delete_"), "{entry}");
     }
 
     #[test]

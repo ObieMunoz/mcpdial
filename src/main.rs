@@ -200,6 +200,18 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Write saved servers out in a host's own shape, to stdout for you to redirect
+    Export {
+        /// Servers to export; every saved server when none is named
+        #[arg(value_name = "NAME")]
+        names: Vec<String>,
+        /// Shape to write: mcpservers (Claude, Cursor, Windsurf), vscode or codex
+        #[arg(long, default_value = "mcpservers", value_name = "FORMAT")]
+        format: mcpdial::export_config::Format,
+        /// Print this host file with the exported servers merged in; it is never written
+        #[arg(long, value_name = "FILE")]
+        merge: Option<std::path::PathBuf>,
+    },
     /// List the curated catalog of servers, grouped by category
     Catalog {
         /// Use the copy built into the binary instead of refreshing it
@@ -1864,6 +1876,23 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 println!("{receipt}");
             } else {
                 eprintln!("imported {} server(s)", imported.len());
+            }
+            Ok(0)
+        }
+
+        Cmd::Export {
+            names,
+            format,
+            merge,
+        } => {
+            let out = mcpdial::export_config::export(&store, &names, format, merge.as_deref())?;
+            print!("{}", out.document);
+            for note in out.notes {
+                if cli.json {
+                    eprintln!("{}", json!({ "note": note }));
+                } else {
+                    eprintln!("{note}");
+                }
             }
             Ok(0)
         }
