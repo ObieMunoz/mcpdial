@@ -1810,12 +1810,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             merge,
         } => {
             let out = mcpdial::export_config::export(&store, &names, format, merge.as_deref())?;
-            print!("{}", out.document);
+            ui.out(&out.document);
             for note in out.notes {
                 if cli.json {
-                    eprintln!("{}", json!({ "note": note }));
+                    ui.err_line(&json!({ "note": note }).to_string());
                 } else {
-                    eprintln!("{note}");
+                    ui.err_line(&note);
                 }
             }
             Ok(0)
