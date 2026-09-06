@@ -158,6 +158,7 @@ mcpdial completions SHELL        a completion script; see Install above
 ```
 
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
+`--trace FILE` to append every message and transport event to a file as JSON Lines,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, `--protocol-version
 VERSION` to name one MCP revision instead of working out which the server speaks,
@@ -687,6 +688,18 @@ object with a `kind` to branch on (`rpc`, `http`, `transport`, `auth`, `config`,
 input schema. Arguments can come from a file (`@args.json`) or stdin (`-`), or be
 `key=value` pairs typed from that schema, so quoting is never a problem. `shell --json`
 gives one JSON line per command, errors included, in order.
+
+To see, keep or share what actually went over the wire, pass `--trace FILE` (or set
+`MCPDIAL_TRACE=FILE`). Every message sent or received on any transport is appended as
+one JSON object per line, `{"t": "2026-09-05T10:11:12.345Z", "dir": "send", "transport":
+"http", "target": "wiki", "message": {...}}`, along with transport events (`"dir":
+"event"` with `"event": "http"`, `"spawn"`, `"exit"` or `"retry"` and a `"detail"`
+object: the status, content type and elapsed milliseconds of each HTTP attempt, or a
+stdio server's exit status and last stderr lines). No header is ever written, so a
+bearer token never is, and `access_token`, `refresh_token`, `client_secret` and `code`
+inside an OAuth exchange are replaced with `"****"`. The file is created owner-only,
+since tool output can be private; attach it to a bug report. `-v` is independent and
+may be given alongside.
 
 The full reference for programs is [docs/AGENTS.md](docs/AGENTS.md), and it is embedded
 in the binary: `mcpdial guide` prints it, so an agent can load it into context without

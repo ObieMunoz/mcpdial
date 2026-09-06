@@ -10,6 +10,7 @@ use mcpdial::session::{
     extension_for, render_content, render_messages, render_resource, resource_bodies, save_media,
     Media, MediaSink, ResourceBody,
 };
+use mcpdial::transport::trace::Trace;
 use mcpdial::{daemon, oauth, Credential, Error, KnownVersion, ServerConfig, Store, USER_AGENT};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -61,6 +62,11 @@ struct Cli {
     /// Trace every message on stderr (and pass a stdio server's stderr through)
     #[arg(short, long, global = true)]
     verbose: bool,
+
+    /// Append every message and transport event to FILE as JSON Lines, secrets
+    /// redacted (MCPDIAL_TRACE=FILE does the same everywhere)
+    #[arg(long, global = true, value_name = "FILE")]
+    trace: Option<PathBuf>,
 
     /// Override the User-Agent (HTTP only)
     #[arg(long, global = true, default_value = USER_AGENT, hide_default_value = true)]
@@ -1508,6 +1514,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
         verbose: cli.verbose,
         no_daemon: cli.no_daemon || daemon::disabled_by_env(),
         retry: !cli.no_retry,
+        trace: Trace::from_flag_or_env(cli.trace.as_deref())?,
         ..Options::default()
     };
     if let Some(dir) = &cli.save_dir {
@@ -2730,8 +2737,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 .then(|| read_secret(client_secret_env.as_deref(), "client secret"))
                 .transpose()?;
             let existing = store.credential(&r.name)?;
-            let http = oauth::Http::new(opts.timeout_for(&r)?, Some(opts.user_agent.clone()))
-                .retry(opts.retry);
+            let http = client::oauth_http(&opts, &r.name, opts.timeout_for(&r)?);
             let client_metadata = match client_metadata_url {
                 Some(url) => oauth::ClientMetadata::Url(url),
                 None if no_client_metadata => oauth::ClientMetadata::Never,

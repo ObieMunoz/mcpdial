@@ -9,7 +9,8 @@ use crate::protocol::{Error, KnownVersion, Result};
 use crate::session::Session;
 use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
-use crate::transport::{Logger, Transport};
+use crate::transport::trace::{self, Trace};
+use crate::transport::{Logger, TraceEvent, Transport};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -45,6 +46,9 @@ pub struct Options {
     pub no_daemon: bool,
     /// One more attempt after a transient HTTP failure; `--no-retry` clears it.
     pub retry: bool,
+    /// `--trace FILE` or `$MCPDIAL_TRACE`: where every message and transport
+    /// event is appended as JSON Lines, whatever `verbose` says.
+    pub trace: Option<Trace>,
 }
 
 impl Default for Options {
@@ -59,6 +63,7 @@ impl Default for Options {
             verbose: false,
             no_daemon: false,
             retry: true,
+            trace: None,
         }
     }
 }
@@ -97,10 +102,34 @@ impl Options {
         }
     }
 
-    fn logger(&self) -> Option<Logger> {
-        self.verbose
-            .then(|| Box::new(|s: &str| eprintln!("{s}")) as Logger)
+    /// Where a transport dialing `target` reports what it does: stderr prose
+    /// for `-v`, the trace file for `--trace`, both when both are on.
+    pub fn logger(&self, target: &str) -> Option<Logger> {
+        if !self.verbose && self.trace.is_none() {
+            return None;
+        }
+        let verbose = self.verbose;
+        let trace = self.trace.clone();
+        let target = target.to_string();
+        Some(Box::new(move |event: &TraceEvent<'_>| {
+            if verbose {
+                if let Some(line) = trace::describe(event) {
+                    eprintln!("{line}");
+                }
+            }
+            if let Some(trace) = &trace {
+                trace.record(&target, event);
+            }
+        }))
     }
+}
+
+/// The HTTP helper an OAuth exchange for `name` runs over, reporting where the
+/// server's own transport would.
+pub fn oauth_http(opts: &Options, name: &str, timeout: Duration) -> oauth::Http {
+    oauth::Http::new(timeout, Some(opts.user_agent.clone()))
+        .retry(opts.retry)
+        .log(opts.logger(name))
 }
 
 /// A target argument turned into something we can connect to.
@@ -226,7 +255,7 @@ fn refresh_and_save(
     opts: &Options,
     timeout: Duration,
 ) -> Result<Credential> {
-    let http = oauth::Http::new(timeout, Some(opts.user_agent.clone())).retry(opts.retry);
+    let http = oauth_http(opts, name, timeout);
     let fresh = if cred.renews_by_grant() {
         oauth::renew_client_credentials(&http, cred)?
     } else {
@@ -280,7 +309,7 @@ fn http_transport(
     for (k, v) in &opts.extra_headers {
         b = b.header(k.clone(), v.clone());
     }
-    if let Some(log) = opts.logger() {
+    if let Some(log) = opts.logger(&r.name) {
         b = b.log(log);
     }
     b.build()
@@ -343,7 +372,7 @@ fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
         r.config.cwd.as_deref().map(std::path::Path::new),
         opts.timeout_for(r)?,
         opts.verbose,
-        opts.logger(),
+        opts.logger(&r.name),
     )
 }
 
@@ -377,7 +406,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
     if r.config.stdio.is_some() {
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
-            if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger())? {
+            if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger(&r.name))? {
                 return handshake(r, t, AuthUsed::None, pinned);
             }
         }

@@ -4,6 +4,7 @@
 //! so for them "the connector is blocked" is close to meaningless: the server is
 //! a local program, and you run local programs.
 
+use super::trace::{Kind, TraceEvent, Wire};
 use super::{silent, Logger, Transport};
 use crate::protocol::{answer, classify, Error, Incoming, Result};
 use serde_json::Value;
@@ -28,16 +29,14 @@ pub(crate) struct Framed {
     lines: Receiver<String>,
     timeout: Duration,
     log: Logger,
-    /// What the two directions are called in trace output.
-    to: &'static str,
-    from: &'static str,
+    wire: Wire<'static>,
 }
 
 impl Framed {
     pub(crate) fn new(
         writer: impl Write + Send + 'static,
         reader: impl Read + Send + 'static,
-        (to, from): (&'static str, &'static str),
+        wire: Wire<'static>,
         timeout: Duration,
         log: Logger,
     ) -> Self {
@@ -57,9 +56,12 @@ impl Framed {
             lines: rx,
             timeout,
             log,
-            to,
-            from,
+            wire,
         }
+    }
+
+    pub(crate) fn note(&self, event: &TraceEvent<'_>) {
+        (self.log)(event)
     }
 
     fn write_line(&mut self, body: &str) -> io::Result<()> {
@@ -90,7 +92,11 @@ impl Framed {
         forward: &mut dyn FnMut(&Value) -> Option<Value>,
     ) -> Result<Option<Value>> {
         let body = payload.to_string();
-        (self.log)(&format!("-> {}\n   {body}", self.to));
+        let wire = self.wire;
+        (self.log)(&TraceEvent::Sent {
+            wire,
+            message: payload,
+        });
         if self.write_line(&body).is_err() {
             return Err(gone());
         }
@@ -115,31 +121,36 @@ impl Framed {
             if line.is_empty() {
                 continue;
             }
-            let from = self.from;
             let Ok(msg) = serde_json::from_str::<Value>(line) else {
-                (self.log)(&format!("<- {from} (ignored, not JSON)\n   {line}"));
+                (self.log)(&TraceEvent::NotJson { wire, line });
                 continue;
+            };
+            let received = |kind| TraceEvent::Received {
+                wire,
+                message: &msg,
+                kind,
             };
             match classify(&msg, Some(id)) {
                 Incoming::Response => {
-                    (self.log)(&format!("<- {from}\n   {line}"));
+                    (self.log)(&received(Kind::Reply));
                     return Ok(Some(msg));
                 }
                 Incoming::ServerRequest { id: theirs, method } => {
-                    (self.log)(&format!("<- {from} (server request)\n   {line}"));
-                    let reply = forward(&msg)
-                        .unwrap_or_else(|| answer(theirs, method))
-                        .to_string();
-                    (self.log)(&format!("-> {}\n   {reply}", self.to));
-                    if self.write_line(&reply).is_err() {
+                    (self.log)(&received(Kind::ServerRequest));
+                    let reply = forward(&msg).unwrap_or_else(|| answer(theirs, method));
+                    (self.log)(&TraceEvent::Sent {
+                        wire,
+                        message: &reply,
+                    });
+                    if self.write_line(&reply.to_string()).is_err() {
                         return Err(gone());
                     }
                 }
                 Incoming::Notification { .. } => {
-                    (self.log)(&format!("<- {from} (other message)\n   {line}"));
+                    (self.log)(&received(Kind::Other));
                     forward(&msg);
                 }
-                Incoming::Foreign => (self.log)(&format!("<- {from} (other message)\n   {line}")),
+                Incoming::Foreign => (self.log)(&received(Kind::Other)),
             }
         }
     }
@@ -150,6 +161,8 @@ pub struct StdioTransport {
     framed: Framed,
     /// The server's most recent stderr lines, shown when it dies without replying.
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// Whether the process's end has been traced; it is traced once.
+    exit_noted: bool,
 }
 
 impl StdioTransport {
@@ -214,16 +227,16 @@ impl StdioTransport {
             });
         }
 
+        let log = log.unwrap_or_else(silent);
+        log(&TraceEvent::Spawned {
+            pid: child.id(),
+            command: argv,
+        });
         Ok(Self {
             child,
-            framed: Framed::new(
-                stdin,
-                stdout,
-                ("stdin", "stdout"),
-                timeout,
-                log.unwrap_or_else(silent),
-            ),
+            framed: Framed::new(stdin, stdout, Wire::Stdio, timeout, log),
             stderr_tail,
+            exit_noted: false,
         })
     }
 
@@ -250,12 +263,33 @@ impl StdioTransport {
             child,
             framed,
             stderr_tail,
+            ..
         } = self;
-        framed.exchange(payload, &mut || post_mortem(child, stderr_tail), forward)
+        let outcome = framed.exchange(payload, &mut || post_mortem(child, stderr_tail), forward);
+        if outcome.is_err() {
+            self.note_exit();
+        }
+        outcome
     }
 
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Trace the process's end, once it has ended and only the first time.
+    fn note_exit(&mut self) {
+        if self.exit_noted {
+            return;
+        }
+        let Ok(Some(status)) = self.child.try_wait() else {
+            return;
+        };
+        self.exit_noted = true;
+        let stderr_tail = self.stderr_tail.lock().unwrap().iter().cloned().collect();
+        self.framed.note(&TraceEvent::Exited {
+            status: status.code(),
+            stderr_tail,
+        });
     }
 }
 
@@ -305,14 +339,19 @@ impl Transport for StdioTransport {
     fn close(&mut self) {
         self.framed.close_writer();
         // Give a well-behaved server a moment to exit on EOF, then insist.
+        let mut exited = false;
         for _ in 0..50 {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+            exited = matches!(self.child.try_wait(), Ok(Some(_)));
+            if exited {
+                break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if !exited {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+        self.note_exit();
     }
 }
 
