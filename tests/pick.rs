@@ -400,6 +400,45 @@ fn a_first_run_at_a_terminal_says_what_to_do_and_hands_the_prompt_back() {
     assert!(done.took < BOUND, "took {:?}, the bound", done.took);
 }
 
+/// The other half of the same rule. With servers saved there is something to
+/// pick, but a bare `mcpdial` still says where things stand rather than acting:
+/// the saved servers as the last probe left them, and the commands that do
+/// something. `probes.json` is the witness - dialing a server writes one, and
+/// a bare run must leave the file exactly as it found it.
+#[test]
+fn a_bare_mcpdial_with_servers_saved_greets_and_dials_nothing() {
+    if no_pty() {
+        return;
+    }
+    let home = home_with_echo("pick-greet-saved");
+    let probes = home.join("probes.json");
+    assert!(
+        !probes.exists(),
+        "`add --no-probe` left a probe behind, so the witness proves nothing"
+    );
+
+    let done = under_pty(&home, &[], &[]);
+    assert_eq!(done.code, 0, "{}", done.output);
+    for said in ["echo", "mcpdial pick", "mcpdial ls", "mcpdial --help"] {
+        assert!(
+            done.output.contains(said),
+            "the greeting never said {said:?}: {}",
+            done.output
+        );
+    }
+    assert!(
+        !done.output.contains(SERVER_QUESTION),
+        "a bare run opened the picker: {}",
+        done.output
+    );
+    assert!(
+        !probes.exists(),
+        "a bare run dialed the saved server: {}",
+        std::fs::read_to_string(&probes).unwrap_or_default()
+    );
+    assert!(done.took < BOUND, "took {:?}, the bound", done.took);
+}
+
 /// `mcpdial pick`, the explicit spelling of the bare form, refuses a pipe
 /// rather than reading one: exit 2, and the commands that do the same job
 /// without a person.
@@ -495,15 +534,15 @@ fn at_a_terminal_a_picked_call_runs_and_prints_the_command_it_ran() {
     let home = home_with_echo("pick-tty");
     if !cfg!(feature = "rich") {
         // The agent-only build has no `Rich` to ask with, so a terminal is a
-        // pipe here too and the bare form is the usage error it always was.
-        let done = under_pty(&home, &[], &[]);
+        // pipe here too and `pick` refuses it rather than reading it.
+        let done = under_pty(&home, &["pick"], &[]);
         assert_eq!(done.code, 2, "{}", done.output);
-        assert!(done.output.contains(TODAYS_USAGE), "{}", done.output);
+        assert!(done.output.contains("pick needs a"), "{}", done.output);
         assert!(!done.output.contains(SERVER_QUESTION), "{}", done.output);
         assert!(done.took < BOUND, "took {:?}, the bound", done.took);
         return;
     }
-    for args in [vec![], vec!["pick"]] {
+    for args in [vec!["pick"]] {
         let mut child = pty(&home, &call_line(&args), &[])
             .spawn()
             .expect("spawn script");
@@ -596,7 +635,7 @@ fn the_server_picker_hands_fzf_a_header_and_narrows_the_search_to_the_name() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let done = under_pty(&home, &[], &[]);
+    let done = under_pty(&home, &["pick"], &[]);
     // Exit 130 from fzf is a person leaving the picker, which is not a failure.
     assert_eq!(done.code, 0, "{}", done.output);
     let recorded = std::fs::read_to_string(&recorded).expect("the shim recorded its arguments");

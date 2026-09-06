@@ -45,62 +45,73 @@ pub fn at_a_terminal(cli: &crate::Cli) -> bool {
     !crate::present::wants_plain(cli) && std::io::stdin().is_terminal()
 }
 
-/// What a bare `mcpdial` does in place of clap's usage error.
-pub enum Bare {
-    /// A person, and saved servers to pick between.
-    Pick,
-    /// A person on a first run: [`welcome`], and their prompt back.
-    Welcome,
-    /// Everything else, which is the usage error and exit 2.
-    Usage,
+/// What a bare `mcpdial` says. Nothing here dials anything: that is the whole
+/// point of it, and [`client::saved`] is chosen over [`client::listing`] for
+/// exactly that reason.
+pub fn welcome(ui: &dyn Presenter, store: &Store) -> Result<(), Failure> {
+    ui.line(ABOUT);
+    let saved = client::saved(store)?;
+    let Some(first) = saved.first() else {
+        ui.line(NOTHING_SAVED);
+        return Ok(());
+    };
+    let counted = match saved.len() {
+        1 => "1 server saved, as the last dial left it".to_string(),
+        n => format!("{n} servers saved, as the last dial left them"),
+    };
+    ui.line(&format!("\n{counted}:\n"));
+    let rows: Vec<Vec<String>> = saved.iter().map(row).collect();
+    ui.table(&SAVED_HEADERS, &rows);
+    ui.line(&format!(
+        "\nwhat next:\n  \
+         mcpdial pick          # pick a server and a tool, and make the call\n  \
+         mcpdial ls            # dial them all for a status that is current\n  \
+         mcpdial tools {:<8}# what one server offers\n\n\
+         `mcpdial --help` lists every command.",
+        shell_word(&first.name)
+    ));
+    Ok(())
 }
 
-/// Which of the three a bare `mcpdial` is, decided before there is a command
-/// to make a presenter for. A pipe, a program, `--json` and `--plain` get the
-/// usage error they always have. A person with nothing saved is greeted rather
-/// than dropped into a list of servers to install, which answers a question
-/// they have not been asked yet and costs a fetch to draw. A person with
-/// servers saved gets the picker, in a build with a `Rich` presenter to ask
-/// them anything with; that last is the same answer [`Presenter::asks`] gives.
-pub fn bare(cli: &crate::Cli) -> Bare {
-    if !at_a_terminal(cli) {
-        return Bare::Usage;
-    }
-    if nothing_saved() {
-        return Bare::Welcome;
-    }
-    match cfg!(feature = "rich") {
-        true => Bare::Pick,
-        false => Bare::Usage,
-    }
-}
-
-/// Whether this is a first run. A config that will not open or will not parse
-/// is not one, and falls through to the command that says why.
-fn nothing_saved() -> bool {
-    Store::from_env()
-        .and_then(|store| store.servers())
-        .is_ok_and(|servers| servers.is_empty())
-}
-
-/// What a first run says: what the tool is, the three ways to get a server
-/// into it, and what the bare form will do once one is saved.
-const WELCOME: &str = "\
+/// What mcpdial is, in the two lines someone who has just installed it needs.
+const ABOUT: &str = "\
 mcpdial dials MCP servers from the shell: what a server offers, a call to one of
-its tools, and a name to keep it under. No servers are saved yet.
+its tools, and a name to keep it under.";
+
+/// The rest of a first run: the three ways to get a server, and what to do once
+/// there is one.
+const NOTHING_SAVED: &str = "
+No servers are saved yet.
 
 getting started:
   mcpdial import        # the servers Claude, Cursor and VS Code already have
   mcpdial browse        # tick what you want from a reviewed catalog
   mcpdial add wiki --http https://mcp.deepwiki.com/mcp
 
-Then `mcpdial ls` says what is saved and whether it answers, and a bare
-`mcpdial` picks a server and a tool and makes the call. `mcpdial --help` lists
-every command.";
+Then `mcpdial ls` says what is saved and whether it answers, and `mcpdial pick`
+picks a server and a tool and makes the call. `mcpdial --help` lists every
+command.";
 
-/// [`WELCOME`] on stdout, where a person's `--help` goes too.
-pub fn welcome(ui: &dyn Presenter) {
-    ui.line(WELCOME);
+const SAVED_HEADERS: [&str; 4] = ["NAME", "TYPE", "STATUS", "CHECKED"];
+
+fn row(s: &client::Saved) -> Vec<String> {
+    let (status, checked) = match &s.last {
+        Some((status, age)) => (status.label(), checked_label(*age)),
+        None => ("-".into(), "never".into()),
+    };
+    vec![s.name.clone(), s.kind.into(), status, checked]
+}
+
+/// How long ago a probe ran. `ls` counts in minutes because what it shows was
+/// taken seconds ago; this column may be showing a status from months back, and
+/// the point of it is how much salt to take that with.
+fn checked_label(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 /// A server, a tool, its arguments, and the call.

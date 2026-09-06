@@ -59,7 +59,7 @@ mcpdial export [NAME...] [--format mcpservers|vscode|codex] [--merge FILE]  the 
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 mcpdial browse [--all] [--offline]   tick catalog servers to save and dial; the saved ones start ticked
-mcpdial pick                     pick a server and a tool, run it, print the call; what a bare `mcpdial` does
+mcpdial pick                     pick a server and a tool, run it, print the call
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
@@ -181,15 +181,14 @@ a script. Nothing is asked unless stdin is a terminal: under `--json`, under
 `--plain`, and with anything piped in, a missing argument is the error and the usage
 line it has always been.
 
-A bare `mcpdial` at a terminal, with servers already saved, picks one: the saved
-servers with the status of their last probe, then that server's tools with the first
-line of what each one is for, then the arguments asked for from the tool's schema
-exactly as above. The call runs, the result is shown, and the line that would have
-made the same call outright is printed under it in dim text, quoted so it pastes
-straight into a script:
+`mcpdial pick` at a terminal picks one: the saved servers with the status of their
+last probe, then that server's tools with the first line of what each one is for,
+then the arguments asked for from the tool's schema exactly as above. The call runs,
+the result is shown, and the line that would have made the same call outright is
+printed under it in dim text, quoted so it pastes straight into a script:
 
 ```
-$ mcpdial
+$ mcpdial pick
   1) echo  connected  stdio  5 tools
 server (1-1): 1
   1) echo   Echo a message back.
@@ -200,16 +199,22 @@ Echo: hello there
 mcpdial call echo echo 'message=hello there'
 ```
 
-`mcpdial pick` is the same thing spelled out, for anyone who aliases the bare form.
 Picking is `fzf` where it is on `PATH` (`--height 40% --reverse`), and the numbered
 list above where it is not; either the number or the line itself answers, and `^D`
-or Esc leaves without sending anything. With nothing saved yet there is nothing to
-pick, and the bare form prints a few lines instead: what mcpdial is, the three ways
-to get a server into it (`import`, `browse`, `add`), and the prompt back at exit 0.
-Nothing is fetched to print them. Under a pipe, under `--json` and under `--plain`
-a bare `mcpdial` is the usage error and exit 2 it has always been, and `mcpdial
-pick` says it needs a terminal rather than reading one, so a script that calls
-either by mistake still fails at once instead of waiting for a keystroke.
+or Esc leaves without sending anything.
+
+A bare `mcpdial` never does any of that. It dials nothing, spawns nothing and calls
+nothing, whatever is saved: it says what mcpdial is, then where things stand, then
+the commands that do something, and gives the prompt back at exit 0. With nothing
+saved that is the three ways to get a server (`import`, `browse`, `add`); with
+servers saved it is a short table of them as the last dial left them - name,
+transport, status and how long ago that status was taken, read from
+`probes.json` rather than measured now, so a status can be stale and says so.
+`mcpdial ls` is the same list dialed fresh, and `mcpdial pick` is the picker.
+Under a pipe, under `--json` and under `--plain` a bare `mcpdial` is the usage error
+and exit 2 it has always been, and `mcpdial pick` says it needs a terminal rather
+than reading one, so a script that calls either by mistake still fails at once
+instead of waiting for a keystroke.
 
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one

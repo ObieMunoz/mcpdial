@@ -645,22 +645,8 @@ enum TokenCmd {
 fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        // A bare `mcpdial` at a terminal picks one of the saved servers, and
-        // with nothing saved says what the tool is and how to get a server
-        // into it; a pipe, a program and `--json` get clap's help and exit 2,
-        // as ever.
         Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            let mut bare = Cli::parse_from(["mcpdial", "pick"]);
-            // MCPDIAL_JSON in the environment is a program asking, not a person.
-            let _ = env_defaults::apply(&mut bare);
-            match pick::bare(&bare) {
-                pick::Bare::Pick => bare,
-                pick::Bare::Welcome => {
-                    pick::welcome(<dyn Presenter>::choose(&bare).as_ref());
-                    return ExitCode::SUCCESS;
-                }
-                pick::Bare::Usage => e.exit(),
-            }
+            return bare_mcpdial(e)
         }
         Err(e) => e.exit(),
     };
@@ -678,10 +664,35 @@ fn main() -> ExitCode {
             } else {
                 f.report(ui.as_ref());
             }
-            ExitCode::from(match f.error {
-                Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
-                _ => EXIT_ERROR,
-            })
+            ExitCode::from(f.exit_code())
+        }
+    }
+}
+
+/// A bare `mcpdial`: [`pick::welcome`] for a person, and clap's usage error for
+/// every pipe, program, `--json` and `--plain`, exactly as it has always been.
+/// Never the picker and never a dial, whatever is saved - `mcpdial pick` is
+/// where choosing a server and calling one of its tools lives, and asking for
+/// it is what starts it.
+fn bare_mcpdial(e: clap::Error) -> ExitCode {
+    // Somewhere to read the global flags from. The argv behind this error
+    // carries none of them - a flag without a subcommand is a different clap
+    // error, which never reaches here - so the environment is the whole of
+    // what there is to find, and MCPDIAL_JSON in it is a program asking.
+    let mut cli = Cli::parse_from(["mcpdial", "pick"]);
+    let _ = env_defaults::apply(&mut cli);
+    if !pick::at_a_terminal(&cli) {
+        e.exit();
+    }
+    let ui = <dyn Presenter>::choose(&cli);
+    match Store::from_env()
+        .map_err(Failure::from)
+        .and_then(|store| pick::welcome(ui.as_ref(), &store))
+    {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(f) => {
+            f.report(ui.as_ref());
+            ExitCode::from(f.exit_code())
         }
     }
 }
@@ -702,6 +713,15 @@ impl Failure {
             error,
             hint: Some(hint.into()),
             tool: None,
+        }
+    }
+
+    /// What the process exits with: a request that was never going to work is
+    /// told apart from one that failed on its way out.
+    fn exit_code(&self) -> u8 {
+        match self.error {
+            Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
+            _ => EXIT_ERROR,
         }
     }
 
