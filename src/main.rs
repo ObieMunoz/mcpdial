@@ -3188,6 +3188,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         "client_id": cred.client_id,
                         "registration": cred.registration,
                         "has_client_secret": cred.client_secret.is_some(),
+                        "issuer": cred.issuer,
                         "token_endpoint": cred.token_endpoint,
                     }),
                 );
@@ -3230,6 +3231,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             .as_deref()
                             .unwrap_or(oauth::CLIENT_SECRET_POST)
                     ));
+                }
+                if let Some(i) = &cred.issuer {
+                    ui.line(&format!("  issuer:        {i}"));
                 }
                 if let Some(t) = &cred.token_endpoint {
                     ui.line(&format!("  token url:     {t}"));

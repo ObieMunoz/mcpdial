@@ -43,6 +43,9 @@ pub struct Metadata {
     pub registration_endpoint: Option<String>,
     /// The server fetches a client ID metadata document, so a URL can be the client id.
     pub client_id_metadata_document_supported: bool,
+    /// RFC 9207: the server says every authorization response names its issuer, so
+    /// one that arrives without an `iss` is a response to reject.
+    pub authorization_response_iss_parameter_supported: bool,
     pub scopes_supported: Vec<String>,
     pub token_endpoint_auth_methods_supported: Vec<String>,
     /// Empty when the server did not say; RFC 8414 then implies `authorization_code`
@@ -428,6 +431,7 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
             }
         }
     }
+    let stated_issuer = validated_issuer(&meta, &issuer)?;
 
     let field = |name: &str, default: String| -> String {
         meta[name].as_str().map(str::to_string).unwrap_or(default)
@@ -443,7 +447,11 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         client_id_metadata_document_supported: meta["client_id_metadata_document_supported"]
             .as_bool()
             .unwrap_or(false),
-        issuer,
+        authorization_response_iss_parameter_supported: meta
+            ["authorization_response_iss_parameter_supported"]
+            .as_bool()
+            .unwrap_or(false),
+        issuer: stated_issuer,
         scopes_supported: scopes,
         token_endpoint_auth_methods_supported: string_list(
             &meta["token_endpoint_auth_methods_supported"],
@@ -451,6 +459,28 @@ pub fn discover(http: &Http, mcp_url: &str, challenge: Option<&str>) -> Result<M
         grant_types_supported: string_list(&meta["grant_types_supported"]),
         resource: mcp_url.to_string(),
     })
+}
+
+/// The issuer to hold the authorization response to, out of a metadata document
+/// fetched for `discovered`.
+///
+/// RFC 8414 section 3.3 refuses a document that names a different issuer than the
+/// one its URL was built from, which is the whole point of the `iss` check below:
+/// an unvalidated issuer would be no protection at all. The document's own
+/// spelling is what an `iss` will be compared with, byte for byte, so it is what
+/// is kept: a trailing slash `discovered` had stripped to build the well-known
+/// URL is the one difference that is not a different issuer.
+fn validated_issuer(document: &Value, discovered: &str) -> Result<String> {
+    match document["issuer"].as_str() {
+        None => Ok(discovered.to_string()),
+        Some(stated) if stated.trim_end_matches('/') == discovered.trim_end_matches('/') => {
+            Ok(stated.to_string())
+        }
+        Some(stated) => Err(Error::auth(format!(
+            "authorization server metadata for {discovered} names {stated} as its issuer; \
+             refusing to use it"
+        ))),
+    }
 }
 
 fn string_list(v: &Value) -> Vec<String> {
@@ -535,6 +565,11 @@ pub fn register(http: &Http, meta: &Metadata, redirect_uri: &str) -> Result<Stri
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
+        // An OpenID Connect registration endpoint reads an absent application_type
+        // as "web", and a web client may not redirect to loopback. mcpdial is a
+        // command-line client and has nowhere else to redirect to; a server that
+        // does not implement OIDC ignores the field.
+        "application_type": "native",
     });
     let (status, value, text) = http.post_json(endpoint, &body)?;
     if !(200..300).contains(&status) {
@@ -639,6 +674,22 @@ enum ClientId {
     Register,
 }
 
+/// The authorization server a saved client id belongs to, when that is not the one
+/// now being logged in to and the id may therefore not be presented.
+///
+/// RFC 6749 section 2.2 makes a client id unique to the authorization server that
+/// issued it, and 2026-07-28 draws the conclusion: a persisted client id is keyed
+/// by that issuer, is never reused with another, and is registered afresh when the
+/// server behind an MCP endpoint changes. A client ID metadata document is the one
+/// exception, being a URL every authorization server resolves for itself. A
+/// credential saved before mcpdial recorded issuers names none, and is adopted by
+/// the first login that discovers one rather than thrown away.
+fn bound_elsewhere<'a>(cred: &'a Credential, issuer: &str) -> Option<&'a str> {
+    let saved = cred.issuer.as_deref()?;
+    let portable = saved_registration(cred) == Registration::ClientMetadataDocument;
+    (cred.client_id.is_some() && saved != issuer && !portable).then_some(saved)
+}
+
 /// How a credential saved before the method was recorded came by its client id:
 /// only a client registered out of band has a secret.
 fn saved_registration(c: &Credential) -> Registration {
@@ -732,6 +783,19 @@ fn urldecode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn escape_html(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '&' => "&amp;".into(),
+            '<' => "&lt;".into(),
+            '>' => "&gt;".into(),
+            '"' => "&quot;".into(),
+            '\'' => "&#39;".into(),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
 fn query_params(query: &str) -> Vec<(String, String)> {
     query
         .split('&')
@@ -745,20 +809,60 @@ fn query_params(query: &str) -> Vec<(String, String)> {
 
 // -- the loopback redirect ----------------------------------------------------
 
+/// Who the authorization response has to say it came from (RFC 9207), recorded
+/// before the browser is opened and checked before the code is redeemed.
+///
+/// The attack this defends against is a mix-up: an authorization server the client
+/// also trusts, or one that got itself into discovery, sending back a code minted
+/// somewhere else. Redeeming it hands the wrong server's code to the right server's
+/// token endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedIssuer {
+    issuer: String,
+    /// Whether the server advertises that it always sends `iss`, which makes a
+    /// response without one a rejection rather than a server that has not caught up.
+    always_sent: bool,
+}
+
+impl ExpectedIssuer {
+    /// The four rows of the 2026-07-28 table: a present `iss` is always compared,
+    /// by simple string comparison (RFC 3986 section 6.2.1) with no normalisation
+    /// of scheme, host, port, trailing slash or percent-encoding; an absent one is
+    /// refused only where the server said it always sends one.
+    fn check(&self, iss: Option<&str>) -> Result<()> {
+        match iss {
+            Some(found) if found == self.issuer => Ok(()),
+            Some(found) => Err(Error::auth(format!(
+                "authorization response came from {found}, not {}; \
+                 refusing to redeem the code",
+                self.issuer
+            ))),
+            None if self.always_sent => Err(Error::auth(format!(
+                "authorization response named no issuer, and {} advertises that it \
+                 always names one; refusing to redeem the code",
+                self.issuer
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Serve exactly one `/callback` request on `listener` and return the `code`.
 fn wait_for_code(
     listeners: Vec<TcpListener>,
     expected_state: &str,
+    expected_issuer: &ExpectedIssuer,
     timeout: Duration,
 ) -> Result<String> {
     let (tx, rx) = mpsc::channel::<Result<String>>();
     for listener in listeners {
         let tx = tx.clone();
         let state = expected_state.to_string();
+        let issuer = expected_issuer.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
-                match handle_callback(stream, &state) {
+                match handle_callback(stream, &state, &issuer) {
                     Some(result) => {
                         let _ = tx.send(result);
                         return;
@@ -777,7 +881,47 @@ fn wait_for_code(
     })?
 }
 
-fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result<String>> {
+/// What one callback's query string amounts to: the authorization code, or why
+/// there is not one to redeem.
+///
+/// The issuer is settled first and alone. A response whose `iss` is not the one
+/// expected is not this server's response, so nothing else in it may be believed:
+/// the spec forbids acting on or displaying its `error`, `error_description` or
+/// `error_uri`, and this is where that is enforced.
+fn callback_result(
+    params: &[(String, String)],
+    expected_state: &str,
+    expected_issuer: &ExpectedIssuer,
+) -> Result<String> {
+    let get = |k: &str| {
+        params
+            .iter()
+            .find(|(pk, _)| pk == k)
+            .map(|(_, v)| v.as_str())
+    };
+    expected_issuer.check(get("iss"))?;
+    if let Some(err) = get("error") {
+        return Err(Error::auth(format!(
+            "authorization server returned {err}: {}",
+            get("error_description").unwrap_or("")
+        )));
+    }
+    if get("state") != Some(expected_state) {
+        return Err(Error::auth(
+            "state mismatch on callback; possible CSRF, aborting",
+        ));
+    }
+    match get("code") {
+        Some(code) => Ok(code.to_string()),
+        None => Err(Error::auth("callback had neither code nor error")),
+    }
+}
+
+fn handle_callback(
+    mut stream: TcpStream,
+    expected_state: &str,
+    expected_issuer: &ExpectedIssuer,
+) -> Option<Result<String>> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let mut reader = BufReader::new(stream.try_clone().ok()?);
     let mut line = String::new();
@@ -798,35 +942,15 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> Option<Result
         }
     }
 
-    let params = query_params(query);
-    let get = |k: &str| {
-        params
-            .iter()
-            .find(|(pk, _)| pk == k)
-            .map(|(_, v)| v.as_str())
-    };
-
-    let result = if let Some(err) = get("error") {
-        Err(Error::auth(format!(
-            "authorization server returned {err}: {}",
-            get("error_description").unwrap_or("")
-        )))
-    } else if get("state") != Some(expected_state) {
-        Err(Error::auth(
-            "state mismatch on callback; possible CSRF, aborting",
-        ))
-    } else if let Some(code) = get("code") {
-        Ok(code.to_string())
-    } else {
-        Err(Error::auth("callback had neither code nor error"))
-    };
+    let result = callback_result(&query_params(query), expected_state, expected_issuer);
 
     let (title, msg) = match &result {
         Ok(_) => (
             "Signed in",
-            "mcpdial has the authorization code. You can close this tab.",
+            "mcpdial has the authorization code. You can close this tab.".to_string(),
         ),
-        Err(e) => ("Sign-in failed", &*e.to_string()),
+        // Half of what a failure says was written by whoever sent the browser here.
+        Err(e) => ("Sign-in failed", escape_html(&e.to_string())),
     };
     let html = format!(
         "<!doctype html><meta charset=utf-8><title>{title}</title>\
@@ -908,6 +1032,25 @@ pub fn login(
     let meta = discover(http, mcp_url, chal.as_deref())?;
     notify(&format!("authorization server: {}", meta.issuer));
 
+    let existing = match existing.map(|c| (c, bound_elsewhere(c, &meta.issuer))) {
+        Some((c, Some(was))) => {
+            if opts.client_id.is_none() && saved_registration(c) == Registration::PreRegistered {
+                return Err(Error::auth(format!(
+                    "the saved client was registered with {was}, and this server now \
+                     authorizes at {}; pass --client-id for a client registered there, or \
+                     `mcpdial logout` first",
+                    meta.issuer
+                )));
+            }
+            notify(&format!(
+                "authorization server is no longer {was}; registering with {} instead",
+                meta.issuer
+            ));
+            None
+        }
+        _ => existing,
+    };
+
     // A saved client id is only reusable with the exact redirect URI it was
     // registered for, which means the same port and the same loopback host. The
     // port is still worth asking for first when the id turns out not to matter.
@@ -982,6 +1125,12 @@ pub fn login(
 
     let (verifier, code_challenge) = pkce()?;
     let state = random_urlsafe(16)?;
+    // Recorded here, beside the verifier and the state and before the browser is
+    // sent anywhere, because that is what makes it worth comparing on the way back.
+    let expected_issuer = ExpectedIssuer {
+        issuer: meta.issuer.clone(),
+        always_sent: meta.authorization_response_iss_parameter_supported,
+    };
     let scope = opts
         .scope
         .clone()
@@ -1024,7 +1173,7 @@ pub fn login(
     }
     notify(&format!("waiting for the callback on {redirect_uri} ..."));
 
-    let code = wait_for_code(listeners, &state, opts.timeout)?;
+    let code = wait_for_code(listeners, &state, &expected_issuer, opts.timeout)?;
 
     let mut params = vec![
         ("grant_type", "authorization_code"),
@@ -1055,6 +1204,7 @@ pub fn login(
     cred.registration = Some(registration.as_str().to_string());
     cred.redirect_port = Some(port);
     cred.redirect_host = Some(host);
+    cred.issuer = Some(meta.issuer.clone());
     cred.resource = Some(meta.resource.clone());
     cred.source = Some("oauth".into());
     if cred.scope.is_none() {
@@ -1168,6 +1318,7 @@ pub fn client_credentials(
         registration: Some(Registration::PreRegistered.as_str().to_string()),
         client_secret: Some(client_secret.to_string()),
         scope,
+        issuer: Some(meta.issuer.clone()),
         resource: Some(meta.resource.clone()),
         source: Some(CLIENT_CREDENTIALS.into()),
         ..Default::default()
@@ -1506,6 +1657,7 @@ mod tests {
             token_endpoint: String::new(),
             registration_endpoint: None,
             client_id_metadata_document_supported: false,
+            authorization_response_iss_parameter_supported: false,
             scopes_supported: Vec::new(),
             token_endpoint_auth_methods_supported: Vec::new(),
             grant_types_supported: grants.iter().map(|g| g.to_string()).collect(),
@@ -1528,6 +1680,162 @@ mod tests {
             "https://as does not offer the client_credentials grant; it supports: \
              authorization_code, refresh_token"
         );
+    }
+
+    /// The table in the 2026-07-28 authorization spec, row by row.
+    #[test]
+    fn an_authorization_response_is_held_to_the_issuer_it_was_asked_of() {
+        let expected = |always_sent| ExpectedIssuer {
+            issuer: "https://as.example".into(),
+            always_sent,
+        };
+        for always_sent in [true, false] {
+            assert!(expected(always_sent)
+                .check(Some("https://as.example"))
+                .is_ok());
+            let err = expected(always_sent)
+                .check(Some("https://evil.example"))
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "authorization response came from https://evil.example, not \
+                 https://as.example; refusing to redeem the code"
+            );
+        }
+        // Absent is refused only where the server advertised that it always sends one.
+        assert!(expected(false).check(None).is_ok());
+        assert!(expected(true).check(None).is_err());
+    }
+
+    /// RFC 3986 section 6.2.1 and nothing beyond it: every one of these is a
+    /// different issuer, however close it looks.
+    #[test]
+    fn the_issuer_comparison_normalises_nothing() {
+        let expected = ExpectedIssuer {
+            issuer: "https://as.example".into(),
+            always_sent: true,
+        };
+        for near_miss in [
+            "https://as.example/",
+            "https://AS.example",
+            "HTTPS://as.example",
+            "https://as.example:443",
+            "https://as.exa%6dple",
+        ] {
+            assert!(expected.check(Some(near_miss)).is_err(), "{near_miss}");
+        }
+    }
+
+    #[test]
+    fn a_mismatched_issuer_is_settled_before_the_rest_of_the_response_is_read() {
+        let params = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect::<Vec<_>>()
+        };
+        let expected = ExpectedIssuer {
+            issuer: "https://as.example".into(),
+            always_sent: false,
+        };
+        let code = params(&[
+            ("code", "abc"),
+            ("state", "st"),
+            ("iss", "https://as.example"),
+        ]);
+        assert_eq!(callback_result(&code, "st", &expected).unwrap(), "abc");
+
+        // An error response from somewhere else is neither acted on nor repeated.
+        let elsewhere = params(&[
+            ("error", "access_denied"),
+            ("error_description", "no such user"),
+            ("state", "st"),
+            ("iss", "https://evil.example"),
+        ]);
+        let err = callback_result(&elsewhere, "st", &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https://evil.example"), "{err}");
+        assert!(!err.contains("access_denied"), "{err}");
+        assert!(!err.contains("no such user"), "{err}");
+
+        // The state check still stands behind it.
+        let wrong_state = params(&[("code", "abc"), ("state", "other")]);
+        assert!(callback_result(&wrong_state, "st", &expected)
+            .unwrap_err()
+            .to_string()
+            .contains("state mismatch"));
+    }
+
+    #[test]
+    fn what_a_failed_callback_shows_the_browser_cannot_be_markup() {
+        assert_eq!(
+            escape_html(r#"<script>alert("x&y")</script>"#),
+            "&lt;script&gt;alert(&quot;x&amp;y&quot;)&lt;/script&gt;"
+        );
+    }
+
+    /// RFC 8414 section 3.3: metadata that names another issuer is not this
+    /// server's metadata. The recorded issuer is the document's own spelling, so
+    /// that a `iss` written the same way compares equal.
+    #[test]
+    fn metadata_that_names_another_issuer_is_refused() {
+        let doc = |issuer: &str| json!({"issuer": issuer, "token_endpoint": "https://as/t"});
+        assert_eq!(
+            validated_issuer(&doc("https://as.example"), "https://as.example").unwrap(),
+            "https://as.example"
+        );
+        assert_eq!(
+            validated_issuer(&doc("https://as.example/"), "https://as.example").unwrap(),
+            "https://as.example/",
+            "discovery strips the trailing slash to build the well-known URL"
+        );
+        assert_eq!(
+            validated_issuer(&Value::Null, "https://as.example").unwrap(),
+            "https://as.example"
+        );
+        let err = validated_issuer(&doc("https://honest.example"), "https://attacker.example")
+            .unwrap_err();
+        assert!(matches!(err, Error::Auth(_)), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "authorization server metadata for https://attacker.example names \
+             https://honest.example as its issuer; refusing to use it"
+        );
+    }
+
+    #[test]
+    fn a_client_id_stays_with_the_authorization_server_that_granted_it() {
+        let saved = |issuer: Option<&str>, registration: &str| Credential {
+            client_id: Some("client-abc".into()),
+            registration: Some(registration.into()),
+            issuer: issuer.map(str::to_string),
+            ..Default::default()
+        };
+        let here = "https://as.example";
+        let elsewhere = "https://other.example";
+        assert_eq!(bound_elsewhere(&saved(Some(here), "dynamic"), here), None);
+        assert_eq!(
+            bound_elsewhere(&saved(Some(elsewhere), "dynamic"), here),
+            Some(elsewhere)
+        );
+        assert_eq!(
+            bound_elsewhere(&saved(Some(elsewhere), "pre-registered"), here),
+            Some(elsewhere)
+        );
+        // A URL the authorization server resolves itself is the same URL anywhere.
+        assert_eq!(
+            bound_elsewhere(&saved(Some(elsewhere), "client_metadata_document"), here),
+            None
+        );
+        // Saved before mcpdial recorded issuers: adopted, not thrown away.
+        assert_eq!(bound_elsewhere(&saved(None, "dynamic"), here), None);
+        // Nothing was registered, so there is nothing bound to anywhere.
+        let token_only = Credential {
+            issuer: Some(elsewhere.into()),
+            ..Default::default()
+        };
+        assert_eq!(bound_elsewhere(&token_only, here), None);
     }
 
     #[test]

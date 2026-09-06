@@ -420,6 +420,12 @@ goes to stdout in that mode, so there is no receipt.
   band), `mcpdial login TARGET --grant client-credentials --client-id ID
   --client-secret-env VAR` needs no human: no browser, no redirect, and the token is
   renewed by running the grant again.
+- A credential belongs to the authorization server that issued it, and `token show
+  --json` names that server under `issuer`. An authorization response that names a
+  different one, or none where the server says it always sends one, is refused before
+  the code is redeemed; a server that has moved to another authorization server is
+  registered with afresh, unless the client was registered out of band, which fails
+  naming both and wants `--client-id` for one the new server knows.
 - If a token already exists in the environment: `mcpdial --token-env VAR ...` or
   `mcpdial token set NAME --env VAR`. Never put a token on the command line.
 - Saved tokens refresh automatically. A `token_rejected` status after that means the

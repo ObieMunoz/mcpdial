@@ -8,6 +8,7 @@ exit 0
   "has_access_token": true,
   "has_client_secret": false,
   "has_refresh_token": false,
+  "issuer": null,
   "name": "work",
   "registration": null,
   "scope": null,
