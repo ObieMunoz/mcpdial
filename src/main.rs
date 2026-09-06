@@ -35,9 +35,11 @@ mod env_defaults;
 mod notices;
 mod output;
 mod present;
+mod snapshot;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
 const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
+const EXIT_DRIFT: u8 = 3; // --check: the server no longer matches the snapshot
 
 /// The positionals more than one subcommand takes, worded once so they cannot
 /// drift apart.
@@ -347,6 +349,16 @@ enum Cmd {
         /// Include the tools the server's allow and deny lists hide, marked (denied)
         #[arg(long, requires = "target")]
         all: bool,
+        /// Write the tools in full to FILE, which must not exist, instead of listing them
+        #[arg(long, value_name = "FILE", requires = "target", conflicts_with_all = ["long", "all"])]
+        snapshot: Option<PathBuf>,
+        /// Report how the tools differ from a snapshot; exit 3 when a caller would break
+        #[arg(long, value_name = "FILE", requires = "target",
+              conflicts_with_all = ["snapshot", "long", "all"])]
+        check: Option<PathBuf>,
+        /// With --check: hold every snapshotted tool to the object the snapshot holds
+        #[arg(long, requires = "check")]
+        strict: bool,
     },
     /// Initialize and show server identity and capabilities
     Info {
@@ -367,6 +379,12 @@ enum Cmd {
         /// Print a url-mode elicitation's address instead of opening a browser
         #[arg(long)]
         no_browser: bool,
+        /// Refuse to call when TOOL has drifted from this snapshot; exit 3 with the differences
+        #[arg(long, value_name = "FILE")]
+        check: Option<PathBuf>,
+        /// With --check: hold TOOL to the object the snapshot holds
+        #[arg(long, requires = "check")]
+        strict: bool,
     },
     /// Show one tool's name, description, and input and output schemas
     Schema {
@@ -2877,13 +2895,33 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             target: Some(target),
             long,
             all,
+            snapshot: to_file,
+            check,
+            strict,
         } => {
+            // Both files are answered before anything is dialed: a path that
+            // could never be written, and a snapshot that is not one, cost no
+            // connection.
+            if let Some(path) = &to_file {
+                snapshot::reserve(path)?;
+            }
+            let promised = check.as_deref().map(snapshot::read).transpose()?;
             let mut conn = dial(&store, &opts, &target)?;
             let tools = if all {
                 conn.list_all_tools()?
             } else {
                 conn.list_tools()?
             };
+            if let Some(path) = to_file {
+                snapshot::write(&path, &snapshot::document(&conn.server_info, &tools))?;
+                snapshot::wrote(ui, cli.json, &path, tools.len());
+                return Ok(0);
+            }
+            if let Some(promised) = promised {
+                let comparison = snapshot::compare(&promised, &tools, strict);
+                comparison.report(ui, cli.json, snapshot::Report::Stdout);
+                return Ok(if comparison.ok() { 0 } else { EXIT_DRIFT });
+            }
             if cli.json {
                 print_json(ui, &json!({ "tools": brief::tools(&tools, long) }));
             } else {
@@ -2938,7 +2976,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             arguments,
             elicit,
             no_browser,
+            check,
+            strict,
         } => {
+            let promised = check.as_deref().map(snapshot::read).transpose()?;
             opts.elicit = elicitation(elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             // A JSON object is settled before anything is dialed, as it always
@@ -2964,6 +3005,21 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let r = client::resolve(&store, &target)?;
             refuse_denied(&r.config, &r.name, &tool)?;
             let mut conn = client::connect(&store, &r, &opts)?;
+            // Nothing is sent for a tool the snapshot says has moved. A
+            // comparison that passes says nothing at all, so the result stays
+            // the only thing this command prints.
+            if let Some(promised) = promised {
+                let live = conn.list_tools()?;
+                let comparison = snapshot::compare(
+                    &snapshot::named(&promised, &tool),
+                    &snapshot::named(&live, &tool),
+                    strict,
+                );
+                if !comparison.ok() {
+                    comparison.report(ui, cli.json, snapshot::Report::Stderr);
+                    return Ok(EXIT_DRIFT);
+                }
+            }
             let prefix = format!("mcpdial call {}", shell_word(&target));
             let tools_cmd = format!("`mcpdial tools {}`", shell_word(&target));
             let hint = |conn: &mut client::Connection, argument_error: bool| {
