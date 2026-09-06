@@ -3,7 +3,7 @@ use clap_complete::Shell;
 use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
 use mcpdial::config::Source;
-use mcpdial::protocol::METHOD_NOT_FOUND;
+use mcpdial::protocol::{is_not_found, INVALID_PARAMS, METHOD_NOT_FOUND};
 use mcpdial::registry::{Pick, Registry, Resolved};
 use mcpdial::serve;
 use mcpdial::session::{
@@ -636,6 +636,15 @@ fn info_hint(target: &str) -> String {
     format!("`mcpdial info {}`", shell_word(target))
 }
 
+/// Where to look for the resource or prompt the server did have.
+fn resources_hint(target: &str) -> String {
+    format!("`mcpdial resources {}`", shell_word(target))
+}
+
+fn prompts_hint(target: &str) -> String {
+    format!("`mcpdial prompts {} --long`", shell_word(target))
+}
+
 /// The config a registry entry describes, with every value it needs in hand.
 /// Nothing is run: the command line is built, not tried.
 fn from_registry(
@@ -1013,9 +1022,14 @@ fn server_refused(e: &Error) -> bool {
 
 /// A server error that the tool's schema would have prevented. Any other error
 /// is the tool's own failure, and printing a schema under it is just noise.
+///
+/// `-32602` is asked to carry more meanings with every revision - 2026-07-28 gave
+/// it a missing resource too - so it only settles the question here because the one
+/// caller is a `tools/call` that named a tool the server has. A name it does not
+/// have is answered by `call_hint` before this is consulted.
 fn is_argument_error(e: &Error) -> bool {
     match e {
-        Error::Rpc { code: -32602, .. } => true,
+        Error::Rpc { code, .. } if *code == INVALID_PARAMS => true,
         Error::Rpc { message, .. } => reads_as_argument_error(message),
         _ => false,
     }
@@ -1031,8 +1045,9 @@ fn reads_as_argument_error(text: &str) -> bool {
 }
 
 /// A server that never implemented `resources/*` or `prompts/*` answers `-32601`,
-/// which reads as a mistake in the request. Its `initialize` result already listed
-/// what it does implement, so point there instead of at the bare code.
+/// which reads as a mistake in the request. Its `initialize` or `server/discover`
+/// result already listed what it does implement, so point there instead of at the
+/// bare code.
 fn missing_capability(e: Error, capability: &str, info_cmd: &str) -> Failure {
     let never_implemented = matches!(&e, Error::Rpc { code, .. } if *code == METHOD_NOT_FOUND);
     if never_implemented {
@@ -1042,6 +1057,23 @@ fn missing_capability(e: Error, capability: &str, info_cmd: &str) -> Failure {
         )
     } else {
         e.into()
+    }
+}
+
+/// One resource or prompt the server does not have, as against a whole capability
+/// it never implemented.
+///
+/// 2026-07-28 answers a URI or a name it does not know with `-32602`, the code every
+/// other method spends on arguments it would not take; the revisions before it
+/// answered a missing resource with `-32002`, which that one retired. Neither number
+/// says so on its own, so the listing does.
+fn missing_item(e: Error, capability: &str, list_cmd: &str, info_cmd: &str) -> Failure {
+    match &e {
+        Error::Rpc { code, .. } if is_not_found(*code) => Failure::hinted(
+            e,
+            format!("{list_cmd} lists the {capability} this server does have."),
+        ),
+        _ => missing_capability(e, capability, info_cmd),
     }
 }
 
@@ -2109,7 +2141,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     "read" => match watched(&mut notices, |w| {
                         conn.session.read_resource_watching(rest, w)
                     }) {
-                        Err(e) => Err(missing_capability(e, "resources", info_cmd)),
+                        Err(e) => Err(missing_item(e, "resources", "`resources`", info_cmd)),
                         Ok(mut result) => {
                             let redirect = format!("mcpdial read {} {}", shell_word(&target), rest);
                             let files = MediaFiles {
@@ -2160,7 +2192,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         conn.session.get_prompt_watching(name, a, w)
                                     })
                                 })
-                                .map_err(|e| missing_capability(e, "prompts", info_cmd))
+                                .map_err(|e| {
+                                    missing_item(e, "prompts", "`prompts --long`", info_cmd)
+                                })
                                 .and_then(|mut result| {
                                     let files = MediaFiles {
                                         dir: save_dir,
@@ -2426,8 +2460,14 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let mut conn = dial(&store, &opts, &target)?;
             let outcome = conn.session.read_resource_watching(&uri, &mut notices);
             notices.finish();
-            let mut result =
-                outcome.map_err(|e| missing_capability(e, "resources", &info_hint(&target)))?;
+            let mut result = outcome.map_err(|e| {
+                missing_item(
+                    e,
+                    "resources",
+                    &resources_hint(&target),
+                    &info_hint(&target),
+                )
+            })?;
             let redirect = format!("mcpdial read {} {}", shell_word(&target), shell_word(&uri));
             let files = MediaFiles {
                 dir: save_dir,
@@ -2480,8 +2520,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 .session
                 .get_prompt_watching(&name, arguments, &mut notices);
             notices.finish();
-            let mut result =
-                outcome.map_err(|e| missing_capability(e, "prompts", &info_hint(&target)))?;
+            let mut result = outcome.map_err(|e| {
+                missing_item(e, "prompts", &prompts_hint(&target), &info_hint(&target))
+            })?;
             if !cli.json {
                 if let Some(d) = result["description"].as_str() {
                     ui.err_line(d);
@@ -3383,13 +3424,70 @@ mod tests {
         }
     }
 
+    fn rpc(code: i64, message: &str) -> Error {
+        Error::Rpc {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    #[test]
+    fn a_capability_a_server_never_had_is_told_from_one_item_it_lacks() {
+        let listing = "`mcpdial resources web`";
+        let info = "`mcpdial info web`";
+
+        let none_at_all = missing_capability(
+            rpc(METHOD_NOT_FOUND, "Method not found: resources/list"),
+            "resources",
+            info,
+        );
+        assert_eq!(
+            none_at_all.hint.as_deref(),
+            Some("this server offers no resources; `mcpdial info web` lists what it does offer.")
+        );
+
+        // The code 2026-07-28 gives a resource that is not there, and the one every
+        // revision before it gave: the same answer, so the same hint.
+        for code in [INVALID_PARAMS, mcpdial::protocol::RESOURCE_NOT_FOUND_LEGACY] {
+            let one_missing = missing_item(
+                rpc(code, "Resource not found: file:///nope"),
+                "resources",
+                listing,
+                info,
+            );
+            assert_eq!(
+                one_missing.hint.as_deref(),
+                Some("`mcpdial resources web` lists the resources this server does have."),
+                "{code}"
+            );
+        }
+
+        // A method the server never implemented still reads as the capability being
+        // absent, whichever way the request was framed.
+        let no_capability = missing_item(
+            rpc(METHOD_NOT_FOUND, "Method not found: resources/read"),
+            "resources",
+            listing,
+            info,
+        );
+        assert!(
+            no_capability.hint.as_deref().unwrap().contains("offers no"),
+            "{:?}",
+            no_capability.hint
+        );
+
+        // Anything else is the server's own trouble and gets no hint invented for it.
+        assert!(
+            missing_item(rpc(-32603, "boom"), "resources", listing, info)
+                .hint
+                .is_none()
+        );
+    }
+
     #[test]
     fn argument_errors_are_recognised_in_both_shapes() {
-        assert!(is_argument_error(&Error::Rpc {
-            code: -32602,
-            message: "bad".into(),
-            data: None
-        }));
+        assert!(is_argument_error(&rpc(INVALID_PARAMS, "bad")));
         // The same complaint arriving as the text of a failed result.
         assert!(reads_as_argument_error(
             "MCP error -32602: Invalid arguments for tool press_key: Required at pageId"

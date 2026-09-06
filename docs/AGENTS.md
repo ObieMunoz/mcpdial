@@ -210,6 +210,13 @@ is a string. `mcpdial prompts TARGET --long` is where they are.
 A server that never implemented one of these answers `-32601`. That error carries a `hint`
 naming the missing capability, so a bare method-not-found never has to be decoded.
 
+One resource or prompt the server does not have is a different answer, and it depends on
+the protocol revision: `resources/read` is `-32602` on 2026-07-28 and `-32002` on every
+revision before it, and `prompts/get` is `-32602` throughout. mcpdial reads all three the
+same way, and the error carries a `hint` naming the listing that would have shown what
+does exist, so neither number has to be decoded either. `-32602` from a `tools/call` still
+means the arguments, and carries the tool's usage as before.
+
 ## Exit codes and errors
 
 | Exit | Meaning |

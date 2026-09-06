@@ -3,3 +3,4 @@ exit 1
 --- stdout
 --- stderr
 error: MCP error -32602: Prompt nope not found
+`mcpdial prompts web --long` lists the prompts this server does have.

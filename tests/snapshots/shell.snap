@@ -90,6 +90,10 @@ error: unknown command "nope"
 commands: tools, schema TOOL, call TOOL {"arg": "value"}, resources, read URI, prompts, prompt NAME, raw METHOD, info, help, quit
 error: MCP error -32602: Tool nope not found
 `tools` lists all 2 tools on this server.
+error: MCP error -32602: Prompt nope not found
+`prompts --long` lists the prompts this server does have.
+error: MCP error -32002: Resource not found: file:///nope
+`resources` lists the resources this server does have.
 commands (one per line; # starts a comment):
   tools [--long]             every tool this server offers
   schema TOOL                one tool's full JSON input schema

@@ -539,8 +539,8 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("prompt-pairs", &["prompt", "web", "summarize", "text=a memo"]),
         Case::both("shell", &["shell", "web"]).stdin(
             "tools\ncall add {\"a\":1,\"b\":2}\ncall add a=5 b=6\nnope\ncall nope\ncall add\nresources\n\
-             prompts\nprompt greet\nread file:///readme.md\ninfo\nhelp\nhelp add\n\
-             schema add\nraw tools/list\nadd\n# a comment\n\nquit\n",
+             prompts\nprompt greet\nprompt nope\nread file:///readme.md\nread file:///nope\n\
+             info\nhelp\nhelp add\nschema add\nraw tools/list\nadd\n# a comment\n\nquit\n",
         ),
         Case::both("shell-denied", &["shell", "fs"])
             .stdin("call fail {}\ncall echo {\"message\":\"ok\"}\n"),
