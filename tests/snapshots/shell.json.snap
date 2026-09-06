@@ -4,7 +4,7 @@ exit 1
 {"tools":[{"description":"Echo a message back.","name":"echo"},{"description":"Add two numbers.","name":"add"}]}
 {"content":[{"text":"The sum of 1 and 2 is 3.","type":"text"}],"structuredContent":{"sum":3.0}}
 {"content":[{"text":"The sum of 5 and 6 is 11.","type":"text"}],"structuredContent":{"sum":11.0}}
-{"error":{"hint":"commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {\"x\": 1}, info, help, quit","kind":"usage","message":"unknown command \"nope\""}}
+{"error":{"hint":"commands: tools, schema TOOL, call TOOL {\"arg\": \"value\"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {\"x\": 1}, info, help, quit (or exit)","kind":"usage","message":"unknown command \"nope\""}}
 {"error":{"code":-32602,"hint":"`tools` lists all 2 tools on this server.","kind":"rpc","message":"MCP error -32602: Tool nope not found"}}
 {"content":[{"text":"The sum of 0 and 0 is 0.","type":"text"}],"structuredContent":{"sum":0.0}}
 {"resourceTemplates":[{"description":"One note, by name.","name":"note","uriTemplate":"file:///notes/{name}.md"}],"resources":[{"description":"The project readme.","name":"readme","uri":"file:///readme.md"},{"description":"A tiny picture.","name":"logo","uri":"file:///logo.png"}]}
@@ -31,7 +31,7 @@ commands (one per line; # starts a comment):
   raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
   elicit {"arg": "value"}    answers for whatever the server elicits from here on
   info                       the initialize result
-  quit                       close the session
+  quit (or exit)             close the session
 
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.

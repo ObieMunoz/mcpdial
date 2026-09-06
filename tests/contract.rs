@@ -630,6 +630,7 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("ls-registry", &["ls", "--no-probe"]),
         Case::each("rm", &["rm", "files"], &["rm", "box"]),
         Case::both("rm-missing", &["rm", "nobody"]),
+        Case::both("logout-missing", &["logout", "nobody"]),
     ];
     if cfg!(unix) {
         // A daemon is unix only; on Windows `start` is exit 2 in the OS's words.

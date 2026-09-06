@@ -376,9 +376,10 @@ chrome> quit
 ```
 
 It reads a script from a pipe just as well. Commands are `call`, `tools`, `schema`,
-`resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `info`, `help`, and `quit`; a `#` starts
-a comment. With `--json` each result is one line of JSON. In a script, any failed command
-makes the exit code 1 after the script finishes.
+`resources`, `read`, `prompts`, `prompt`, `raw`, `elicit`, `info`, `help`, and `quit`
+(`exit` ends the session too); a `#` starts a comment. With `--json` each result is one
+line of JSON. In a script, any failed command makes the exit code 1 after the script
+finishes.
 
 Arguments are one JSON object, or the same `key=value` pairs the command line takes.
 When a line does not work, the answer says what the tool actually takes, in both forms,
@@ -803,8 +804,14 @@ use instead.
 from `--env VAR`. It is never accepted as a command-line argument, so it cannot land in
 `ps` output or shell history.
 
+**`mcpdial logout NAME`**, and `mcpdial token rm NAME`, delete the saved credential and
+exit 0 whether or not there was one to delete, so either is safe to run twice. A name
+that is neither saved nor a URL or `stdio:` target names nothing to log out of, and is
+exit 2 the way `mcpdial rm` answers one.
+
 **`--token-env VAR`**, on the command line or saved with `add`, reads the token from the
-environment on every call and beats any saved credential.
+environment on every call and beats any saved credential. `ls` names the variable in its
+AUTH column, as `$VAR`, whether or not the servers were dialed.
 
 **`${VAR}` in the config** does the same for any header, and for a stdio server's
 environment, working directory and command line, and for the URL:
