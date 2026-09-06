@@ -1,7 +1,7 @@
 mod common;
 
 use common::{
-    echo_command, echo_server, mcpdial, run, start, temp_home, Mode, CONFIDENTIAL_ID,
+    echo_command, echo_server, mcpdial, run, start, temp_home, Iss, Mode, CONFIDENTIAL_ID,
     CONFIDENTIAL_SECRET as SECRET,
 };
 use serde_json::{json, Value};
@@ -719,6 +719,266 @@ fn drive_login_out(home: &std::path::Path, target: &str, extra: &[&str]) -> (Str
     let log = drain.join().unwrap();
     assert!(out.status.success(), "login exited {}:\n{log}", out.status);
     (log, String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// [`drive_login`] for a login that is expected to be refused. The browser step is
+/// still played, because what refuses it arrives on the callback.
+fn drive_refused_login(home: &std::path::Path, target: &str) -> String {
+    let mut child = mcpdial(home)
+        .args(["login", target, "--no-browser"])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let drain = std::thread::spawn(move || {
+        let mut all = String::new();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let t = line.trim();
+            if t.starts_with("http://127.0.0.1:") && t.contains("/authorize?") {
+                let _ = tx.send(t.to_string());
+            }
+            all.push_str(&line);
+            all.push('\n');
+        }
+        all
+    });
+    let auth_url = match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+        Ok(u) => u,
+        Err(_) => {
+            let _ = child.kill();
+            panic!(
+                "login printed no authorization URL:\n{}",
+                drain.join().unwrap()
+            );
+        }
+    };
+    ureq::get(&auth_url).call().expect("authorize -> callback");
+    let status = child.wait().unwrap();
+    let log = drain.join().unwrap();
+    assert!(!status.success(), "login should have been refused:\n{log}");
+    log
+}
+
+fn saved_credentials(home: &std::path::Path) -> Value {
+    match std::fs::read_to_string(home.join("credentials.json")) {
+        Ok(text) => serde_json::from_str(&text).unwrap(),
+        Err(_) => json!({}),
+    }
+}
+
+fn add_auth_server(home: &std::path::Path, s: &common::FakeServer) {
+    assert_eq!(
+        run(mcpdial(home).args(["add", "work", "--http", &s.url])).code,
+        0
+    );
+}
+
+fn registrations(s: &common::FakeServer) -> usize {
+    s.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.path == "/register")
+        .count()
+}
+
+#[test]
+fn an_authorization_response_naming_the_issuer_it_was_asked_of_is_redeemed() {
+    let s = start(Mode::AuthIssuer {
+        advertised: true,
+        iss: Iss::Own,
+    });
+    let home = temp_home("iss-ok");
+    add_auth_server(&home, &s);
+
+    let log = drive_login(&home, "work", &[]);
+    assert!(log.contains("saved token for work (expires in"), "{log}");
+    assert_eq!(
+        saved_credentials(&home)["credentials"]["work"]["issuer"],
+        json!(s.base)
+    );
+
+    let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"ok"}"#]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+}
+
+#[test]
+fn an_authorization_response_from_another_issuer_is_never_redeemed() {
+    let s = start(Mode::AuthIssuer {
+        advertised: true,
+        iss: Iss::Other("https://evil.example"),
+    });
+    let home = temp_home("iss-mixup");
+    add_auth_server(&home, &s);
+
+    let log = drive_refused_login(&home, "work");
+    assert!(
+        log.contains("authorization response came from https://evil.example"),
+        "{log}"
+    );
+    assert!(log.contains("refusing to redeem the code"), "{log}");
+    assert_eq!(
+        saved_credentials(&home)["credentials"]["work"],
+        Value::Null,
+        "nothing may be saved for a response that was not this server's"
+    );
+    assert!(
+        !s.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.path == "/token"),
+        "the code must not reach a token endpoint"
+    );
+}
+
+#[test]
+fn a_response_that_names_nobody_is_refused_only_where_the_server_said_it_always_would() {
+    let s = start(Mode::AuthIssuer {
+        advertised: true,
+        iss: Iss::Absent,
+    });
+    let home = temp_home("iss-absent");
+    add_auth_server(&home, &s);
+    let log = drive_refused_login(&home, "work");
+    assert!(log.contains("named no issuer"), "{log}");
+
+    // The same response from a server that never advertised RFC 9207 is fine: the
+    // servers that have not caught up are still the majority.
+    let quiet = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("iss-unadvertised");
+    add_auth_server(&home, &quiet);
+    let log = drive_login(&home, "work", &[]);
+    assert!(log.contains("saved token for work"), "{log}");
+}
+
+#[test]
+fn a_wrong_issuer_is_refused_even_where_the_server_advertised_nothing() {
+    let s = start(Mode::AuthIssuer {
+        advertised: false,
+        iss: Iss::Other("https://evil.example"),
+    });
+    let home = temp_home("iss-unadvertised-wrong");
+    add_auth_server(&home, &s);
+    let log = drive_refused_login(&home, "work");
+    assert!(
+        log.contains("authorization response came from https://evil.example"),
+        "{log}"
+    );
+}
+
+#[test]
+fn dynamic_registration_says_it_is_a_native_client() {
+    let s = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("native");
+    add_auth_server(&home, &s);
+    drive_login(&home, "work", &[]);
+
+    let registration = s
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.path == "/register")
+        .expect("a registration request")
+        .json();
+    assert_eq!(
+        registration["application_type"], "native",
+        "an omitted application_type is \"web\" under OIDC, which forbids loopback"
+    );
+    assert!(registration["redirect_uris"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("http://127.0.0.1:"));
+}
+
+#[test]
+fn a_client_id_is_not_presented_to_an_authorization_server_that_did_not_grant_it() {
+    let s = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("issuer-moved");
+    add_auth_server(&home, &s);
+    drive_login(&home, "work", &[]);
+    assert_eq!(
+        saved_credentials(&home)["credentials"]["work"]["issuer"],
+        json!(s.base)
+    );
+
+    // The endpoint now answers to a different authorization server. What was
+    // registered with the old one is no use, so a fresh registration is made.
+    let path = home.join("credentials.json");
+    let mut saved = saved_credentials(&home);
+    saved["credentials"]["work"]["issuer"] = json!("https://elsewhere.example");
+    std::fs::write(&path, saved.to_string()).unwrap();
+
+    let log = drive_login(&home, "work", &[]);
+    assert!(
+        log.contains("no longer https://elsewhere.example"),
+        "the change is said out loud:\n{log}"
+    );
+    assert_eq!(registrations(&s), 2, "the old client id is not presented");
+    assert_eq!(
+        saved_credentials(&home)["credentials"]["work"]["issuer"],
+        json!(s.base)
+    );
+
+    // A client an administrator registered by hand cannot be re-registered, so the
+    // mismatch is surfaced rather than worked around.
+    let mut saved = saved_credentials(&home);
+    saved["credentials"]["work"]["issuer"] = json!("https://elsewhere.example");
+    saved["credentials"]["work"]["registration"] = json!("pre-registered");
+    std::fs::write(&path, saved.to_string()).unwrap();
+    let o = run(mcpdial(&home).args(["login", "work", "--no-browser"]));
+    assert_eq!(o.code, 1, "{}", o.stderr);
+    assert!(
+        o.stderr
+            .contains("was registered with https://elsewhere.example"),
+        "{}",
+        o.stderr
+    );
+    assert!(o.stderr.contains("--client-id"), "{}", o.stderr);
+}
+
+/// A `credentials.json` written before mcpdial recorded issuers has no `issuer`
+/// key. Its token still works, and the first login stamps the issuer on it rather
+/// than throwing the registration away.
+#[test]
+fn a_credential_saved_before_issuers_were_recorded_keeps_working() {
+    let s = start(Mode::Auth { tokens: vec![] });
+    let home = temp_home("old-credentials");
+    add_auth_server(&home, &s);
+    drive_login(&home, "work", &[]);
+    assert_eq!(registrations(&s), 1);
+
+    // What an older mcpdial left behind: everything but the issuer.
+    let path = home.join("credentials.json");
+    let mut saved = saved_credentials(&home);
+    saved["credentials"]["work"]
+        .as_object_mut()
+        .unwrap()
+        .remove("issuer");
+    std::fs::write(&path, saved.to_string()).unwrap();
+
+    let o = run(mcpdial(&home).args(["call", "work", "echo", r#"{"message":"still here"}"#]));
+    assert_eq!(o.code, 0, "the saved token must still work: {}", o.stderr);
+    assert_eq!(o.stdout.trim(), "Echo: still here");
+
+    let o = run(mcpdial(&home).args(["token", "show", "work"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(!o.stdout.contains("issuer:"), "none is recorded yet");
+
+    drive_login(&home, "work", &[]);
+    assert_eq!(
+        registrations(&s),
+        1,
+        "the saved client id is adopted, not registered over"
+    );
+    assert_eq!(
+        saved_credentials(&home)["credentials"]["work"]["issuer"],
+        json!(s.base),
+        "and the issuer is recorded from now on"
+    );
 }
 
 #[test]

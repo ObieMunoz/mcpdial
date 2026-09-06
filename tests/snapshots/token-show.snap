@@ -10,5 +10,6 @@ work
   client id:     conf-client
   registered:    out of band (--client-id)
   client secret: present (client_secret_post)
+  issuer:        http://127.0.0.1:PORT2
   token url:     http://127.0.0.1:PORT2/token
 --- stderr

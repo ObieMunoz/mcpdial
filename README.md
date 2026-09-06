@@ -785,7 +785,21 @@ The redirect URI is `http://127.0.0.1:PORT/callback`, and if the server refuses 
 `http://localhost:PORT/callback` is tried next, because some servers allowlist only the
 name. If both are refused, the server is not following RFC 8252 and the error says what
 to change; for a Doorkeeper server that is one line in `config/initializers/doorkeeper.rb`.
-Use `--redirect-host` to skip the guessing.
+Use `--redirect-host` to skip the guessing. Dynamic registration declares
+`application_type: "native"`, without which an OpenID Connect registration endpoint reads
+the client as a web application and refuses a loopback redirect on principle.
+
+The authorization server is held to its own identity. The `issuer` of its metadata is
+recorded beside the PKCE verifier before the browser is opened anywhere, and the `iss`
+the authorization response comes back with (RFC 9207) has to be that same string, byte
+for byte, or the code is never sent to a token endpoint: a response from somewhere else
+is a mix-up attack, and nothing in it is acted on, not even its error message. A server
+that advertises `authorization_response_iss_parameter_supported` and then sends no `iss`
+is refused too. That issuer is saved with the credential and shown by `token show`,
+because a client id belongs to the authorization server that granted it: if the server
+behind a URL moves to a different one, a dynamically registered client is registered
+again there, and a client registered out of band is not quietly presented to a server
+that never issued it — the mismatch is reported, and `--client-id` names one that fits.
 
 **`mcpdial login NAME --grant client-credentials`** is for a cron job, a CI step or a
 headless agent that owns a confidential client: pass `--client-id` and the secret from

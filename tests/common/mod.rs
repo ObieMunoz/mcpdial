@@ -36,6 +36,11 @@ pub enum Mode {
     /// documents: `authorize` expects this URL as the client id, unless the client
     /// registered dynamically after all.
     AuthClientMetadata { client_id: String },
+    /// Like `Auth`, and the authorization server identifies itself in the
+    /// authorization response as RFC 9207 asks. `advertised` sets
+    /// `authorization_response_iss_parameter_supported` in its metadata; `iss` is
+    /// what the redirect back actually carries.
+    AuthIssuer { advertised: bool, iss: Iss },
     /// 403 with no challenge, like a WAF.
     Blocked,
     /// Hands back the same `nextCursor` on every `tools/list`.
@@ -75,6 +80,19 @@ pub enum Mode {
     /// the request carried plus one under a token nobody asked for, a log
     /// message at each end of the severity scale, and then the result.
     Logging,
+}
+
+/// Who an [`Mode::AuthIssuer`] authorization response says it came from. The
+/// server's own base is only known once it has a port, so it is named rather than
+/// spelled out.
+#[derive(Clone, Debug)]
+pub enum Iss {
+    /// This authorization server, exactly as its metadata spells it.
+    Own,
+    /// Somebody else, which is what a mix-up attack looks like from here.
+    Other(&'static str),
+    /// Nothing at all, as a server that has not implemented RFC 9207 sends.
+    Absent,
 }
 
 /// The revision the [`Mode::Modern`] server speaks, and the only one.
@@ -293,6 +311,12 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
             if let Mode::AuthClientMetadata { .. } = mode {
                 meta["client_id_metadata_document_supported"] = json!(true);
             }
+            if let Mode::AuthIssuer {
+                advertised: true, ..
+            } = mode
+            {
+                meta["authorization_response_iss_parameter_supported"] = json!(true);
+            }
             json_resp(200, &meta)
         }
         "/moved" => with_headers(
@@ -339,8 +363,16 @@ fn route(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp 
                 "must send the resource indicator"
             );
             state.lock().unwrap().code_challenge = Some(get("code_challenge"));
+            let names_issuer = match mode {
+                Mode::AuthIssuer { iss: Iss::Own, .. } => format!("&iss={}", percent_encode(base)),
+                Mode::AuthIssuer {
+                    iss: Iss::Other(other),
+                    ..
+                } => format!("&iss={}", percent_encode(other)),
+                _ => String::new(),
+            };
             let location = format!(
-                "{}?code=code-123&state={}",
+                "{}?code=code-123&state={}{names_issuer}",
                 get("redirect_uri"),
                 get("state")
             );
@@ -601,6 +633,7 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         Mode::Auth { .. }
             | Mode::AuthLocalhostOnly
             | Mode::AuthClientMetadata { .. }
+            | Mode::AuthIssuer { .. }
             | Mode::Confidential { .. }
     ) {
         let bearer = rec
@@ -1055,6 +1088,17 @@ fn form(s: &str) -> Vec<(String, String)> {
         .map(|p| {
             let (k, v) = p.split_once('=').unwrap_or((p, ""));
             (percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            b => format!("%{b:02X}"),
         })
         .collect()
 }

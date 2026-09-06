@@ -321,6 +321,13 @@ pub struct Credential {
     /// How that id came to be: "pre-registered", "dynamic" or "client_metadata_document".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration: Option<String>,
+    /// The authorization server that issued all of this: the `issuer` of its
+    /// validated metadata document. A client id belongs to the server that granted
+    /// it, so this is what a later login checks before presenting it again, and
+    /// what an authorization response's `iss` is held to. Absent in a file written
+    /// before mcpdial recorded it, and filled in by the next login.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
     /// Secret of a confidential client registered out of band. Kept so a refresh can
     /// authenticate on its own; the file it lives in is mode 0600.
     #[serde(default, skip_serializing_if = "Option::is_none")]
