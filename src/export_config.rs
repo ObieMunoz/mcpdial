@@ -79,7 +79,7 @@ pub fn export(
     let credentials = store.credentials()?;
     let notes = chosen
         .iter()
-        .flat_map(|(name, config)| notes_for(name, config, format, &credentials))
+        .flat_map(|(name, config)| notes_for(name, config, &credentials))
         .collect();
     let document = match format {
         Format::Codex => codex_document(&chosen, merge)?,
@@ -112,24 +112,13 @@ fn choose<'a>(
 fn notes_for(
     name: &str,
     config: &ServerConfig,
-    format: Format,
     credentials: &BTreeMap<String, Credential>,
 ) -> Vec<String> {
     let mut notes = Vec::new();
-    match &config.token_env {
-        // VS Code expands `${env:VAR}` and `${input:ID}`, never a bare `${VAR}`.
-        Some(var) if format == Format::VsCode => notes.push(format!(
-            "{name}: Authorization carries ${{{var}}}, which VS Code does not expand; \
-             write it as ${{env:{var}}} or as an inputs entry"
-        )),
-        Some(_) => {}
-        None => {
-            if credentials.get(name).is_some_and(Credential::has_token) {
-                notes.push(format!(
-                    "{name}: exported without its saved token; the host will need its own login"
-                ));
-            }
-        }
+    if config.token_env.is_none() && credentials.get(name).is_some_and(Credential::has_token) {
+        notes.push(format!(
+            "{name}: exported without its saved token; the host will need its own login"
+        ));
     }
     if !config.allow.is_empty() || !config.deny.is_empty() {
         notes.push(format!(
@@ -177,13 +166,20 @@ fn json_entry(config: &ServerConfig, format: Format) -> Value {
         fields.insert("type".into(), Value::from("stdio"));
     }
     if let Some(var) = &config.token_env {
+        // VS Code expands `${env:VAR}` and never a bare `${VAR}`; the mcpServers
+        // hosts that expand anything take the bare form.
+        let reference = if format == Format::VsCode {
+            format!("${{env:{var}}}")
+        } else {
+            format!("${{{var}}}")
+        };
         let headers = fields
             .entry("headers")
             .or_insert_with(|| Value::Object(Map::new()));
         if let Some(headers) = headers.as_object_mut() {
             headers
                 .entry("Authorization")
-                .or_insert_with(|| Value::from(format!("Bearer ${{{var}}}")));
+                .or_insert_with(|| Value::from(format!("Bearer {reference}")));
         }
     }
     entry
@@ -484,20 +480,23 @@ X-A = "1"
             .unwrap()
             .contains("bearer_token_env_var = \"API_TOKEN\""));
 
-        let none = BTreeMap::new();
-        assert!(notes_for("wiki", &http, Format::McpServers, &none).is_empty());
-        assert!(notes_for("wiki", &http, Format::Codex, &none).is_empty());
-        let vscode = notes_for("wiki", &http, Format::VsCode, &none);
-        assert!(
-            vscode[0].contains("${API_TOKEN}") && vscode[0].contains("${env:API_TOKEN}"),
-            "{vscode:?}"
+        // VS Code expands `${env:VAR}`, so the document it is handed says that
+        // and needs no note telling the reader to rewrite it.
+        let vscode: Value =
+            serde_json::from_str(&json_document(&chosen, Format::VsCode, None).unwrap()).unwrap();
+        assert_eq!(
+            vscode["servers"]["wiki"]["headers"]["Authorization"],
+            "Bearer ${env:API_TOKEN}"
         );
+
+        let none = BTreeMap::new();
+        assert!(notes_for("wiki", &http, &none).is_empty());
 
         // A saved OAuth token is never written, whatever the format.
         let plain = config(json!({"type": "http", "url": "https://x/mcp"}));
         let saved = credentials(&["wiki"]);
         assert_eq!(
-            notes_for("wiki", &plain, Format::McpServers, &saved),
+            notes_for("wiki", &plain, &saved),
             ["wiki: exported without its saved token; the host will need its own login"]
         );
         let chosen = [("wiki", &plain)];
@@ -512,7 +511,7 @@ X-A = "1"
         // A hidden tool stays hidden here, so the loss is named rather than silent.
         let mut restricted = plain.clone();
         restricted.deny = vec!["delete_*".into()];
-        let notes = notes_for("wiki", &restricted, Format::McpServers, &BTreeMap::new());
+        let notes = notes_for("wiki", &restricted, &BTreeMap::new());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("allow and deny lists are not exported"));
     }

@@ -372,10 +372,9 @@ fn export_writes_the_shape_each_host_reads() {
     let doc: Value = serde_json::from_str(&o.stdout).unwrap();
     assert_eq!(doc["servers"]["fs"]["type"], "stdio");
     assert_eq!(doc["servers"]["tok"]["type"], "http");
-    assert!(
-        o.stderr.contains("which VS Code does not expand") && o.stderr.contains("${env:API_TOKEN}"),
-        "{}",
-        o.stderr
+    assert_eq!(
+        doc["servers"]["tok"]["headers"]["Authorization"],
+        "Bearer ${env:API_TOKEN}"
     );
 
     let o = run(mcpdial(&home).args(["export", "fs", "tok", "--format", "codex"]));
