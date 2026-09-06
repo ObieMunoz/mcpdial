@@ -4,6 +4,7 @@
 //! nothing.
 
 use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
+use crate::elicit::{self, Answers, Elicit};
 use crate::notify::Level;
 use crate::oauth;
 use crate::protocol::{Error, KnownVersion, Result};
@@ -55,6 +56,8 @@ pub struct Options {
     /// `--trace FILE` or `$MCPDIAL_TRACE`: where every message and transport
     /// event is appended as JSON Lines, whatever `verbose` says.
     pub trace: Option<Trace>,
+    /// What this invocation can answer when the server elicits mid-call.
+    pub elicit: Elicit,
 }
 
 impl Default for Options {
@@ -71,6 +74,7 @@ impl Default for Options {
             retry: true,
             log_level: None,
             trace: None,
+            elicit: Elicit::default(),
         }
     }
 }
@@ -206,6 +210,9 @@ pub struct Connection {
     pub server_info: Value,
     /// Which credential was used, for status reporting.
     pub auth: AuthUsed,
+    /// What a form elicitation is filled in with. `shell`'s `elicit` command
+    /// replaces it partway through a session.
+    pub elicit: Answers,
 }
 
 impl Connection {
@@ -339,19 +346,32 @@ fn pinned_version(r: &Resolved, opts: &Options) -> Result<Option<KnownVersion>> 
     }
 }
 
+/// `initialize`, with whatever can answer the server back installed first: the
+/// capability is declared in the same breath as the handler that honours it,
+/// and only on a transport that took one. Streamable HTTP takes none - the
+/// question arrives on the response stream, but the reply would need a second
+/// POST while the first is still open - so nothing is promised to a server
+/// that could only be left waiting.
 fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
     auth: AuthUsed,
     pinned: Option<KnownVersion>,
-    log_level: Option<Level>,
+    opts: &Options,
 ) -> Result<Connection> {
-    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>);
+    let mut transport = Box::new(transport) as Box<dyn Transport>;
+    let elicit = Answers::new(opts.elicit.answers.clone());
+    let answering = transport.answer_requests(elicit::responder(&opts.elicit, elicit.clone()));
+    let declared = match answering {
+        true => opts.elicit.capabilities(),
+        false => json!({}),
+    };
+    let mut session = Session::new(transport).declaring(declared);
     if let Some(version) = pinned {
         session = session.offering(version);
     }
     let server_info = session.open()?.clone();
-    if let Some(level) = log_level {
+    if let Some(level) = opts.log_level {
         set_log_level(&mut session, &server_info, level);
     }
     Ok(Connection {
@@ -360,6 +380,7 @@ fn handshake(
         session,
         server_info,
         auth,
+        elicit,
     })
 }
 
@@ -405,7 +426,7 @@ fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
 /// holds on behalf of its callers.
 pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport>> {
     let r = r.dialed()?;
-    let mut session = Session::new(spawn_stdio(&r, opts)?);
+    let mut session = Session::new(spawn_stdio(&r, opts)?).declaring(Elicit::relayed());
     if let Some(version) = pinned_version(&r, opts)? {
         session = session.offering(version);
     }
@@ -431,16 +452,10 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
             if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger(&r.name))? {
-                return handshake(r, t, AuthUsed::None, pinned, opts.log_level);
+                return handshake(r, t, AuthUsed::None, pinned, opts);
             }
         }
-        return handshake(
-            r,
-            spawn_stdio(r, opts)?,
-            AuthUsed::None,
-            pinned,
-            opts.log_level,
-        );
+        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, pinned, opts);
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
@@ -449,7 +464,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         http_transport(r, token, opts, timeout),
         auth,
         pinned,
-        opts.log_level,
+        opts,
     ) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
@@ -462,7 +477,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
                 http_transport(r, cred.access_token, opts, timeout),
                 auth,
                 pinned,
-                opts.log_level,
+                opts,
             )
         }
         outcome => outcome,

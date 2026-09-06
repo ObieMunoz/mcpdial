@@ -35,6 +35,10 @@
 //! Set `ECHO_SERVER_ANNOTATED=1` to add an `erase` tool that says what calling it
 //! does: a `title`, `annotations` marking it destructive and open-world, and
 //! `execution.taskSupport`. Behind a flag for the same reason `typed` is.
+//! Set `ECHO_SERVER_ELICIT=form` (or `url`) to make every `tools/call` ask the
+//! client for one more fact first, the way a server missing a confirmation or a
+//! region does, and answer with whatever the client replied. The call blocks on
+//! that reply, so a client that neither answers nor refuses hangs the server.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -81,6 +85,7 @@ fn main() {
     let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
     let types = std::env::var_os("ECHO_SERVER_TYPES").is_some();
     let annotated = std::env::var_os("ECHO_SERVER_ANNOTATED").is_some();
+    let elicit = std::env::var("ECHO_SERVER_ELICIT").ok();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
@@ -140,8 +145,8 @@ fn main() {
                 &json!({"jsonrpc": "2.0", "method": "notifications/message",
                         "params": {"level": "info", "data": "working"}}),
             );
-            let pong = ask(&mut out, &mut lines, "srv-ping", "ping");
-            let refusal = ask(&mut out, &mut lines, "srv-roots", "roots/list");
+            let pong = ask(&mut out, &mut lines, "srv-ping", "ping", Value::Null);
+            let refusal = ask(&mut out, &mut lines, "srv-roots", "roots/list", Value::Null);
             if pong.get("result").is_none() {
                 let complaint = format!("ping answered {pong}");
                 tell(&mut out, &err(id.clone(), -32001, &complaint));
@@ -150,6 +155,39 @@ fn main() {
             if refusal["error"]["code"] != -32601 {
                 let complaint = format!("roots/list answered {refusal}");
                 tell(&mut out, &err(id.clone(), -32001, &complaint));
+                continue;
+            }
+        }
+
+        // One fact is missing, so ask for it and block until the client answers.
+        // The answer is echoed in the result: a test reads what the client
+        // decided from the tool's own output, with no trace parsing.
+        if let Some(mode) = elicit.as_deref() {
+            if method == "tools/call" {
+                let url_mode = mode == "url";
+                let answered = ask(
+                    &mut out,
+                    &mut lines,
+                    "srv-elicit",
+                    "elicitation/create",
+                    elicitation(url_mode),
+                );
+                if url_mode {
+                    tell(
+                        &mut out,
+                        &json!({"jsonrpc": "2.0",
+                        "method": "notifications/elicitation/complete",
+                        "params": {"elicitationId": "e-1"}}),
+                    );
+                }
+                let text = match answered.get("result") {
+                    Some(result) => format!("elicited {result}"),
+                    None => format!("refused {}", answered["error"]),
+                };
+                tell(
+                    &mut out,
+                    &ok(id, json!({"content": [{"type": "text", "text": text}]})),
+                );
                 continue;
             }
         }
@@ -314,8 +352,18 @@ fn tell(out: &mut impl Write, msg: &Value) {
 /// Send the client a request and block until the answer to it arrives, the way a
 /// server waiting on a `ping` does. Anything else on the way is skipped, and a
 /// client that hangs up gets `null` back rather than a panic.
-fn ask(out: &mut impl Write, lines: &mut Lines<StdinLock<'_>>, id: &str, method: &str) -> Value {
-    tell(out, &json!({"jsonrpc": "2.0", "id": id, "method": method}));
+fn ask(
+    out: &mut impl Write,
+    lines: &mut Lines<StdinLock<'_>>,
+    id: &str,
+    method: &str,
+    params: Value,
+) -> Value {
+    let mut request = json!({"jsonrpc": "2.0", "id": id, "method": method});
+    if !params.is_null() {
+        request["params"] = params;
+    }
+    tell(out, &request);
     while let Some(Ok(line)) = lines.next() {
         match serde_json::from_str::<Value>(&line) {
             Ok(reply) if reply["id"] == id => return reply,
@@ -323,6 +371,23 @@ fn ask(out: &mut impl Write, lines: &mut Lines<StdinLock<'_>>, id: &str, method:
         }
     }
     Value::Null
+}
+
+/// What the server asks for: a small form, or an address to finish at.
+fn elicitation(url_mode: bool) -> Value {
+    if url_mode {
+        return json!({"mode": "url", "message": "finish this in your browser",
+                      "url": "https://example.test/elicit/1", "elicitationId": "e-1"});
+    }
+    json!({"message": "confirm before running", "requestedSchema": {
+        "type": "object",
+        "properties": {
+            "confirm": {"type": "boolean", "description": "Really run it?"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 3},
+            "region": {"type": "string", "enum": ["us", "eu"]},
+        },
+        "required": ["confirm", "region"],
+    }})
 }
 
 fn ok(id: Value, result: Value) -> Value {

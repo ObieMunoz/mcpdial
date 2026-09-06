@@ -217,6 +217,49 @@ same way, and the error carries a `hint` naming the listing that would have show
 does exist, so neither number has to be decoded either. `-32602` from a `tools/call` still
 means the arguments, and carries the tool's usage as before.
 
+## Elicitation
+
+A server that needs one more fact mid-call - a confirmation, a region, a parameter
+nobody passed - sends `elicitation/create` and blocks until the client replies.
+mcpdial never waits on a person who is not there: with no terminal on both stdin and
+stderr, or under `--json`, the request is declined the moment it arrives and the call
+carries on. **A decline is not an error.** It is the spec's way of saying the value is
+not coming; the server degrades around it, and the exit code stays the tool's own.
+
+```
+mcpdial call TARGET TOOL '{}' --elicit '{"confirm": true, "region": "eu"}'
+mcpdial call TARGET TOOL '{}' --elicit @answers.json
+```
+
+`--elicit` works on `call` and `prompt`, and `elicit {"json": "answers"}` does the same
+for the rest of a `shell` session. It maps property names to values: a request whose
+required properties they all cover is accepted with them, and anything else is declined
+without being sent - a missing required property, or a value the schema's own `minimum`,
+`maximum`, `minLength`, `maxLength`, `enum` or `format` forbids. Values a particular form
+does not ask for are ignored, so one object can answer a whole session. Values in hand
+answer on their own: given them, mcpdial never stops to ask, terminal or not.
+
+Every elicitation puts one line on stderr, or one object with `--json`:
+
+```
+server asked: confirm before running; declined (no terminal; use --elicit)
+{"elicitation":{"action":"decline","message":"confirm before running","detail":"declined (no terminal; use --elicit)"}}
+{"elicitation":{"action":"accept","message":"sign in","detail":"accepted; opened https://x/y","url":"https://x/y"}}
+```
+
+`initialize` declares only what can actually answer: over stdio, `"elicitation": {"form":
+{}, "url": {}}` when there is a terminal or `--elicit`, `{"url": {}}` otherwise, so a
+server that checks can avoid asking for what it will not get. A url-mode request needs nobody: its
+address goes on stderr, a browser opens it unless `--no-browser` (on `call`, `prompt`
+and `shell`), and it is accepted at once, because the interaction happens out of band.
+Nothing is declared for `sampling` or `roots`, which are still answered `-32601`.
+
+stdio servers are answered, including one held open by `mcpdial start`. Over Streamable
+HTTP the question arrives - the response stream is read event by event - but the reply
+would need a second POST while that one is still open, which mcpdial does not yet send.
+So nothing is declared there at all, and a server that checks the capability will not ask
+a question it would be left waiting on.
+
 ## Exit codes and errors
 
 | Exit | Meaning |
@@ -308,6 +351,7 @@ read URI                      # one resource's contents
 prompts [--long]              # list prompts
 prompt NAME {"json":"args"}   # expand a prompt into its messages
 raw METHOD {"json":"params"}  # any JSON-RPC method; allow and deny lists do not apply
+elicit {"json":"answers"}     # answer whatever the server elicits from here on
 info                          # the initialize result
 help [TOOL]                   # commands, or one tool's parameters
 quit

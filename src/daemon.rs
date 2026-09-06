@@ -96,7 +96,9 @@ mod unix {
     use super::{socket_path, State, RELAY_ERROR, STOP_METHOD};
     use crate::client::{self, Options};
     use crate::config::Store;
-    use crate::protocol::{check, classify, reply, reply_error, request, Error, Incoming, Result};
+    use crate::protocol::{
+        check, classify, reply, reply_error, request, Error, Incoming, Responder, Result,
+    };
     use crate::transport::stdio::{Framed, StdioTransport};
     use crate::transport::trace::Wire;
     use crate::transport::{silent, Logger, Transport};
@@ -216,6 +218,11 @@ mod unix {
             watch: &mut dyn FnMut(&Value),
         ) -> Result<Option<Value>> {
             self.relay(payload, watch)
+        }
+
+        fn answer_requests(&mut self, responder: Responder) -> bool {
+            self.framed.answer_requests(responder);
+            true
         }
 
         fn close(&mut self) {

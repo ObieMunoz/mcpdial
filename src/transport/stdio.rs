@@ -6,7 +6,7 @@
 
 use super::trace::{Kind, TraceEvent, Wire};
 use super::{silent, Logger, Transport};
-use crate::protocol::{answer, classify, Error, Incoming, Result};
+use crate::protocol::{answer_with, classify, Error, Incoming, Responder, Result};
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -30,6 +30,9 @@ pub(crate) struct Framed {
     timeout: Duration,
     log: Logger,
     wire: Wire<'static>,
+    /// Serves what the peer asks of us beyond `ping`, when a capability for it
+    /// was declared at `initialize`.
+    responder: Option<Responder>,
 }
 
 impl Framed {
@@ -57,11 +60,16 @@ impl Framed {
             timeout,
             log,
             wire,
+            responder: None,
         }
     }
 
     pub(crate) fn note(&self, event: &TraceEvent<'_>) {
         (self.log)(event)
+    }
+
+    pub(crate) fn answer_requests(&mut self, responder: Responder) {
+        self.responder = Some(responder);
     }
 
     fn write_line(&mut self, body: &str) -> io::Result<()> {
@@ -82,7 +90,7 @@ impl Framed {
     /// `gone` says what it means that the peer closed the stream or refused the
     /// write; whoever owns the peer knows that better than this loop does.
     /// `forward` sees every request and notification the peer sends on the way,
-    /// and may supply the reply to a request; otherwise [`answer`] does. The
+    /// and may supply the reply to a request; otherwise [`answer_with`] does. The
     /// peer may well be blocked on that reply, so waiting quietly for our own id
     /// would deadlock both ends.
     ///
@@ -144,7 +152,12 @@ impl Framed {
                 }
                 Incoming::ServerRequest { id: theirs, method } => {
                     (self.log)(&received(Kind::ServerRequest));
-                    let reply = forward(&msg).unwrap_or_else(|| answer(theirs, method));
+                    let reply = match forward(&msg) {
+                        Some(from_elsewhere) => from_elsewhere,
+                        None => {
+                            answer_with(theirs, method, &msg["params"], self.responder.as_mut())
+                        }
+                    };
                     (self.log)(&TraceEvent::Sent {
                         wire,
                         message: &reply,
@@ -352,6 +365,11 @@ impl Transport for StdioTransport {
             watch(from_server);
             None
         })
+    }
+
+    fn answer_requests(&mut self, responder: Responder) -> bool {
+        self.framed.answer_requests(responder);
+        true
     }
 
     fn close(&mut self) {

@@ -503,15 +503,20 @@ pub fn notification(method: &str, params: Option<Value>) -> Value {
     msg
 }
 
+/// Serves the server requests this client declared a capability for. It is
+/// handed the method and its `params`, and returns the `result` to reply with,
+/// or `None` to leave [`answer`] to refuse.
+pub type Responder = Box<dyn FnMut(&str, &Value) -> Option<Value>>;
+
 /// The reply owed to a server request, given its id and method.
 ///
 /// `ping` is the one request every MCP client must answer whatever it declared. A
 /// server that pings during a long call and hears nothing back either drops the
 /// connection or waits for a peer that is never coming, and the stall gets
 /// reported as the server's fault. Everything else - `sampling/createMessage`,
-/// `roots/list`, `elicitation/create` - we turned down by sending an empty
-/// `capabilities` at initialize, so a refusal is both truthful and something the
-/// server can act on at once; silence it can only time out.
+/// `roots/list` - we turned down by declaring no such capability at initialize,
+/// so a refusal is both truthful and something the server can act on at once;
+/// silence it can only time out.
 pub fn answer(id: &Value, method: &str) -> Value {
     match method {
         "ping" => reply(id, json!({})),
@@ -520,6 +525,24 @@ pub fn answer(id: &Value, method: &str) -> Value {
             METHOD_NOT_FOUND,
             &format!("{CLIENT_NAME} does not implement {other}"),
         ),
+    }
+}
+
+/// [`answer`], with `responder` offered anything beyond `ping` first: what a
+/// transport sends back when a capability was declared at `initialize` and
+/// something behind it can serve the request.
+pub fn answer_with(
+    id: &Value,
+    method: &str,
+    params: &Value,
+    responder: Option<&mut Responder>,
+) -> Value {
+    match responder {
+        Some(serve) if method != "ping" => match serve(method, params) {
+            Some(result) => reply(id, result),
+            None => answer(id, method),
+        },
+        _ => answer(id, method),
     }
 }
 
@@ -746,6 +769,32 @@ mod tests {
             .unwrap()
             .contains("sampling/createMessage"));
         assert!(refusal.get("result").is_none());
+    }
+
+    #[test]
+    fn a_responder_answers_what_it_serves_and_ping_stays_ours() {
+        let id = json!("srv-1");
+        let mut serve: Responder = Box::new(|method, params| {
+            (method == "elicitation/create").then(|| json!({"saw": params["mode"]}))
+        });
+        let served = answer_with(
+            &id,
+            "elicitation/create",
+            &json!({"mode": "url"}),
+            Some(&mut serve),
+        );
+        assert_eq!(served["result"], json!({"saw": "url"}));
+
+        // Anything the responder passes on is refused exactly as before, and
+        // `ping` never reaches it: the transport owes that answer itself.
+        let refused = answer_with(&id, "roots/list", &Value::Null, Some(&mut serve));
+        assert_eq!(refused["error"]["code"], METHOD_NOT_FOUND);
+        let pong = answer_with(&id, "ping", &Value::Null, Some(&mut serve));
+        assert_eq!(pong["result"], json!({}));
+        assert_eq!(
+            answer_with(&id, "ping", &Value::Null, None)["result"],
+            json!({})
+        );
     }
 
     #[test]

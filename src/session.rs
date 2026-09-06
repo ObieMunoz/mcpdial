@@ -55,6 +55,9 @@ pub struct Session<T: Transport> {
     /// Set by [`Session::offering`]: the caller named a revision, so the era is
     /// not worked out from how the server answers and not changed behind them.
     pinned: bool,
+    /// What `initialize` declares this client can do. Empty until something is
+    /// installed that can actually serve a request the server makes back.
+    capabilities: Value,
 }
 
 impl<T: Transport> Session<T> {
@@ -65,7 +68,21 @@ impl<T: Transport> Session<T> {
             server_info: Value::Null,
             version: KnownVersion::LATEST,
             pinned: false,
+            capabilities: json!({}),
         }
+    }
+
+    /// Declare these client capabilities at `initialize` instead of none. A
+    /// capability declared without a handler behind it is a promise to a server
+    /// that then blocks on an answer nobody sends, so this belongs beside
+    /// [`crate::Transport::answer_requests`] and nowhere else.
+    ///
+    /// 2026-07-28 has no server-initiated request to declare for: what
+    /// elicitation was there is a result the client re-sends instead, so the
+    /// `_meta` capabilities of that era stay empty.
+    pub fn declaring(mut self, capabilities: Value) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Speak `version` rather than working out what the server wants, for a
@@ -236,7 +253,7 @@ impl<T: Transport> Session<T> {
             "initialize",
             Some(json!({
                 "protocolVersion": offered.as_str(),
-                "capabilities": {},
+                "capabilities": self.capabilities.clone(),
                 "clientInfo": { "name": CLIENT_NAME, "version": CLIENT_VERSION },
             })),
         )?;
