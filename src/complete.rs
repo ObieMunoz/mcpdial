@@ -1,9 +1,11 @@
 //! What Tab offers at the shell prompt.
 //!
 //! Three pools, in the order a line is typed: the command names, then whatever
-//! the command that was typed takes as its one argument, then — inside the
-//! arguments object of a `call` — the property names of the tool's `inputSchema`
-//! and the values an `enum` allows.
+//! the command that was typed takes as its one argument, then — for a `call` —
+//! the property names of the tool's `inputSchema` and the values an `enum`
+//! allows. That third pool answers where the arguments object has not been
+//! opened yet as well as inside it, so that Tab writes the `{` rather than
+//! waiting to be given one.
 //!
 //! An arguments object under the cursor is JSON that is not finished yet, so it
 //! cannot be parsed; it is scanned instead, far enough to say which object the
@@ -88,13 +90,18 @@ impl ShellHelper {
             .collect()
     }
 
-    /// What may go where the cursor is inside a `call`'s arguments object, or
-    /// `None` when the cursor is not in one.
+    /// What may go where the cursor is in a `call`'s arguments, or `None` when
+    /// the cursor is not in them.
     fn inside_arguments(&self, head: &str) -> Option<(usize, Vec<String>)> {
         let (name, arguments, at) = call_arguments(head)?;
         let tool = self.tools.iter().find(|t| t["name"] == name)?;
+        let input = &tool["inputSchema"];
+        if arguments.is_empty() {
+            // Nothing to replace: the candidates go in at the end of the line.
+            return Some((at, Opening::opens_arguments(input)));
+        }
         let opening = Opening::read(arguments)?;
-        let object = opening.enclosing(&tool["inputSchema"])?;
+        let object = opening.enclosing(input)?;
         Some((at + opening.start, opening.fill(object)))
     }
 }
@@ -113,12 +120,16 @@ fn call_arguments(head: &str) -> Option<(&str, &str, usize)> {
 
 /// The first word of `text`, what follows the whitespace after it, and the byte
 /// that follows starts at. `None` when there is no whitespace after the word,
-/// which is to say the word itself is still being typed.
+/// which is to say the word itself is still being typed. Whitespace running to
+/// the end of `text` gives an empty rest at the end of it: the word is finished
+/// and what comes after it has not been started.
 fn word_then_rest(text: &str) -> Option<(&str, &str, usize)> {
     let begins = text.find(|c: char| !c.is_whitespace())?;
     let word = &text[begins..];
     let ends = word.find(char::is_whitespace)?;
-    let next = word[ends..].find(|c: char| !c.is_whitespace())? + ends;
+    let next = word[ends..]
+        .find(|c: char| !c.is_whitespace())
+        .map_or(word.len(), |at| at + ends);
     Some((&word[..ends], &word[next..], begins + next))
 }
 
@@ -137,7 +148,10 @@ enum Frame {
     Array,
 }
 
-/// Where a half-typed arguments object leaves the cursor.
+/// Where a half-typed arguments object leaves the cursor. The default is the
+/// cursor before any of it exists: the arguments object itself, with nothing
+/// written in it and neither a key nor a value under way.
+#[derive(Default)]
 struct Opening {
     /// The byte of the arguments text the token being completed starts at, which
     /// is the opening quote when there is one.
@@ -273,6 +287,18 @@ impl Opening {
             value_of,
             written: written.clone(),
         })
+    }
+
+    /// What Tab offers where the arguments have not been started: the keys
+    /// [`fill`](Self::fill) offers inside the object, each carrying the `{` that
+    /// opens it, so that one keystroke does both. A tool that takes no arguments
+    /// is offered nothing — a lone `{` is not worth a keystroke.
+    fn opens_arguments(input: &Value) -> Vec<String> {
+        Opening::default()
+            .fill(input)
+            .into_iter()
+            .map(|key| format!("{{{key}"))
+            .collect()
     }
 
     /// The schema of the object the cursor is in, walked down from the tool's
@@ -426,6 +452,46 @@ mod tests {
         // Whitespace and an unfinished pair do not move where the token starts.
         let (at, found) = complete(&helper, "call new_page   {  \"url\" : \"x\" ,  \"vi");
         assert_eq!((at, found), (34, vec![r#""viewport": "#.to_string()]));
+    }
+
+    #[test]
+    fn opens_the_arguments_object_where_one_has_not_been_typed() {
+        let helper = browser();
+        // Tab after the tool name writes the brace along with the key, and
+        // replaces nothing: the candidates start at the end of the line.
+        let (at, found) = complete(&helper, "call new_page ");
+        assert_eq!(at, 14);
+        assert_eq!(
+            found,
+            [
+                r#"{"retries": "#,
+                r#"{"url": "#,
+                r#"{"user": "#,
+                r#"{"viewport": "#,
+                r#"{"wait": "#
+            ]
+        );
+        assert_eq!(complete(&helper, "call new_page   ").0, 16);
+        // A tool that takes no arguments has no object worth opening.
+        let bare = ShellHelper {
+            tools: vec![json!({
+                "name": "count",
+                "inputSchema": {"type": "object", "properties": {}},
+            })],
+            ..ShellHelper::default()
+        };
+        assert!(complete(&bare, "call count ").1.is_empty());
+        assert!(complete(&ShellHelper::default(), "call count ")
+            .1
+            .is_empty());
+        // The other ways of writing arguments are left where they were.
+        assert!(complete(&helper, "call new_page @args.json").1.is_empty());
+        assert!(complete(&helper, "call new_page -").1.is_empty());
+        // Only `call` takes an arguments object, and only after its tool name.
+        assert!(complete(&helper, "prompt poster ").1.is_empty());
+        assert!(complete(&helper, "schema new_page ").1.is_empty());
+        assert!(complete(&helper, "raw tools/call ").1.is_empty());
+        assert_eq!(complete(&helper, "call ").1, ["new_page"]);
     }
 
     #[test]
