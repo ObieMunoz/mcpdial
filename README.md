@@ -157,20 +157,27 @@ mcpdial completions SHELL        a completion script; see Install above
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, `--protocol-version
-VERSION` to offer an older MCP revision at `initialize`, `--no-daemon` to dial a
-server afresh even while `start` has one running, and `--no-retry` to fail on the
-first transient HTTP failure instead of sending the request once more.
+VERSION` to name one MCP revision instead of working out which the server speaks,
+`--no-daemon` to dial a server afresh even while `start` has one running, and
+`--no-retry` to fail on the first transient HTTP failure instead of sending the
+request once more.
 
 `--timeout` bounds every wait: the flag on the command line, else the timeout saved
 with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
 installs packages on first launch or runs tools for minutes, `ls --no-probe` shows it,
 and `import` keeps a numeric `timeout` (seconds) it finds in a host's config.
 
-`initialize` offers protocol `2025-11-25` and runs on whichever version the server
-answers with, out of `2025-11-25`, `2025-06-18` and `2025-03-26`; `mcpdial info` shows
-the one agreed. A server that answers with a version mcpdial does not speak is reported
-as such. For a server that misbehaves when offered the newest, `--protocol-version
-2025-06-18` offers that instead, and `add --protocol-version` saves the choice.
+mcpdial speaks both eras of the protocol. A session opens with `server/discover`,
+which is all that revision `2026-07-28` has; a server that has never heard of it gets
+the `initialize` handshake instead, offering `2025-11-25` and running on whichever of
+`2025-11-25`, `2025-06-18` and `2025-03-26` it answers with. `mcpdial info` shows the
+version in use either way, and a server that names one mcpdial does not speak is
+reported as such. On `2026-07-28` there is no handshake to stand behind a request, so
+each one carries the version, the client's identity and its capabilities itself and
+mirrors its method and subject into the `Mcp-Method` and `Mcp-Name` headers.
+`--protocol-version VERSION` skips the working out - `2025-11-25` holds a server that
+serves both eras to the handshake, `2025-06-18` suits one that misbehaves when offered
+anything newer - and `add --protocol-version` saves the choice.
 
 ### Seeing what a server offers
 

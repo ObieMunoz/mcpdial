@@ -10,13 +10,29 @@ use serde_json::{json, Value};
 use std::fmt;
 use std::str::FromStr;
 
-/// What `initialize` offers unless a version is pinned: the newest one we speak.
-pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST.as_str();
+/// What `initialize` offers unless a version is pinned: the newest revision that
+/// still has a handshake to offer it at.
+pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST_LEGACY.as_str();
 pub const CLIENT_NAME: &str = "mcpdial";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// JSON-RPC's "method not found", the honest answer to a request we do not serve.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// The headers 2026-07-28 mirrors the body into did not agree with the body.
+pub const HEADER_MISMATCH: i64 = -32020;
+/// Serving the request needed a client capability the request did not declare.
+pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
+/// The server does not speak the revision the request declared, and `data.supported`
+/// names the ones it does.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The `_meta` keys 2026-07-28 carries on every request in place of a handshake.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+/// Where the same revision puts what `initialize` used to answer with.
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -25,25 +41,38 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Ordered by date, so a feature gate reads `session.version() >= V2025_11_25`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KnownVersion {
+    V2026_07_28,
     V2025_11_25,
     V2025_06_18,
     V2025_03_26,
 }
 
 impl KnownVersion {
-    pub const ALL: [KnownVersion; 3] = [
+    pub const ALL: [KnownVersion; 4] = [
+        KnownVersion::V2026_07_28,
         KnownVersion::V2025_11_25,
         KnownVersion::V2025_06_18,
         KnownVersion::V2025_03_26,
     ];
     pub const LATEST: KnownVersion = KnownVersion::ALL[0];
+    /// The newest revision with an `initialize` handshake. 2026-07-28 removed it,
+    /// so a server from before that is reached by offering this one.
+    pub const LATEST_LEGACY: KnownVersion = KnownVersion::V2025_11_25;
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            KnownVersion::V2026_07_28 => "2026-07-28",
             KnownVersion::V2025_11_25 => "2025-11-25",
             KnownVersion::V2025_06_18 => "2025-06-18",
             KnownVersion::V2025_03_26 => "2025-03-26",
         }
+    }
+
+    /// Whether this revision carries the protocol version, the client's identity
+    /// and its capabilities on every request instead of settling them once at
+    /// `initialize`.
+    pub fn is_modern(self) -> bool {
+        self >= KnownVersion::V2026_07_28
     }
 
     pub fn parse(s: &str) -> Option<KnownVersion> {
@@ -353,6 +382,70 @@ pub fn check(msg: Option<Value>) -> Result<Option<Value>> {
     Ok(msg)
 }
 
+/// Whether a code is one only a 2026-07-28 server sends. Such an answer settles
+/// which revision the server speaks: the request was wrong, not the era.
+pub fn is_modern_error(code: i64) -> bool {
+    matches!(
+        code,
+        HEADER_MISMATCH | MISSING_REQUIRED_CLIENT_CAPABILITY | UNSUPPORTED_PROTOCOL_VERSION
+    )
+}
+
+/// The JSON-RPC `error` object behind a failure, whichever way it arrived.
+///
+/// 2026-07-28 sends its own three codes over both carriers: a JSON-RPC error
+/// response for a request it understood, and a `400` whose body holds the same
+/// object for one it would not read. Reading only the first misses half of them.
+pub fn rpc_error(e: &Error) -> Option<Value> {
+    match e {
+        Error::Rpc {
+            code,
+            message,
+            data,
+        } => Some(json!({ "code": code, "message": message, "data": data })),
+        Error::Http { body, .. } => serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|msg| msg.get("error").cloned())
+            .filter(Value::is_object),
+        _ => None,
+    }
+}
+
+/// The `_meta` a 2026-07-28 request carries: the revision it speaks, who is
+/// speaking, and what it may be asked to do in return.
+///
+/// There is no handshake to settle any of it, so every request says it again and
+/// a server that reads only this one still has everything it needs. The empty
+/// capabilities are the same refusal `initialize` sent: mcpdial answers no
+/// sampling, elicitation or roots request.
+pub fn client_meta(version: KnownVersion) -> Value {
+    json!({
+        META_PROTOCOL_VERSION: version.as_str(),
+        META_CLIENT_INFO: { "name": CLIENT_NAME, "version": CLIENT_VERSION },
+        META_CLIENT_CAPABILITIES: {},
+    })
+}
+
+/// `params` with [`client_meta`] filled in around whatever `_meta` it already
+/// carries, so that `raw` reaches a 2026-07-28 server without the caller
+/// spelling out three fixed fields, and still gets to set `progressToken` or a
+/// log level of its own. Params that are not an object have nowhere to put it.
+pub fn with_client_meta(params: Option<Value>, version: KnownVersion) -> Value {
+    let mut params = params.unwrap_or_else(|| json!({}));
+    let Some(fields) = params.as_object_mut() else {
+        return params;
+    };
+    let mut meta = client_meta(version);
+    if let (Some(ours), Some(theirs)) = (
+        meta.as_object_mut(),
+        fields.get("_meta").and_then(Value::as_object),
+    ) {
+        ours.extend(theirs.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    fields.insert("_meta".into(), meta);
+    params
+}
+
 pub fn request(method: &str, id: u64, params: Option<Value>) -> Value {
     let mut msg = json!({ "jsonrpc": "2.0", "id": id, "method": method });
     if let Some(p) = params {
@@ -617,13 +710,77 @@ mod tests {
     #[test]
     fn known_versions_order_by_date_and_the_newest_is_offered() {
         use KnownVersion::*;
-        assert!(V2025_11_25 > V2025_06_18 && V2025_06_18 > V2025_03_26);
-        assert_eq!(KnownVersion::LATEST, V2025_11_25);
+        assert!(
+            V2026_07_28 > V2025_11_25 && V2025_11_25 > V2025_06_18 && V2025_06_18 > V2025_03_26
+        );
+        assert_eq!(KnownVersion::LATEST, V2026_07_28);
+        assert_eq!(KnownVersion::LATEST_LEGACY, V2025_11_25);
         assert_eq!(PROTOCOL_VERSION, "2025-11-25");
         assert_eq!("2025-03-26".parse::<KnownVersion>(), Ok(V2025_03_26));
         let e = "2024-11-05".parse::<KnownVersion>().unwrap_err();
-        assert!(e.contains("2024-11-05") && e.contains("2025-11-25"), "{e}");
+        assert!(e.contains("2024-11-05") && e.contains("2026-07-28"), "{e}");
         assert_eq!(V2025_06_18.to_string(), "2025-06-18");
+    }
+
+    #[test]
+    fn only_the_newest_revision_carries_its_metadata_per_request() {
+        use KnownVersion::*;
+        assert!(V2026_07_28.is_modern());
+        assert!(!V2025_11_25.is_modern() && !V2025_03_26.is_modern());
+    }
+
+    #[test]
+    fn the_three_required_meta_fields_ride_along_and_the_callers_own_keys_survive() {
+        let meta = with_client_meta(None, KnownVersion::V2026_07_28)["_meta"].clone();
+        assert_eq!(meta[META_PROTOCOL_VERSION], "2026-07-28");
+        assert_eq!(meta[META_CLIENT_INFO]["name"], CLIENT_NAME);
+        assert_eq!(meta[META_CLIENT_CAPABILITIES], json!({}));
+
+        let raw = json!({"name": "echo", "_meta": {"progressToken": 7}});
+        let params = with_client_meta(Some(raw), KnownVersion::V2026_07_28);
+        assert_eq!(params["name"], "echo");
+        assert_eq!(params["_meta"]["progressToken"], 7);
+        assert_eq!(params["_meta"][META_PROTOCOL_VERSION], "2026-07-28");
+
+        // What the caller spelled out wins: `raw` is the escape hatch.
+        let pinned = json!({"_meta": {META_PROTOCOL_VERSION: "2025-11-25"}});
+        let params = with_client_meta(Some(pinned), KnownVersion::V2026_07_28);
+        assert_eq!(params["_meta"][META_PROTOCOL_VERSION], "2025-11-25");
+
+        let not_an_object = with_client_meta(Some(json!([1, 2])), KnownVersion::V2026_07_28);
+        assert_eq!(not_an_object, json!([1, 2]));
+    }
+
+    #[test]
+    fn the_new_revisions_errors_are_read_out_of_either_carrier() {
+        let rpc = Error::Rpc {
+            code: UNSUPPORTED_PROTOCOL_VERSION,
+            message: "Unsupported protocol version".into(),
+            data: Some(json!({"supported": ["2025-11-25"], "requested": "2026-07-28"})),
+        };
+        let found = rpc_error(&rpc).unwrap();
+        assert_eq!(found["code"], UNSUPPORTED_PROTOCOL_VERSION);
+        assert_eq!(found["data"]["supported"][0], "2025-11-25");
+
+        let over_http = Error::Http {
+            status: 400,
+            body: r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"Header mismatch"}}"#
+                .into(),
+            www_authenticate: None,
+        };
+        assert_eq!(rpc_error(&over_http).unwrap()["code"], HEADER_MISMATCH);
+
+        let plain = Error::Http {
+            status: 404,
+            body: "Not Found".into(),
+            www_authenticate: None,
+        };
+        assert!(rpc_error(&plain).is_none());
+        assert!(rpc_error(&Error::transport("no route to host")).is_none());
+
+        assert!(is_modern_error(HEADER_MISMATCH));
+        assert!(is_modern_error(UNSUPPORTED_PROTOCOL_VERSION));
+        assert!(!is_modern_error(METHOD_NOT_FOUND) && !is_modern_error(-32000));
     }
 
     #[test]

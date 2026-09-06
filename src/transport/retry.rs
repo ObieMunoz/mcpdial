@@ -18,6 +18,7 @@ pub const RETRY_DELAY: Duration = Duration::from_millis(500);
 /// Requests whose second delivery changes nothing, whatever the server did with
 /// the first one.
 const IDEMPOTENT_METHODS: &[&str] = &[
+    "server/discover",
     "initialize",
     "tools/list",
     "resources/list",

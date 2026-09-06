@@ -73,8 +73,13 @@ fn a_503_before_any_session_is_retried_once_and_traced() {
     );
     assert_eq!(
         methods(&s.requests.lock().unwrap()),
-        ["initialize", "initialize", "notifications/initialized"],
-        "the refused initialize went again, and only it"
+        [
+            "server/discover",
+            "server/discover",
+            "initialize",
+            "notifications/initialized"
+        ],
+        "the refused request went again, and only it"
     );
 }
 
@@ -94,7 +99,7 @@ fn a_connection_closed_without_a_reply_is_retried() {
     // The dropped connection never reached the server; the retry did.
     assert_eq!(
         methods(&s.requests.lock().unwrap()),
-        ["initialize", "notifications/initialized"]
+        ["server/discover", "initialize", "notifications/initialized"]
     );
 
     let s = start(Mode::HangUpOnce);
@@ -124,9 +129,11 @@ fn a_server_that_stays_unavailable_fails_after_exactly_two_attempts() {
     let e: Value = serde_json::from_str(o.stderr.trim()).unwrap();
     assert_eq!(e["error"]["kind"], "http", "{}", o.stderr);
     assert_eq!(e["error"]["status"], 503, "{}", o.stderr);
+    // A 503 is the server being down, not one that never had `server/discover`,
+    // so the handshake is never reached for.
     assert_eq!(
         methods(&s.requests.lock().unwrap()),
-        ["initialize", "initialize"]
+        ["server/discover", "server/discover"]
     );
     assert!(
         started.elapsed().as_secs() < 30,
@@ -140,7 +147,7 @@ fn a_server_that_stays_unavailable_fails_after_exactly_two_attempts() {
     assert_eq!(e["error"]["status"], 503, "{}", o.stderr);
     assert_eq!(
         methods(&s.requests.lock().unwrap()),
-        ["initialize", "initialize", "initialize"],
+        ["server/discover", "server/discover", "server/discover"],
         "--no-retry: the first 503 is the answer"
     );
 }

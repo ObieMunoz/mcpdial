@@ -243,14 +243,20 @@ terminal; piped input is read one line at a time with no editing and no history.
 - A stdio server that exits before replying reports its exit status and last stderr
   lines in the error message. A wrong package name shows up there as an npm 404.
 - Servers are called at their final URL. A redirect is reported, not followed.
-- `initialize` offers protocol `2025-11-25`; `info --json` reports the version the
-  server agreed to under `protocolVersion`. A `transport` error naming a version
-  mcpdial does not speak means the server wants one it was not offered; retry with
-  `--protocol-version 2025-06-18` (or `2025-03-26`), and save it with `add`.
+- A session opens with `server/discover`, all that revision `2026-07-28` has; a server
+  that has never heard of it gets the `initialize` handshake instead, offering
+  `2025-11-25`. `info --json` reports the version in use under `protocolVersion` and
+  the server's identity under `serverInfo` either way; on `2026-07-28` the discovery
+  result's own `supportedVersions`, `resultType` and `_meta` are there beside them. A
+  `transport` error naming a version mcpdial does not speak means the server wants one
+  it was not offered; retry with `--protocol-version 2025-06-18` (or `2025-03-26`), and
+  save it with `add`. `--protocol-version` also pins `2026-07-28`, or `2025-11-25` to
+  hold a server that serves both eras to the handshake.
 - A transient HTTP failure is retried once, only where that is provably safe: the
-  request is idempotent (`initialize`, a `*/list`, `ping`, or a tool whose listing
-  carries `idempotentHint`), or it failed before the server could have processed
-  it (connection refused or reset with no reply, DNS failure, 429, or 502/503/504
-  before a session was issued). A timeout, any other 4xx, a JSON-RPC error and a
-  stdio server that dies are never retried. `--no-retry` reports the first failure.
+  request is idempotent (`server/discover`, `initialize`, a `*/list`, `ping`, or a
+  tool whose listing carries `idempotentHint`), or it failed before the server could
+  have processed it (connection refused or reset with no reply, DNS failure, 429, or
+  502/503/504 before a session was issued). A timeout, any other 4xx, a JSON-RPC error
+  and a stdio server that dies are never retried. `--no-retry` reports the first
+  failure.
 - `mcpdial guide` prints this document.

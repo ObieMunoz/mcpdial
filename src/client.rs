@@ -286,18 +286,20 @@ fn http_transport(
     b.build()
 }
 
-/// The version to offer at `initialize`: the flag, else the one saved with the
-/// server, else the newest. A saved value this build does not know is a config
-/// error, since the file was edited to say something we cannot send.
-fn version_to_offer(r: &Resolved, opts: &Options) -> Result<KnownVersion> {
+/// The revision the caller named: the flag, else the one saved with the server,
+/// else `None` to let the session work out which era the server speaks. A saved
+/// value this build does not know is a config error, since the file was edited to
+/// say something we cannot send.
+fn pinned_version(r: &Resolved, opts: &Options) -> Result<Option<KnownVersion>> {
     if let Some(pinned) = opts.protocol_version {
-        return Ok(pinned);
+        return Ok(Some(pinned));
     }
     match &r.config.protocol_version {
         Some(saved) => saved
             .parse()
+            .map(Some)
             .map_err(|e| Error::config(format!("{}: protocol_version {e}", r.name))),
-        None => Ok(KnownVersion::LATEST),
+        None => Ok(None),
     }
 }
 
@@ -305,10 +307,13 @@ fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
     auth: AuthUsed,
-    offer: KnownVersion,
+    pinned: Option<KnownVersion>,
 ) -> Result<Connection> {
-    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>).offering(offer);
-    let server_info = session.initialize()?.clone();
+    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>);
+    if let Some(version) = pinned {
+        session = session.offering(version);
+    }
+    let server_info = session.open()?.clone();
     Ok(Connection {
         name: r.name.clone(),
         config: r.config.clone(),
@@ -342,13 +347,16 @@ fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
     )
 }
 
-/// A stdio server's process with its session opened, offering the version the
-/// flag or the config asks for: what a daemon holds on behalf of its callers.
+/// A stdio server's process with its session opened, on the revision the flag or
+/// the config asks for or the one the server turns out to speak: what a daemon
+/// holds on behalf of its callers.
 pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport>> {
     let r = r.dialed()?;
-    let offer = version_to_offer(&r, opts)?;
-    let mut session = Session::new(spawn_stdio(&r, opts)?).offering(offer);
-    session.initialize()?;
+    let mut session = Session::new(spawn_stdio(&r, opts)?);
+    if let Some(version) = pinned_version(&r, opts)? {
+        session = session.offering(version);
+    }
+    session.open()?;
     Ok(session)
 }
 
@@ -364,20 +372,20 @@ pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
     let dialed = r.dialed()?;
     let r = &dialed;
-    let offer = version_to_offer(r, opts)?;
+    let pinned = pinned_version(r, opts)?;
     let timeout = opts.timeout_for(r)?;
     if r.config.stdio.is_some() {
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
             if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger())? {
-                return handshake(r, t, AuthUsed::None, offer);
+                return handshake(r, t, AuthUsed::None, pinned);
             }
         }
-        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, offer);
+        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, pinned);
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
-    match handshake(r, http_transport(r, token, opts, timeout), auth, offer) {
+    match handshake(r, http_transport(r, token, opts, timeout), auth, pinned) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
@@ -388,7 +396,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
                 r,
                 http_transport(r, cred.access_token, opts, timeout),
                 auth,
-                offer,
+                pinned,
             )
         }
         outcome => outcome,

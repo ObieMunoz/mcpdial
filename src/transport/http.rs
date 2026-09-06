@@ -2,7 +2,9 @@
 
 use super::retry::{self, Failed, Failure, Retry};
 use super::{silent, Logger, Transport};
-use crate::protocol::{decode_body, Error, KnownVersion, Result};
+use crate::protocol::{decode_body, Error, KnownVersion, Result, META_PROTOCOL_VERSION};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Read;
@@ -39,12 +41,18 @@ pub struct HttpTransport {
     /// passed through here: the only `tools/call`s that are safe to send twice.
     idempotent_tools: HashSet<String>,
     /// Set by stateful servers on `initialize`; echoed on every later request.
-    /// Stateless servers never send one and we simply never echo one.
+    /// Stateless servers never send one and we simply never echo one. 2026-07-28
+    /// has no sessions at all, so on such a server this stays empty and the
+    /// header and the closing `DELETE` that go with it are never sent.
     pub session_id: Option<String>,
-    /// What the session settled on at `initialize`. Its presence is also the
-    /// handshake flag: the spec puts `MCP-Protocol-Version` on every request after
-    /// initialization and none on `initialize` itself, which has nothing negotiated yet.
+    /// What the handshake settled on. Its presence is also the handshake flag: the
+    /// spec puts `MCP-Protocol-Version` on every request after initialization and
+    /// none on `initialize` itself, which has nothing negotiated yet. A 2026-07-28
+    /// session negotiates nothing and gets the header from the body instead.
     negotiated_version: Option<KnownVersion>,
+    /// Whether this URL has ever answered a POST, which is what tells it apart
+    /// from an endpoint that only ever serves the transport MCP retired.
+    spoke_streamable_http: bool,
 }
 
 impl HttpTransport {
@@ -183,6 +191,7 @@ impl HttpTransportBuilder {
             idempotent_tools: HashSet::new(),
             session_id: None,
             negotiated_version: None,
+            spoke_streamable_http: false,
         }
     }
 }
@@ -216,6 +225,60 @@ pub fn legacy_sse_error(url: &str) -> Error {
 
 pub fn is_legacy_sse_error(detail: &str) -> bool {
     detail.contains(LEGACY_SSE_TRANSPORT)
+}
+
+/// The headers 2026-07-28 mirrors selected body fields into, so that a proxy can
+/// route and rate-limit on them without parsing the body.
+///
+/// Both sides read from the same payload on purpose: a server compares the two and
+/// refuses the request outright if they disagree. A request from an older revision
+/// carries none of this, and is left as it was.
+fn mirrored_headers(payload: &Value) -> Vec<(&'static str, String)> {
+    let params = &payload["params"];
+    let (Some(version), Some(method)) = (
+        params["_meta"][META_PROTOCOL_VERSION].as_str(),
+        payload["method"].as_str(),
+    ) else {
+        return Vec::new();
+    };
+    let mut headers = vec![
+        ("MCP-Protocol-Version", version.to_string()),
+        ("Mcp-Method", method.to_string()),
+    ];
+    if let Some(subject) = subject_of(method, params) {
+        headers.push(("Mcp-Name", header_value(subject)));
+    }
+    headers
+}
+
+/// What `Mcp-Name` names: the one tool, prompt or resource a request is about.
+fn subject_of<'a>(method: &str, params: &'a Value) -> Option<&'a str> {
+    match method {
+        "tools/call" | "prompts/get" => params["name"].as_str(),
+        "resources/read" => params["uri"].as_str(),
+        _ => None,
+    }
+}
+
+/// The sentinel that says the rest of a header value is base64 of UTF-8.
+const ENCODED_OPEN: &str = "=?base64?";
+const ENCODED_CLOSE: &str = "?=";
+
+/// A value as it can go in a header, encoded where it cannot go as it is.
+///
+/// An HTTP field value is visible ASCII (RFC 9110), and the spec only recommends
+/// that a tool or prompt name stay inside that; a resource URI need not. Anything
+/// else travels base64'd behind the sentinel, and so does a plain value that would
+/// otherwise read as one.
+fn header_value(value: &str) -> String {
+    let printable = |c: char| (' '..='~').contains(&c) || c == '\t';
+    let goes_as_it_is = value.chars().all(printable)
+        && value.trim() == value
+        && !(value.starts_with(ENCODED_OPEN) && value.ends_with(ENCODED_CLOSE));
+    match goes_as_it_is {
+        true => value.to_string(),
+        false => format!("{ENCODED_OPEN}{}{ENCODED_CLOSE}", STANDARD.encode(value)),
+    }
 }
 
 /// Whether a failed POST has failed the way a 2024-11-05 endpoint fails, and is
@@ -265,13 +328,16 @@ impl HttpTransport {
     ) -> std::result::Result<Option<Value>, Failed> {
         (self.log)(&format!("-> POST {}\n   {}", self.url, body));
 
-        let req = self.identify(
+        let mut req = self.identify(
             self.agent
                 .post(&self.url)
                 .header("Content-Type", "application/json")
                 // Advertise both: the server picks the framing.
                 .header("Accept", "application/json, text/event-stream"),
         );
+        for (name, value) in mirrored_headers(payload) {
+            req = req.header(name, &value);
+        }
 
         let mut resp = req.send(body).map_err(|e| Failed {
             failure: retry::before_any_reply(&e),
@@ -312,8 +378,12 @@ impl HttpTransport {
             )));
         }
         if !(200..300).contains(&status) {
-            let never_spoke_streamable_http = self.negotiated_version.is_none();
-            let worth_probing = never_spoke_streamable_http
+            // A `server/discover` that fails says nothing yet: the client is still
+            // working out which era this server speaks and will ask again with a
+            // handshake, and that request is the one worth explaining.
+            let deciding_the_era = payload["method"] == "server/discover";
+            let worth_probing = !self.spoke_streamable_http
+                && !deciding_the_era
                 && failed_like_a_legacy_endpoint(status, www_authenticate.as_deref());
             if worth_probing && self.speaks_legacy_sse() {
                 return Err(Failed::final_(legacy_sse_error(&self.url)));
@@ -330,6 +400,7 @@ impl HttpTransport {
                 },
             });
         }
+        self.spoke_streamable_http = true;
         if let Some(sid) = session_id {
             self.session_id = Some(sid);
         }
@@ -398,7 +469,24 @@ impl Transport for HttpTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{with_client_meta, KnownVersion};
+    use serde_json::json;
     use std::io::Cursor;
+
+    fn modern(method: &str, params: Value) -> Value {
+        crate::protocol::request(
+            method,
+            1,
+            Some(with_client_meta(Some(params), KnownVersion::V2026_07_28)),
+        )
+    }
+
+    fn header_of(payload: &Value, name: &str) -> Option<String> {
+        mirrored_headers(payload)
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v)
+    }
 
     /// Repeats one frame and never reaches EOF, the way the legacy endpoint's own
     /// stream does not.
@@ -458,6 +546,71 @@ mod tests {
         assert!(!failed_like_a_legacy_endpoint(403, None));
         assert!(!failed_like_a_legacy_endpoint(500, None));
         assert!(!failed_like_a_legacy_endpoint(400, Some("Bearer realm=x")));
+    }
+
+    #[test]
+    fn the_body_of_a_2026_07_28_request_is_mirrored_into_headers() {
+        let call = modern(
+            "tools/call",
+            json!({"name": "get_weather", "arguments": {}}),
+        );
+        assert_eq!(
+            header_of(&call, "mcp-protocol-version").as_deref(),
+            Some("2026-07-28")
+        );
+        assert_eq!(
+            header_of(&call, "mcp-method").as_deref(),
+            Some("tools/call")
+        );
+        assert_eq!(header_of(&call, "mcp-name").as_deref(), Some("get_weather"));
+
+        let read = modern("resources/read", json!({"uri": "file:///readme.md"}));
+        assert_eq!(
+            header_of(&read, "mcp-name").as_deref(),
+            Some("file:///readme.md"),
+            "a resource is named by its uri"
+        );
+
+        let list = modern("tools/list", json!({}));
+        assert_eq!(
+            header_of(&list, "mcp-method").as_deref(),
+            Some("tools/list")
+        );
+        assert_eq!(
+            header_of(&list, "mcp-name"),
+            None,
+            "it is about no one thing"
+        );
+    }
+
+    #[test]
+    fn a_request_from_an_older_revision_carries_none_of_them() {
+        let handshake =
+            crate::protocol::request("initialize", 1, Some(json!({"capabilities": {}})));
+        assert!(mirrored_headers(&handshake).is_empty());
+        assert!(mirrored_headers(&crate::protocol::notification(
+            "notifications/initialized",
+            None
+        ))
+        .is_empty());
+    }
+
+    #[test]
+    fn a_name_that_cannot_go_on_the_wire_travels_behind_the_sentinel() {
+        assert_eq!(header_value("get_weather"), "get_weather");
+        assert_eq!(header_value("file:///a b.md"), "file:///a b.md");
+        assert_eq!(
+            header_value("Hello, 世界"),
+            "=?base64?SGVsbG8sIOS4lueVjA==?="
+        );
+        assert_eq!(header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(header_value("line1\nline2"), "=?base64?bGluZTEKbGluZTI=?=");
+        // A plain value that reads as the sentinel is encoded too, or the server
+        // would decode something the client never encoded.
+        assert_eq!(
+            header_value("=?base64?literal?="),
+            "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        );
     }
 
     #[test]
