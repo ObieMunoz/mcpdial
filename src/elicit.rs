@@ -9,6 +9,7 @@
 //! answer is a decline, sent at once, and the server degrades however it likes.
 
 use crate::protocol::Responder;
+use crate::schema::plain;
 use serde_json::{json, Map, Value};
 use std::cell::RefCell;
 use std::io::{BufRead, Write};
@@ -615,14 +616,6 @@ fn listed(of: &[Choice]) -> String {
         .map(|(i, c)| format!("{}) {}", i + 1, c.title))
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-/// A JSON scalar as a person would type it: a string without its quotes.
-fn plain(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
-    }
 }
 
 fn count(spec: &Value, key: &str) -> Option<u64> {

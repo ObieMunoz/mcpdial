@@ -1,9 +1,10 @@
 //! What a tool's JSON Schema says one value is.
 //!
-//! `call` reads a `key=value` pair against a tool's `inputSchema` and the tool
-//! summaries name the types out of that same schema. Reading it in one place is
-//! what keeps the type a parameter is described as and the type a value is sent
-//! as the same type.
+//! `call` reads a `key=value` pair against a tool's `inputSchema`, the tool
+//! summaries name the types out of that same schema, and a prompt asks for a
+//! missing argument in the shape it declares. Reading it in one place is what
+//! keeps the type a parameter is described as, the type a value is asked for as
+//! and the type it is sent as the same type.
 //!
 //! Nothing here resolves `$ref`, and every step into a nested schema spends from
 //! a fixed budget. A schema arrives from a server: one that nests a thousand deep
@@ -48,6 +49,88 @@ pub fn allowed_values(spec: &Value) -> Vec<&Value> {
     spec.get("const").into_iter().collect()
 }
 
+/// One parameter of a tool's object schema.
+pub struct Parameter<'a> {
+    pub name: &'a str,
+    pub spec: &'a Value,
+    pub required: bool,
+}
+
+/// A tool's parameters, the required ones first and each group in the order the
+/// schema declares them: the order a summary lists them in, and the order a
+/// prompt asks for them in.
+pub fn parameters(schema: &Value) -> Vec<Parameter<'_>> {
+    let required: Vec<&str> = schema["required"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let Some(props) = properties(schema) else {
+        return Vec::new();
+    };
+    let mut ordered: Vec<Parameter<'_>> = props
+        .iter()
+        .map(|(name, spec)| Parameter {
+            name,
+            spec,
+            required: required.contains(&name.as_str()),
+        })
+        .collect();
+    // Required first: they are what a caller has to get right. The sort is
+    // stable, so everything else keeps the order the schema listed it in.
+    ordered.sort_by_key(|p| !p.required);
+    ordered
+}
+
+/// What has to be asked for to fill in one value: the schema's own answer to
+/// what a person would type here.
+#[derive(Debug, PartialEq)]
+pub enum Asked<'a> {
+    /// One of the values the schema names outright.
+    Choice(Vec<&'a Value>),
+    /// Yes or no.
+    Boolean,
+    /// A number.
+    Number,
+    /// JSON, because no plain line of text is an array or an object.
+    Json,
+    /// A line of text, read as whatever type the schema declares.
+    Text,
+}
+
+/// How to ask for a value of this schema. Alternatives are read as an example
+/// value reads them: the first of them stands for all of them.
+pub fn asked(spec: &Value) -> Asked<'_> {
+    let values = allowed_values(spec);
+    if !values.is_empty() {
+        return Asked::Choice(values);
+    }
+    match example_of(spec)["type"].as_str() {
+        Some("boolean") => Asked::Boolean,
+        Some("number" | "integer") => Asked::Number,
+        Some("array" | "object") => Asked::Json,
+        _ => Asked::Text,
+    }
+}
+
+/// One named value as it is written outside JSON: a string without its quotes,
+/// anything else as JSON writes it.
+pub fn plain(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_string)
+}
+
+/// The one line of a schema's `description` worth putting beside a value: the
+/// first, where there is one that says anything.
+pub fn summary(spec: &Value) -> Option<&str> {
+    spec["description"]
+        .as_str()?
+        .trim()
+        .lines()
+        .next()
+        .filter(|first| !first.is_empty())
+}
+
 /// What stands in for one value in an example JSON arguments object.
 pub fn json_placeholder(spec: &Value) -> String {
     let spec = example_of(spec);
@@ -75,7 +158,7 @@ pub fn pair_placeholder(spec: &Value) -> String {
     if let Some(values) = choices(spec) {
         return values
             .iter()
-            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+            .map(|v| plain(v))
             .collect::<Vec<_>>()
             .join("|");
     }
@@ -174,13 +257,10 @@ fn alternatives(spec: &Value) -> Option<&Vec<Value>> {
         .filter(|branches| !branches.is_empty())
 }
 
-/// The values a schema names outright: an `enum`'s members, or the one value a
-/// `const` allows.
+/// As many of the values a schema names as a summary spells out.
 fn choices(spec: &Value) -> Option<Vec<&Value>> {
-    if let Some(values) = spec["enum"].as_array().filter(|v| !v.is_empty()) {
-        return Some(values.iter().take(LISTED).collect());
-    }
-    spec.get("const").map(|only| vec![only])
+    let values = allowed_values(spec);
+    (!values.is_empty()).then(|| values.into_iter().take(LISTED).collect())
 }
 
 /// The schema an example value is written from: any one alternative satisfies an
@@ -359,6 +439,71 @@ mod tests {
         assert_eq!(allowed_values(&json!({"const": 5})), vec![&json!(5)]);
         assert!(allowed_values(&json!({"type": "string"})).is_empty());
         assert!(allowed_values(&json!({"enum": []})).is_empty());
+    }
+
+    #[test]
+    fn the_type_decides_what_a_prompt_asks_for() {
+        let ask = |spec: Value| match asked(&spec) {
+            Asked::Choice(values) => format!("choice {}", values.len()),
+            Asked::Boolean => "boolean".into(),
+            Asked::Number => "number".into(),
+            Asked::Json => "json".into(),
+            Asked::Text => "text".into(),
+        };
+        assert_eq!(ask(json!({"type": "string"})), "text");
+        assert_eq!(ask(json!({"type": "boolean"})), "boolean");
+        assert_eq!(ask(json!({"type": "number"})), "number");
+        assert_eq!(ask(json!({"type": "integer"})), "number");
+        assert_eq!(ask(json!({"type": "array"})), "json");
+        assert_eq!(ask(json!({"type": "object"})), "json");
+        // A union, and a property the schema says nothing about, are typed as a
+        // line and read as `key=value` reads one.
+        assert_eq!(ask(json!({"type": ["string", "null"]})), "text");
+        assert_eq!(ask(json!({})), "text");
+        // Named values are picked from, however many there are, and whichever
+        // of the two ways the schema names them.
+        assert_eq!(
+            ask(json!({"enum": ["a", "b", "c", "d", "e", "f"]})),
+            "choice 6"
+        );
+        assert_eq!(ask(json!({"const": "only"})), "choice 1");
+        // Values named beside a declared type are still the values, as they are
+        // in an example: a summary calls that property a string, but there is
+        // only one string it can be.
+        assert_eq!(ask(json!({"type": "string", "enum": ["x"]})), "choice 1");
+        // One alternative satisfies an anyOf, so the first stands for all.
+        assert_eq!(
+            ask(json!({"anyOf": [{"type": "number"}, {"type": "string"}]})),
+            "number"
+        );
+        assert_eq!(ask(json!({"enum": []})), "text");
+    }
+
+    #[test]
+    fn parameters_come_out_required_first_and_otherwise_as_declared() {
+        let schema = json!({"type": "object", "properties": {
+            "b": {"type": "string"},
+            "a": {"type": "number"},
+            "z": {"type": "string"},
+        }, "required": ["z", "a"]});
+        let listed: Vec<(&str, bool)> = parameters(&schema)
+            .iter()
+            .map(|p| (p.name, p.required))
+            .collect();
+        assert_eq!(
+            listed,
+            [("a", true), ("z", true), ("b", false)],
+            "required in the schema's order, then the rest in the schema's order"
+        );
+        assert!(parameters(&json!({"type": "object"})).is_empty());
+        assert!(parameters(&Value::Null).is_empty());
+    }
+
+    #[test]
+    fn a_named_value_is_written_without_the_quotes_json_needs() {
+        assert_eq!(plain(&json!("fast")), "fast");
+        assert_eq!(plain(&json!(5)), "5");
+        assert_eq!(plain(&json!(null)), "null");
     }
 
     #[test]

@@ -6,7 +6,7 @@
 //! and stays text where it says `string`. `key:=json` skips the schema and takes
 //! the value as written, which is how arrays, objects and a forced string arrive.
 
-use crate::{closest, parse_object};
+use crate::{closest, parse_object, shell_word};
 use mcpdial::schema;
 use mcpdial::transport::stdio::split_command;
 use mcpdial::{Error, Result};
@@ -147,6 +147,31 @@ pub fn example_pairs(tool: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// `arguments` written back as the words that would have passed them, quoted for
+/// a shell: what a call filled in by prompting is echoed as, so the same call can
+/// go into a script.
+///
+/// Every value takes the `key=value` form the schema reads it back out of, and
+/// anything that form would not read back the same way takes `key:=json`, which
+/// is read as written. Either way the line makes this call again.
+pub fn as_pairs(arguments: &Value, schema: &Value) -> Vec<String> {
+    let Some(object) = arguments.as_object() else {
+        return Vec::new();
+    };
+    object
+        .iter()
+        .map(|(key, value)| {
+            let text = format!("{key}={}", schema::plain(value));
+            let reads_back = parse_pairs(std::slice::from_ref(&text), schema)
+                .is_ok_and(|back| back[key] == *value);
+            shell_word(&match reads_back {
+                true => text,
+                false => format!("{key}:={value}"),
+            })
+        })
+        .collect()
 }
 
 /// One word split into its key and what follows the `=`, with a `key:=json` value
@@ -441,6 +466,34 @@ mod tests {
         // A line that is neither still answers as a would-be object.
         let e = shell_arguments("nonsense", schema).unwrap_err().to_string();
         assert!(e.contains("must be a JSON object"), "{e}");
+    }
+
+    #[test]
+    fn arguments_written_back_as_pairs_make_the_same_call_again() {
+        let written = |arguments: Value| as_pairs(&arguments, &schema()).join(" ");
+        assert_eq!(
+            written(json!({"query": "rust", "limit": 5, "fuzzy": true})),
+            "fuzzy=true limit=5 query=rust"
+        );
+        // A value with a space in it survives the shell it is pasted into.
+        assert_eq!(written(json!({"query": "rust ureq"})), "'query=rust ureq'");
+        // An array or an object has no text form, and a string that the schema
+        // would read as something else has to say it is one.
+        assert_eq!(
+            written(json!({"tags": ["a", "b"], "meta": {"k": 1}})),
+            r#"'meta:={"k":1}' 'tags:=["a","b"]'"#
+        );
+        assert_eq!(written(json!({"id": "123"})), "id=123");
+        assert_eq!(written(json!({"id": 123})), "id:=123");
+        assert_eq!(written(json!({"limit": "many"})), r#"'limit:="many"'"#);
+        // Whatever was written, reading it back is the arguments it came from.
+        for arguments in [
+            json!({"query": "a=b", "limit": 5, "tags": ["x"], "id": 1, "loose": null}),
+            json!({"query": "", "fuzzy": false, "meta": {}}),
+        ] {
+            let words = split_line(&as_pairs(&arguments, &schema()).join(" ")).unwrap();
+            assert_eq!(parse_pairs(&words, &schema()).unwrap(), arguments);
+        }
     }
 
     #[test]

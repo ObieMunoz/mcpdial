@@ -36,6 +36,7 @@ mod grep;
 mod notices;
 mod output;
 mod present;
+mod prompt;
 mod snapshot;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
@@ -1555,6 +1556,24 @@ fn shell_call_hint(
     )
 }
 
+/// What a shell `call` will send: the arguments that were typed, plus whatever
+/// the tool requires and nobody typed, asked for where there is someone to ask.
+/// The tool list is the one the hints read, so asking costs no extra request.
+fn shell_fill(
+    ui: &dyn Presenter,
+    cache: &mut Option<Vec<Value>>,
+    conn: &mut client::Connection,
+    tool: &str,
+    arguments: &mut Value,
+) -> Result<(), Error> {
+    if !ui.asks() {
+        return Ok(());
+    }
+    let schema =
+        find_tool(shell_tools(cache, conn), tool).map_or(Value::Null, |t| t["inputSchema"].clone());
+    prompt::fill(ui, &schema, arguments, &format!("call {tool}"))
+}
+
 /// Where shell input comes from. A terminal gets line editing, history and
 /// completion; anything else is read a line at a time exactly as before, which
 /// is what scripts and pipes depend on.
@@ -2343,7 +2362,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 find_tool(shell_tools(&mut cache, &mut conn), tool)
                                     .map_or(Value::Null, |t| t["inputSchema"].clone())
                             });
-                            match parsed {
+                            match parsed.and_then(|mut a| {
+                                shell_fill(ui, &mut cache, &mut conn, tool, &mut a).map(|()| a)
+                            }) {
                                 Err(e) => Err(Failure {
                                     error: e,
                                     hint: shell_call_hint(&mut cache, &mut conn, tool, true),
@@ -3036,24 +3057,24 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 let tools = conn.list_tools().unwrap_or_default();
                 call_hint(&tools, &tool, argument_error, &prefix, "'", &tools_cmd)
             };
-            let arguments = match object {
-                Some(object) => object,
-                None => {
-                    let pairs = form.pairs();
-                    let tools = if args::needs_schema(pairs) {
-                        conn.list_tools().unwrap_or_default()
-                    } else {
-                        Vec::new()
-                    };
-                    let schema =
-                        find_tool(&tools, &tool).map_or(Value::Null, |t| t["inputSchema"].clone());
-                    args::parse_pairs(pairs, &schema).map_err(|e| Failure {
-                        error: e,
-                        hint: call_hint(&tools, &tool, true, &prefix, "'", &tools_cmd),
-                        tool: None,
-                    })?
-                }
+            // The schema is what a pair is read against and what a prompt asks
+            // from, so one listing serves both, and neither costs a program a
+            // request it was not making already.
+            let tools = if ui.asks() || args::needs_schema(form.pairs()) {
+                conn.list_tools().unwrap_or_default()
+            } else {
+                Vec::new()
             };
+            let schema = find_tool(&tools, &tool).map_or(Value::Null, |t| t["inputSchema"].clone());
+            let mut arguments = match object {
+                Some(object) => object,
+                None => args::parse_pairs(form.pairs(), &schema).map_err(|e| Failure {
+                    error: e,
+                    hint: call_hint(&tools, &tool, true, &prefix, "'", &tools_cmd),
+                    tool: None,
+                })?,
+            };
+            prompt::fill(ui, &schema, &mut arguments, &format!("{prefix} {tool}"))?;
             let outcome = conn
                 .session
                 .call_tool_watching(&tool, arguments, &mut notices);

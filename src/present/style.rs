@@ -48,6 +48,7 @@ pub enum Color {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
     bold: bool,
+    dim: bool,
     color: Option<Color>,
 }
 
@@ -59,12 +60,17 @@ impl Style {
     pub const fn new() -> Self {
         Self {
             bold: false,
+            dim: false,
             color: None,
         }
     }
 
     pub const fn bold(self) -> Self {
         Self { bold: true, ..self }
+    }
+
+    pub const fn dim(self) -> Self {
+        Self { dim: true, ..self }
     }
 
     pub const fn color(self, color: Color) -> Self {
@@ -89,6 +95,9 @@ impl Style {
         let mut codes: Vec<u8> = Vec::new();
         if self.bold {
             codes.push(1);
+        }
+        if self.dim {
+            codes.push(2);
         }
         if let Some(color) = self.color {
             codes.push(30 + color as u8);
