@@ -2162,7 +2162,10 @@ enum Input {
     Tty {
         editor: Box<rustyline::Editor<ShellHelper, rustyline::history::DefaultHistory>>,
         history: std::path::PathBuf,
-        prompt: String,
+        /// What the server is called at this prompt. The prompt itself is built
+        /// fresh for each line, because the status dot in it is only true for
+        /// as long as the state it was read from.
+        label: String,
         interrupts: u8,
     },
     Pipe {
@@ -2181,11 +2184,13 @@ impl Input {
         label: &str,
         interactive: bool,
     ) -> Result<Self, Error> {
-        let prompt = format!("{label}> ");
         if !interactive || !std::io::stdout().is_terminal() {
+            // A redirected stdout is the agent's, whatever is on stdin, so what
+            // it is prompted with is the plain name and bracket it has always
+            // been given rather than anything a state could move.
             return Ok(Input::Pipe {
                 stdin: std::io::stdin(),
-                prompt: interactive.then_some(prompt),
+                prompt: interactive.then(|| present::Plain.shell_prompt(label, Health::Fine)),
             });
         }
         let config = rustyline::Config::builder()
@@ -2200,13 +2205,18 @@ impl Input {
         Ok(Input::Tty {
             editor: Box::new(editor),
             history,
-            prompt,
+            label: label.to_string(),
             interrupts: 0,
         })
     }
 
     /// The next line, or `None` when the session should end.
-    fn next(&mut self, ui: &dyn Presenter) -> Result<Option<String>, Error> {
+    ///
+    /// `health` is read afresh for every line, and the prompt built from it
+    /// here, which is what keeps the dot honest without anything ever writing
+    /// over a line somebody is halfway through typing: rustyline draws the
+    /// prompt itself, at the one moment there is no half-typed line to spoil.
+    fn next(&mut self, ui: &dyn Presenter, health: Health) -> Result<Option<String>, Error> {
         match self {
             Input::Pipe { stdin, prompt } => {
                 if let Some(prompt) = prompt {
@@ -2223,11 +2233,12 @@ impl Input {
             }
             Input::Tty {
                 editor,
-                prompt,
+                label,
                 interrupts,
                 ..
             } => loop {
-                match editor.readline(prompt) {
+                let prompt = ui.shell_prompt(label, health);
+                match editor.readline(&prompt) {
                     Ok(line) => {
                         *interrupts = 0;
                         if !line.trim().is_empty() {
@@ -2363,6 +2374,108 @@ impl Says {
             Says::Nothing => {}
         }
     }
+
+    /// One fact about the session itself rather than about a server's list: the
+    /// token running out, the transport dropping, the reconnect that followed.
+    /// A new key on stderr, so nothing a script already reads there moves.
+    fn about_the_session(self, ui: &dyn Presenter, state: &str, line: &str) {
+        self.tell(
+            ui,
+            line,
+            &json!({"session": {"state": state, "message": line}}),
+        );
+    }
+}
+
+/// How a shell session is, as the dot in its prompt shows it.
+///
+/// The dot is a reminder rather than an announcement: each of these states is
+/// also said once, in one dim line, at the moment it becomes true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Health {
+    /// Connected, with nothing said against it.
+    Fine,
+    /// The saved token runs out within [`TOKEN_RUNNING_OUT`].
+    Expiring,
+    /// The transport failed; the next command dials again.
+    Lost,
+}
+
+/// How long before a token runs out the prompt starts saying so.
+const TOKEN_RUNNING_OUT: u64 = 10 * 60;
+
+impl Health {
+    /// What the prompt shows now. A transport that has dropped outranks a token
+    /// running out: a session that cannot carry a request has nothing left to
+    /// spend a token on.
+    fn read(dropped: bool, expires_at: Option<u64>, now: u64) -> Self {
+        if dropped {
+            Health::Lost
+        } else if expires_at.is_some_and(|at| at <= now.saturating_add(TOKEN_RUNNING_OUT)) {
+            Health::Expiring
+        } else {
+            Health::Fine
+        }
+    }
+}
+
+/// Whether this failure took the session with it.
+///
+/// A server that answers with an error is a server that is still there, and an
+/// HTTP status is an answer as much as a JSON-RPC error object is. Only the
+/// transport failing to carry the request at all - a dead socket, a server
+/// process that exited, a reply that never came, a frame that made no sense -
+/// says there is nothing on the other end to send the next command to.
+fn dropped_the_session(error: &Error) -> bool {
+    matches!(error, Error::Transport(_))
+}
+
+/// How long is left, in the largest unit that still says something true.
+fn how_long(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// The one line a token running out is worth, and how to get another one where
+/// there is a saved server to ask for it under.
+fn expiring_line(r: &client::Resolved, left: u64) -> String {
+    let when = match left {
+        0 => "the token has expired".to_string(),
+        s => format!("the token expires in {}", how_long(s)),
+    };
+    match r.saved {
+        true => format!("{when}; `mcpdial login {}` renews it", r.name),
+        false => when,
+    }
+}
+
+/// The one line a shell prints when it is connected: what answered, and how
+/// much of itself it offered. A list nobody fetched says nothing rather than
+/// zero, because zero is a fact about the server and this would be a fact about
+/// us.
+fn connected_line(server_info: &Value, lists: &Lists) -> String {
+    let si = &server_info["serverInfo"];
+    let mut line = format!(
+        "connected  {} {}",
+        si["name"].as_str().unwrap_or("?"),
+        si["version"].as_str().unwrap_or("")
+    );
+    let counts = [
+        ("tool", lists.tools.as_ref()),
+        ("resource", lists.resources.as_ref()),
+        ("prompt", lists.prompts.as_ref()),
+    ];
+    for (what, found) in counts {
+        if let Some(items) = found {
+            let n = items.len();
+            let plural = if n == 1 { "" } else { "s" };
+            line.push_str(&format!("  {n} {what}{plural}"));
+        }
+    }
+    line.trim_end().to_string()
 }
 
 /// The `subscribe URI [FILE]` line: what to follow, and where its contents go.
@@ -2935,14 +3048,6 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let mut conn = client::connect(&store, &r, &opts)?;
             let si = &conn.server_info["serverInfo"];
             let interactive = std::io::stdin().is_terminal();
-            if interactive {
-                ui.err_line(&format!(
-                    "connected to {} {}",
-                    si["name"].as_str().unwrap_or("?"),
-                    si["version"].as_str().unwrap_or("")
-                ));
-                ui.err_line(SHELL_SUMMARY);
-            }
             // A saved server is prompted by its own name. An ad-hoc target is a
             // whole URL or command line, which makes a prompt that wraps the
             // terminal, so use what the server calls itself instead.
@@ -2984,6 +3089,27 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     input.suggestions_from(Rc::new(lent.clone()));
                 }
             }
+            if interactive {
+                ui.err_line(&connected_line(&conn.server_info, &lists));
+            }
+            // When the credential this session is holding runs out, so that the
+            // prompt can say so before a call fails on it. Read once: a token
+            // is not renewed under a session that is already using it.
+            let token_expires_at = matches!(conn.auth, client::AuthUsed::Saved)
+                .then(|| store.credential(&r.name).ok().flatten())
+                .flatten()
+                .and_then(|cred| cred.expires_at);
+            // Whether the transport dropped under the last command, and whether
+            // the token running out has been mentioned; each state is worth one
+            // line, and the dot in the prompt carries it from then on.
+            let mut dropped = false;
+            let mut said_expiring = false;
+            // Whether there is a person here to be shown a state and to wait
+            // for a session to be dialed again. A piped shell keeps today's
+            // behaviour to the letter, down to a stdio server that died staying
+            // dead rather than being restarted under a script that would then
+            // be talking to a process with none of the state it had built up.
+            let at_a_terminal = matches!(input, Input::Tty { .. });
             let info_cmd = "`info`";
             // Every result this session prints, numbered, so a later line can
             // name one instead of running it again.
@@ -2992,12 +3118,19 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             // nobody typed: the loop reads it before asking for another.
             let mut pending: Option<String> = None;
             loop {
+                let health = Health::read(dropped, token_expires_at, mcpdial::config::now());
+                if health == Health::Expiring && !std::mem::replace(&mut said_expiring, true) {
+                    let left = token_expires_at
+                        .unwrap_or_default()
+                        .saturating_sub(mcpdial::config::now());
+                    says.about_the_session(ui, "expiring", &expiring_line(&r, left));
+                }
                 let raw = match pending.take() {
                     Some(line) => line,
                     None => {
                         // The session goes on loan to Tab for the length of the
                         // read and comes straight back; see [`Lent`].
-                        let (returned, read) = lent.reading(conn, || input.next(ui));
+                        let (returned, read) = lent.reading(conn, || input.next(ui, health));
                         conn = returned;
                         match read? {
                             Some(line) => line,
@@ -3035,6 +3168,38 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     );
                     shell_failed(ui, &refused, cli.json);
                     continue;
+                }
+                // A session that dropped is dialed again here rather than where
+                // it dropped: reconnecting under a prompt nobody has typed at
+                // yet spends a person's wait on a session they may be about to
+                // leave, and `quit` needs no server at all.
+                if dropped && at_a_terminal && !matches!(word, "quit" | "exit") {
+                    match client::connect(&store, &r, &opts) {
+                        Ok(mut fresh) => {
+                            // What the session had been told to answer with, and
+                            // what it had been told to follow, were asked for by
+                            // the person at the prompt: a new socket under them
+                            // does not unask either.
+                            fresh.elicit = conn.elicit.clone();
+                            conn = fresh;
+                            dropped = false;
+                            let following: Vec<String> =
+                                subs.following().map(|(uri, _)| uri.clone()).collect();
+                            for uri in following {
+                                start_following(&mut conn, subs.mechanism(), &uri, info_cmd).ok();
+                            }
+                            says.about_the_session(
+                                ui,
+                                "reconnected",
+                                &format!("reconnected to {label}"),
+                            );
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            shell_failed(ui, &Failure::from(e), cli.json);
+                            continue;
+                        }
+                    }
                 }
                 let outcome: Result<(), Failure> = match word {
                     "quit" | "exit" => break,
@@ -3569,6 +3734,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 };
                 if let Err(f) = outcome {
                     failures += 1;
+                    dropped |= dropped_the_session(&f.error);
                     shell_failed(ui, &f, cli.json);
                 }
                 // Between two commands, where a line of ours cannot land in the
@@ -4895,5 +5061,107 @@ mod tests {
         // A tool that simply failed does not get a schema dumped under it.
         assert!(!reads_as_argument_error("Navigation timed out after 30s"));
         assert!(!is_argument_error(&Error::usage("no")));
+    }
+
+    #[test]
+    fn the_prompt_says_lost_over_expiring_and_expiring_only_when_it_is_close() {
+        const NOW: u64 = 1_700_000_000;
+        let in_secs = |s: u64| Some(NOW + s);
+
+        assert_eq!(Health::read(false, None, NOW), Health::Fine);
+        assert_eq!(Health::read(false, in_secs(3600), NOW), Health::Fine);
+        assert_eq!(
+            Health::read(false, in_secs(TOKEN_RUNNING_OUT + 1), NOW),
+            Health::Fine
+        );
+        assert_eq!(
+            Health::read(false, in_secs(TOKEN_RUNNING_OUT), NOW),
+            Health::Expiring
+        );
+        assert_eq!(Health::read(false, Some(NOW - 1), NOW), Health::Expiring);
+
+        // A transport that dropped outranks both: a token is no use to a
+        // session that cannot carry a request.
+        assert_eq!(Health::read(true, None, NOW), Health::Lost);
+        assert_eq!(Health::read(true, in_secs(1), NOW), Health::Lost);
+    }
+
+    #[test]
+    fn only_the_transport_failing_says_the_session_is_gone() {
+        assert!(dropped_the_session(&Error::transport("server exited")));
+        // An answer, however unwelcome, is a server that is still there.
+        for still_there in [
+            Error::Rpc {
+                code: INVALID_PARAMS,
+                message: "no".into(),
+                data: None,
+            },
+            Error::Http {
+                status: 401,
+                body: String::new(),
+                www_authenticate: None,
+            },
+            Error::usage("typo"),
+            Error::auth("login first"),
+            Error::config("unreadable"),
+        ] {
+            assert!(!dropped_the_session(&still_there), "{still_there:?}");
+        }
+    }
+
+    #[test]
+    fn one_connected_line_names_the_server_and_counts_what_it_offered() {
+        let info = json!({"serverInfo": {"name": "chrome-devtools-mcp", "version": "0.6.0"}});
+        let listed = |n: usize| Some(vec![json!({}); n]);
+
+        let everything = Lists {
+            tools: listed(26),
+            resources: listed(3),
+            templates: listed(1),
+            prompts: listed(1),
+        };
+        assert_eq!(
+            connected_line(&info, &everything),
+            "connected  chrome-devtools-mcp 0.6.0  26 tools  3 resources  1 prompt"
+        );
+
+        // A list nobody fetched is left out; a list fetched and empty is not.
+        let tools_only = Lists {
+            tools: listed(1),
+            resources: listed(0),
+            ..Lists::default()
+        };
+        assert_eq!(
+            connected_line(&info, &tools_only),
+            "connected  chrome-devtools-mcp 0.6.0  1 tool  0 resources"
+        );
+        assert_eq!(
+            connected_line(&json!({}), &Lists::default()),
+            "connected  ?"
+        );
+    }
+
+    #[test]
+    fn a_token_running_out_is_one_line_that_says_how_to_renew_it() {
+        let saved = client::Resolved {
+            name: "web".into(),
+            config: ServerConfig::http("https://example.test/mcp"),
+            saved: true,
+        };
+        let ad_hoc = client::Resolved {
+            saved: false,
+            ..saved.clone()
+        };
+        assert_eq!(
+            expiring_line(&saved, 9 * 60 + 30),
+            "the token expires in 9m; `mcpdial login web` renews it"
+        );
+        assert_eq!(
+            expiring_line(&saved, 0),
+            "the token has expired; `mcpdial login web` renews it"
+        );
+        // Nothing to log in to under an ad-hoc URL, so nothing is suggested.
+        assert_eq!(expiring_line(&ad_hoc, 45), "the token expires in 45s");
+        assert_eq!(how_long(3 * 3600 + 4 * 60), "3h04m");
     }
 }

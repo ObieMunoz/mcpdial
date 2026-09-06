@@ -8,7 +8,7 @@
 //!
 //! [`choose`]: dyn Presenter::choose
 
-use crate::{Cli, Failure};
+use crate::{Cli, Failure, Health};
 use mcpdial::catalog;
 use mcpdial::session::{Media, ResourceBody};
 use mcpdial::Error;
@@ -194,6 +194,14 @@ pub trait Presenter {
     /// terminal, since it is not the answer, only how to ask again.
     fn aside(&self, line: &str) {
         self.err_line(line);
+    }
+
+    /// What a shell session asks for its next line with. A redirected stdout
+    /// has been given the server's name and an angle bracket since there was a
+    /// shell, and a program cannot be shown a state, so this says nothing about
+    /// one.
+    fn shell_prompt(&self, label: &str, _health: Health) -> String {
+        format!("{label}> ")
     }
 
     /// The number the shell filed a result under, before the result itself, so
@@ -451,6 +459,15 @@ impl Presenter for Rich {
         self.aside(&format!("[{n}]"));
     }
 
+    /// The status dot between the server's name and the bracket. Rustyline
+    /// draws the prompt on stdout, so it is stdout's colour switch that decides
+    /// whether the dot is painted; the glyph carries the same three states on
+    /// its own, for the terminal where colour is off.
+    fn shell_prompt(&self, label: &str, health: Health) -> String {
+        let (dot, style) = health_dot(health);
+        format!("{label} {} > ", style.when(self.color_out).paint(dot))
+    }
+
     fn page_start(&self) {
         self.page.borrow_mut().get_or_insert_with(Vec::new);
     }
@@ -644,6 +661,20 @@ impl Rich {
             .color(style::Color::Red)
             .when(self.color_err)
             .paint("error:")
+    }
+}
+
+/// The dot a shell prompt wears, and what colour it is worth.
+///
+/// Full, half and hollow, in that order, so the three states are still three
+/// states where `NO_COLOR` or a colourless terminal leaves the paint off.
+#[cfg(feature = "rich")]
+fn health_dot(health: Health) -> (&'static str, style::Style) {
+    use style::{Color, Style};
+    match health {
+        Health::Fine => ("\u{25cf}", Style::new().color(Color::Green)),
+        Health::Expiring => ("\u{25d0}", Style::new().color(Color::Yellow)),
+        Health::Lost => ("\u{25cb}", Style::new().color(Color::Red)),
     }
 }
 
@@ -956,6 +987,51 @@ mod tests {
         assert_eq!(
             p.err.borrow().as_str(),
             "note: first\n      second\nerror: no\ntry this\nerror: alone\n"
+        );
+    }
+
+    #[test]
+    fn a_program_is_prompted_by_name_alone_whatever_the_session_is_doing() {
+        for health in [Health::Fine, Health::Expiring, Health::Lost] {
+            assert_eq!(Plain.shell_prompt("web", health), "web> ", "{health:?}");
+            assert_eq!(Kept::default().shell_prompt("web", health), "web> ");
+        }
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn the_prompt_dot_says_which_of_the_three_states_the_session_is_in() {
+        let painted = Rich {
+            color_out: true,
+            ..Rich::default()
+        };
+        assert_eq!(
+            painted.shell_prompt("chrome", Health::Fine),
+            "chrome \x1b[32m\u{25cf}\x1b[0m > "
+        );
+        assert_eq!(
+            painted.shell_prompt("chrome", Health::Expiring),
+            "chrome \x1b[33m\u{25d0}\x1b[0m > "
+        );
+        assert_eq!(
+            painted.shell_prompt("chrome", Health::Lost),
+            "chrome \x1b[31m\u{25cb}\x1b[0m > "
+        );
+
+        // NO_COLOR, or a terminal with nothing to paint with: full, half and
+        // hollow still tell the three apart.
+        let bare = Rich::default();
+        assert_eq!(
+            bare.shell_prompt("chrome", Health::Fine),
+            "chrome \u{25cf} > "
+        );
+        assert_eq!(
+            bare.shell_prompt("chrome", Health::Expiring),
+            "chrome \u{25d0} > "
+        );
+        assert_eq!(
+            bare.shell_prompt("chrome", Health::Lost),
+            "chrome \u{25cb} > "
         );
     }
 

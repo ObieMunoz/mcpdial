@@ -72,11 +72,15 @@ impl<'a> Notices<'a> {
     }
 
     /// One line on stderr, and the updating line cleared out of its way first.
+    ///
+    /// Dim, because it is the server talking beside the answer rather than the
+    /// answer: `aside` is what dims it at a terminal and leaves a pipe's bytes
+    /// exactly where they were.
     fn say(&mut self, notice: &Notice<'_>, prose: String) {
         self.finish();
         match self.json {
             true => self.ui.err_line(&Self::wire(notice)),
-            false => self.ui.err_line(&prose),
+            false => self.ui.aside(&prose),
         }
     }
 

@@ -216,7 +216,7 @@ fn at_a_terminal(home: &std::path::Path, url: &str, lines: &[(&str, &str)]) -> S
     let printed = both_streams(&mut child);
     // Not before the line editor is there to read them: keys typed at a
     // terminal that is still connecting are echoed, not completed.
-    printed.wait_for("connected to");
+    printed.wait_for("connected  ");
     for (keys, expected) in lines {
         typing
             .write_all(keys.as_bytes())
