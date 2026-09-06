@@ -172,7 +172,9 @@ What a pipe gets is frozen. Everything mcpdial prints goes through one of two
 presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
 `MCPDIAL_PLAIN` and for `TERM=dumb`, is the same bytes release after release, and
 `Rich`, chosen only for a person at a terminal, is the one place the output may
-differ. A snapshot test holds `Plain` to its word; see Development below.
+differ: JSON (`schema`, `info`, `raw`, a tool's `structuredContent`) comes with its
+keys, strings, numbers, booleans and null in colour, which `NO_COLOR` turns off. A
+snapshot test holds `Plain` to its word; see Development below.
 
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
