@@ -346,12 +346,19 @@ fn pinned_version(r: &Resolved, opts: &Options) -> Result<Option<KnownVersion>> 
     }
 }
 
-/// `initialize`, with whatever can answer the server back installed first: the
-/// capability is declared in the same breath as the handler that honours it,
-/// and only on a transport that took one. Streamable HTTP takes none - the
-/// question arrives on the response stream, but the reply would need a second
-/// POST while the first is still open - so nothing is promised to a server
-/// that could only be left waiting.
+/// Open the session, with whatever can answer the server back installed first:
+/// the capability is declared in the same breath as the handler that honours
+/// it, and never where nothing could honour it.
+///
+/// Which era the server speaks is not known yet - that is what opening settles -
+/// so both ways of being asked are installed and the era picks one. Before
+/// 2026-07-28 the question is a request the server sends mid-call, and only a
+/// transport that can carry a reply takes the handler: Streamable HTTP takes
+/// none, because the question arrives on the response stream and the reply would
+/// need a second POST while the first is still open. From 2026-07-28 the
+/// question comes back as a result and the answer is the next request, which
+/// every transport can send - so on that revision Streamable HTTP declares
+/// elicitation too.
 fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
@@ -361,12 +368,14 @@ fn handshake(
 ) -> Result<Connection> {
     let mut transport = Box::new(transport) as Box<dyn Transport>;
     let elicit = Answers::new(opts.elicit.answers.clone());
-    let answering = transport.answer_requests(elicit::responder(&opts.elicit, elicit.clone()));
-    let declared = match answering {
-        true => opts.elicit.capabilities(),
-        false => json!({}),
-    };
-    let mut session = Session::new(transport).declaring(declared);
+    let can_answer = opts.elicit.capabilities();
+    let mid_call = transport.answer_requests(elicit::responder(&opts.elicit, elicit.clone()));
+    let mut session = Session::new(transport)
+        .declaring(match mid_call {
+            true => can_answer.clone(),
+            false => json!({}),
+        })
+        .answering(can_answer, elicit::responder(&opts.elicit, elicit.clone()));
     if let Some(version) = pinned {
         session = session.offering(version);
     }

@@ -245,9 +245,13 @@ means the arguments, and carries the tool's usage as before.
 ## Elicitation
 
 A server that needs one more fact mid-call - a confirmation, a region, a parameter
-nobody passed - sends `elicitation/create` and blocks until the client replies.
-mcpdial never waits on a person who is not there: with no terminal on both stdin and
-stderr, or under `--json`, the request is declined the moment it arrives and the call
+nobody passed - asks for it with `elicitation/create`, either as a request it sends while
+the call is in flight or, from revision `2026-07-28`, as a result the client answers by
+sending the call again.
+mcpdial never waits on a person who is not there: the same rule that decides whether a
+missing argument is asked for decides this. Anything that says the output belongs to a
+program - `--json`, `--plain`, `MCPDIAL_PLAIN`, `TERM=dumb`, or a pipe on any of the three
+streams - declines the request the moment it arrives and the call
 carries on. **A decline is not an error.** It is the spec's way of saying the value is
 not coming; the server degrades around it, and the exit code stays the tool's own.
 
@@ -272,18 +276,33 @@ server asked: confirm before running; declined (no terminal; use --elicit)
 {"elicitation":{"action":"accept","message":"sign in","detail":"accepted; opened https://x/y","url":"https://x/y"}}
 ```
 
-`initialize` declares only what can actually answer: over stdio, `"elicitation": {"form":
-{}, "url": {}}` when there is a terminal or `--elicit`, `{"url": {}}` otherwise, so a
-server that checks can avoid asking for what it will not get. A url-mode request needs nobody: its
+Only what can actually answer is declared: `"elicitation": {"form": {}, "url": {}}` when
+there is a terminal or `--elicit`, `{"url": {}}` otherwise, so a server that checks can
+avoid asking for what it will not get. A url-mode request needs nobody: its
 address goes on stderr, a browser opens it unless `--no-browser` (on `call`, `prompt`
 and `shell`), and it is accepted at once, because the interaction happens out of band.
 Nothing is declared for `sampling` or `roots`, which are still answered `-32601`.
 
-stdio servers are answered, including one held open by `mcpdial start`. Over Streamable
-HTTP the question arrives - the response stream is read event by event - but the reply
-would need a second POST while that one is still open, which mcpdial does not yet send.
-So nothing is declared there at all, and a server that checks the capability will not ask
-a question it would be left waiting on.
+Where the declaration goes, and which transports get one, depends on the revision.
+
+Before `2026-07-28` the question is a request the server sends mid-call, so the
+declaration is at `initialize` and only a transport that can carry a reply gets one.
+stdio does, `mcpdial start`'s daemon included. Streamable HTTP does not: the question
+arrives - the response stream is read event by event - but the reply would need a second
+POST while that one is still open. Nothing is declared there, so a server that checks
+will not ask a question it would be left waiting on.
+
+From `2026-07-28` the question is a **result** instead. A server answers with
+`resultType: "input_required"`, an `inputRequests` map keyed by names it chose, and an
+opaque `requestState`; mcpdial serves each request and sends the same call again with
+`inputResponses` under those keys and the state back untouched, under a new JSON-RPC id.
+The declaration rides in every request's `_meta` under
+`io.modelcontextprotocol/clientCapabilities`. Because the answer is a fresh request
+rather than a reply on an open stream, **every transport can answer, Streamable HTTP
+included**, and it declares elicitation there too. A server may demand input again on the
+retry; mcpdial goes round four times at most and then fails, naming the server, rather
+than answering for ever. `raw` is the exception: it was asked to send one request, so it
+prints the `input_required` result as it came.
 
 ## Exit codes and errors
 

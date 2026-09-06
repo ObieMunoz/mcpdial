@@ -742,13 +742,16 @@ fn watched<'a, T>(
     outcome
 }
 
-/// What this invocation can answer when a server elicits mid-call.
+/// What this invocation can answer when a server asks for one more fact.
 ///
-/// Nothing here may wait on a person who is not there. Without a terminal on
-/// both stdin and stderr, or under `--json`, where the output is being parsed
-/// rather than read, a form elicitation is declined the moment it arrives and
-/// the call carries on.
+/// Nothing here may wait on a person who is not there, and whether one is there
+/// is a question already answered: [`Presenter::asks`] is what says whether this
+/// run is a person's or a program's, and a missing argument and an elicitation
+/// are the same question put twice. Stderr is looked at as well, because that is
+/// where an elicitation's question and prompts go; `--json` says so twice over,
+/// since it also decides what the report on stderr looks like.
 fn elicitation(
+    ui: &dyn Presenter,
     answers: Option<&str>,
     no_browser: bool,
     json: bool,
@@ -758,10 +761,9 @@ fn elicitation(
         .map(|text| read_json_arg(text, "elicit answers"))
         .transpose()?
         .and_then(|v| v.as_object().cloned());
-    let at_a_terminal = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     Ok(Elicit {
         answers,
-        ask: at_a_terminal && !json,
+        ask: ui.asks() && std::io::stderr().is_terminal() && !json,
         later: shell,
         browser: !no_browser,
         json,
@@ -2142,7 +2144,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         }
 
         Cmd::Shell { target, no_browser } => {
-            opts.elicit = elicitation(None, no_browser, cli.json, true)?;
+            opts.elicit = elicitation(ui, None, no_browser, cli.json, true)?;
             let r = client::resolve(&store, &target)?;
             let mut conn = client::connect(&store, &r, &opts)?;
             let si = &conn.server_info["serverInfo"];
@@ -2655,7 +2657,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             elicit,
             no_browser,
         } => {
-            opts.elicit = elicitation(elicit.as_deref(), no_browser, cli.json, false)?;
+            opts.elicit = elicitation(ui, elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             let arguments = match form.json() {
                 Some(text) => read_json_arg(text, "arguments").map_err(|e| {
@@ -3024,7 +3026,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             strict,
         } => {
             let promised = check.as_deref().map(snapshot::read).transpose()?;
-            opts.elicit = elicitation(elicit.as_deref(), no_browser, cli.json, false)?;
+            opts.elicit = elicitation(ui, elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             // A JSON object is settled before anything is dialed, as it always
             // was; pairs wait for the schema only an open session can supply.
@@ -3131,7 +3133,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
         } => {
             let params = read_json_arg(&params, "params")?;
             let mut conn = dial(&store, &opts, &target)?;
-            let result = conn.session.request(&method, Some(params))?;
+            let result = conn.session.request_once(&method, Some(params))?;
             let sent = out.deliver(
                 Payload::Json {
                     value: &result,

@@ -6,7 +6,7 @@
 //! 2. Transport is HTTP POST to one endpoint, or newline-delimited JSON over stdio.
 //! 3. The methods you actually need are `initialize`, `tools/list` and `tools/call`.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::fmt;
 use std::str::FromStr;
 
@@ -48,6 +48,11 @@ pub const MISSING_REQUIRED_CLIENT_CAPABILITY: i64 = -32021;
 /// The server does not speak the revision the request declared, and `data.supported`
 /// names the ones it does.
 pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The `resultType` of a 2026-07-28 result that is a demand for input rather
+/// than the answer: the same request goes again carrying what it asked for.
+/// Every other value, and an absent one, is a finished result.
+pub const INPUT_REQUIRED: &str = "input_required";
 
 /// The `_meta` keys 2026-07-28 carries on every request in place of a handshake.
 pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
@@ -437,14 +442,15 @@ pub fn rpc_error(e: &Error) -> Option<Value> {
 /// speaking, and what it may be asked to do in return.
 ///
 /// There is no handshake to settle any of it, so every request says it again and
-/// a server that reads only this one still has everything it needs. The empty
-/// capabilities are the same refusal `initialize` sent: mcpdial answers no
-/// sampling, elicitation or roots request.
-pub fn client_meta(version: KnownVersion) -> Value {
+/// a server that reads only this one still has everything it needs. That goes
+/// for the capabilities too: this revision has a server ask for what it needs in
+/// the *result* of a request, so what the request itself declared is the whole
+/// of what stands behind the ask.
+pub fn client_meta(version: KnownVersion, capabilities: &Value) -> Value {
     json!({
         META_PROTOCOL_VERSION: version.as_str(),
         META_CLIENT_INFO: { "name": CLIENT_NAME, "version": CLIENT_VERSION },
-        META_CLIENT_CAPABILITIES: {},
+        META_CLIENT_CAPABILITIES: capabilities.clone(),
     })
 }
 
@@ -452,12 +458,16 @@ pub fn client_meta(version: KnownVersion) -> Value {
 /// carries, so that `raw` reaches a 2026-07-28 server without the caller
 /// spelling out three fixed fields, and still gets to set `progressToken` or a
 /// log level of its own. Params that are not an object have nowhere to put it.
-pub fn with_client_meta(params: Option<Value>, version: KnownVersion) -> Value {
+pub fn with_client_meta(
+    params: Option<Value>,
+    version: KnownVersion,
+    capabilities: &Value,
+) -> Value {
     let mut params = params.unwrap_or_else(|| json!({}));
     let Some(fields) = params.as_object_mut() else {
         return params;
     };
-    let mut meta = client_meta(version);
+    let mut meta = client_meta(version, capabilities);
     if let (Some(ours), Some(theirs)) = (
         meta.as_object_mut(),
         fields.get("_meta").and_then(Value::as_object),
@@ -465,6 +475,66 @@ pub fn with_client_meta(params: Option<Value>, version: KnownVersion) -> Value {
         ours.extend(theirs.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
     fields.insert("_meta".into(), meta);
+    params
+}
+
+/// What a 2026-07-28 server wants before it will answer, in place of the
+/// server-initiated request every earlier revision sent mid-call.
+///
+/// The revision calls this a Multi Round-Trip Request: the result is not the
+/// answer but a demand, and the same request goes again carrying what it asked
+/// for. Because the demand is a *returned value* rather than a question down an
+/// open connection, the answer is a fresh request, which every transport can
+/// send.
+pub struct InputRequired {
+    /// The requests to serve, under the identifiers the server chose. The
+    /// answers go back under those same keys.
+    ///
+    /// None at all is a server shedding load: it wants the request again and
+    /// nothing more, which is why the spec has it send either these or a state
+    /// and does not insist on both.
+    pub requests: Map<String, Value>,
+    /// The server's own business, echoed back exactly as it arrived. The spec
+    /// forbids a client to read, parse or alter it, so nothing here does.
+    pub state: Option<String>,
+}
+
+/// Read a demand for input out of a result, or `None` for a finished one.
+pub fn input_required(result: &Value) -> Option<InputRequired> {
+    if result.get("resultType").and_then(Value::as_str) != Some(INPUT_REQUIRED) {
+        return None;
+    }
+    Some(InputRequired {
+        requests: result["inputRequests"]
+            .as_object()
+            .cloned()
+            .unwrap_or_default(),
+        state: result["requestState"].as_str().map(str::to_string),
+    })
+}
+
+/// The params of the request to send again: what it carried the first time,
+/// plus the answers under the keys the server asked under and its state back
+/// untouched. Params that are not an object have nowhere to put either, as with
+/// [`with_client_meta`].
+///
+/// A server that asked for nothing gets no `inputResponses`, and one that sent
+/// no state gets none back: the spec forbids inventing either.
+pub fn with_input_responses(
+    params: Option<Value>,
+    answers: Map<String, Value>,
+    state: Option<&str>,
+) -> Value {
+    let mut params = params.unwrap_or_else(|| json!({}));
+    let Some(fields) = params.as_object_mut() else {
+        return params;
+    };
+    if !answers.is_empty() {
+        fields.insert("inputResponses".into(), Value::Object(answers));
+    }
+    if let Some(state) = state {
+        fields.insert("requestState".into(), json!(state));
+    }
     params
 }
 
@@ -824,23 +894,73 @@ mod tests {
 
     #[test]
     fn the_three_required_meta_fields_ride_along_and_the_callers_own_keys_survive() {
-        let meta = with_client_meta(None, KnownVersion::V2026_07_28)["_meta"].clone();
+        let declared = json!({"elicitation": {"url": {}}});
+        let meta = with_client_meta(None, KnownVersion::V2026_07_28, &declared)["_meta"].clone();
         assert_eq!(meta[META_PROTOCOL_VERSION], "2026-07-28");
         assert_eq!(meta[META_CLIENT_INFO]["name"], CLIENT_NAME);
-        assert_eq!(meta[META_CLIENT_CAPABILITIES], json!({}));
+        // What a request declares is the whole of what stands behind a server's
+        // ask, since there is no handshake that could have declared it earlier.
+        assert_eq!(meta[META_CLIENT_CAPABILITIES], declared);
 
         let raw = json!({"name": "echo", "_meta": {"progressToken": 7}});
-        let params = with_client_meta(Some(raw), KnownVersion::V2026_07_28);
+        let params = with_client_meta(Some(raw), KnownVersion::V2026_07_28, &json!({}));
         assert_eq!(params["name"], "echo");
         assert_eq!(params["_meta"]["progressToken"], 7);
         assert_eq!(params["_meta"][META_PROTOCOL_VERSION], "2026-07-28");
+        assert_eq!(params["_meta"][META_CLIENT_CAPABILITIES], json!({}));
 
         // What the caller spelled out wins: `raw` is the escape hatch.
         let pinned = json!({"_meta": {META_PROTOCOL_VERSION: "2025-11-25"}});
-        let params = with_client_meta(Some(pinned), KnownVersion::V2026_07_28);
+        let params = with_client_meta(Some(pinned), KnownVersion::V2026_07_28, &json!({}));
         assert_eq!(params["_meta"][META_PROTOCOL_VERSION], "2025-11-25");
 
-        let not_an_object = with_client_meta(Some(json!([1, 2])), KnownVersion::V2026_07_28);
+        let not_an_object =
+            with_client_meta(Some(json!([1, 2])), KnownVersion::V2026_07_28, &json!({}));
+        assert_eq!(not_an_object, json!([1, 2]));
+    }
+
+    #[test]
+    fn a_demand_for_input_is_read_apart_from_a_finished_result() {
+        assert!(input_required(&json!({"resultType": "complete"})).is_none());
+        // Every revision before this one sent no `resultType` at all.
+        assert!(input_required(&json!({"content": []})).is_none());
+
+        let asked = input_required(&json!({
+            "resultType": INPUT_REQUIRED,
+            "inputRequests": {"github_login": {"method": "elicitation/create", "params": {}}},
+            "requestState": "opaque",
+        }))
+        .expect("a demand for input");
+        assert_eq!(asked.requests.len(), 1);
+        assert_eq!(asked.state.as_deref(), Some("opaque"));
+
+        // A server shedding load asks for nothing and only wants the state back.
+        let shed = input_required(&json!({"resultType": INPUT_REQUIRED, "requestState": "s"}))
+            .expect("a demand for input");
+        assert!(shed.requests.is_empty());
+    }
+
+    #[test]
+    fn the_retry_carries_the_answers_and_the_state_exactly_as_they_came() {
+        let answers: Map<String, Value> = json!({"github_login": {"action": "decline"}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let again = with_input_responses(
+            Some(json!({"name": "echo", "arguments": {}})),
+            answers.clone(),
+            Some("opaque"),
+        );
+        assert_eq!(again["name"], "echo");
+        assert_eq!(again["inputResponses"]["github_login"]["action"], "decline");
+        assert_eq!(again["requestState"], "opaque");
+
+        // Neither field is invented: a server that sent no state gets none back,
+        // and one that asked for nothing gets no responses.
+        let bare = with_input_responses(Some(json!({"name": "echo"})), Map::new(), None);
+        assert_eq!(bare, json!({"name": "echo"}));
+
+        let not_an_object = with_input_responses(Some(json!([1, 2])), answers, Some("opaque"));
         assert_eq!(not_an_object, json!([1, 2]));
     }
 

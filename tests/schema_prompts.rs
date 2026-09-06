@@ -10,18 +10,13 @@
 
 mod common;
 
-use common::{echo_command, mcpdial, temp_home};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-/// Long enough for a debug build to spawn a server and finish a call on a busy
-/// machine, and far short of for ever, which is how long a prompt with nobody
-/// in front of it takes.
-const BOUND: Duration = Duration::from_secs(20);
+use common::{
+    both_streams, echo_command, mcpdial, no_pty, pty_args, pty_line, temp_home,
+    with_a_silent_pipe_on_stdin, within_a_pty, within_bound, BOUND,
+};
+use std::io::Write;
+use std::path::PathBuf;
+use std::time::Duration;
 
 /// Longer than [`BOUND`], so that a stdin which is supposed to stay silent has
 /// not gone quiet on its own before the clock runs out. Short enough that the
@@ -48,197 +43,6 @@ fn home_with_echo(tag: &str) -> PathBuf {
     home
 }
 
-/// Everything a run printed, on either stream, and what it exited with.
-struct Finished {
-    code: i32,
-    output: String,
-    took: Duration,
-}
-
-/// Runs `child` to its end, or kills it once [`BOUND`] is up and fails. `held`
-/// is its stdin, kept open for as long as it lives and never written to: a read
-/// of that blocks for ever, which is exactly what a prompt would do here.
-fn within_bound(mut child: Child, held: Option<ChildStdin>, printed: &Printed) -> Finished {
-    let started = Instant::now();
-    let mut waited = None;
-    while started.elapsed() < BOUND {
-        if let Some(status) = child.try_wait().expect("wait for mcpdial") {
-            waited = Some(status);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let took = started.elapsed();
-    printed.drained();
-    let Some(status) = waited else {
-        child.kill().ok();
-        child.wait().ok();
-        panic!(
-            "still running after {BOUND:?}: it stopped to ask a question that nobody \
-             can answer.\nwhat it had printed:\n{}",
-            printed.text()
-        );
-    };
-    drop(held);
-    Finished {
-        code: status.code().unwrap_or(-1),
-        output: printed.text(),
-        took,
-    }
-}
-
-/// Both of a child's streams, drained as they come. Draining matters twice
-/// over: a child that fills a pipe buffer must not be mistaken for one that
-/// stopped to ask something, and a question has to be readable before it is
-/// answered.
-struct Printed {
-    kept: Arc<Mutex<Vec<u8>>>,
-    readers: Mutex<Vec<JoinHandle<()>>>,
-}
-
-impl Printed {
-    fn text(&self) -> String {
-        String::from_utf8_lossy(&self.kept.lock().unwrap()).replace('\r', "")
-    }
-
-    /// Waits, briefly, for both streams to reach their end. A command that has
-    /// exited has printed everything it is going to, but the threads reading it
-    /// may not have caught up, and what they have not read yet is not something
-    /// to judge it by.
-    fn drained(&self) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            if self
-                .readers
-                .lock()
-                .unwrap()
-                .iter()
-                .all(JoinHandle::is_finished)
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    /// Waits for `needle` to be printed, and fails once [`BOUND`] is up.
-    fn wait_for(&self, needle: &str) -> String {
-        let started = Instant::now();
-        loop {
-            let so_far = self.text();
-            if so_far.contains(needle) {
-                return so_far;
-            }
-            assert!(
-                started.elapsed() < BOUND,
-                "{needle:?} was not printed inside {BOUND:?}; what was:\n{so_far}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-fn both_streams(child: &mut Child) -> Printed {
-    let kept = Arc::new(Mutex::new(Vec::new()));
-    let mut readers = Vec::new();
-    for stream in [
-        Box::new(child.stdout.take().expect("stdout is piped")) as Box<dyn Read + Send>,
-        Box::new(child.stderr.take().expect("stderr is piped")),
-    ] {
-        let filling = Arc::clone(&kept);
-        let mut stream = stream;
-        readers.push(std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            while let Ok(read) = stream.read(&mut buf) {
-                if read == 0 {
-                    break;
-                }
-                filling.lock().unwrap().extend_from_slice(&buf[..read]);
-            }
-        }));
-    }
-    Printed {
-        kept,
-        readers: Mutex::new(readers),
-    }
-}
-
-/// `args` run with an open pipe on stdin that nothing is ever written to.
-fn with_a_silent_pipe_on_stdin(home: &Path, args: &[&str]) -> Finished {
-    let mut child = mcpdial(home)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn mcpdial");
-    let held = child.stdin.take();
-    let printed = both_streams(&mut child);
-    within_bound(child, held, &printed)
-}
-
-/// `script` gives what it runs a pseudo-terminal for stdin and stdout both, so
-/// `Rich` is chosen and a prompt is possible. BSD `script` takes the command as
-/// arguments; util-linux wants one string after `-c`, and `-e` to hand the
-/// command's exit status on. Either way the line runs under `sh`, so a pipeline
-/// written into it is a pipeline.
-fn pty(home: &Path, line: &str, env: &[(&str, &str)]) -> Command {
-    let bsd = cfg!(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd"
-    ));
-    let mut cmd = Command::new("script");
-    cmd.arg("-q");
-    if bsd {
-        cmd.args(["/dev/null", "sh", "-c", line]);
-    } else {
-        cmd.args(["-e", "-c", line, "/dev/null"]);
-    }
-    cmd.env("MCPDIAL_HOME", home)
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("MCPDIAL_PLAIN")
-        .env_remove("MCPDIAL_JSON")
-        .env_remove("MCPDIAL_TIMEOUT")
-        .env_remove("NO_COLOR")
-        .env("TERM", "xterm")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    cmd
-}
-
-fn under_pty(home: &Path, args: &[&str], env: &[(&str, &str)]) -> Finished {
-    let mut child = pty(home, &call_line(args), env)
-        .spawn()
-        .expect("spawn script");
-    let held = child.stdin.take();
-    let printed = both_streams(&mut child);
-    within_bound(child, held, &printed)
-}
-
-/// The command line that reaches mcpdial inside the pseudo-terminal, with the
-/// binary named in full because a test's PATH is not the developer's.
-fn call_line(args: &[&str]) -> String {
-    std::iter::once(env!("CARGO_BIN_EXE_mcpdial"))
-        .chain(args.iter().copied())
-        .map(|word| format!("'{}'", word.replace('\'', r"'\''")))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn no_pty() -> bool {
-    if cfg!(unix) {
-        return false;
-    }
-    eprintln!("skipped: needs `script` to make a pseudo-terminal");
-    true
-}
-
 /// The rule the whole feature lives under: a missing required argument with
 /// anything but a person on stdin is today's error, and it arrives.
 #[test]
@@ -250,7 +54,7 @@ fn a_pipe_gets_todays_error_and_never_waits_for_an_answer() {
         vec!["--json", "call", "echo", "echo"],
         vec!["--plain", "call", "echo", "echo"],
     ] {
-        let done = with_a_silent_pipe_on_stdin(&home, &args);
+        let done = with_a_silent_pipe_on_stdin(mcpdial(&home).args(&args));
         assert_eq!(done.code, 1, "{args:?}: {}", done.output);
         assert!(
             done.output.contains(TODAYS_ERROR),
@@ -284,9 +88,11 @@ fn a_terminal_reading_a_silent_pipe_still_gets_todays_error() {
     let piped_in = format!(
         "sleep {} | {}",
         SILENCE.as_secs(),
-        call_line(&["call", "echo", "echo"])
+        pty_args(&["call", "echo", "echo"])
     );
-    let mut child = pty(&home, &piped_in, &[]).spawn().expect("spawn script");
+    let mut child = pty_line(&home, &piped_in, &[])
+        .spawn()
+        .expect("spawn script");
     let held = child.stdin.take();
     let printed = both_streams(&mut child);
     let shown = printed.wait_for(TODAYS_ERROR);
@@ -313,7 +119,7 @@ fn nothing_that_asked_for_plain_output_is_ever_asked_a_question() {
         (vec!["call", "echo", "echo"], vec![("MCPDIAL_PLAIN", "1")]),
         (vec!["call", "echo", "echo"], vec![("TERM", "dumb")]),
     ] {
-        let done = under_pty(&home, &args, &env);
+        let done = within_a_pty(&home, &args, &env);
         assert_eq!(done.code, 1, "{args:?} {env:?}: {}", done.output);
         assert!(
             done.output.contains(TODAYS_ERROR),
@@ -345,13 +151,13 @@ fn a_terminal_is_asked_for_what_the_call_left_out() {
     if !cfg!(feature = "rich") {
         // The agent-only build has no `Rich` to ask with, so a terminal is a
         // pipe here too, and gets exactly what a pipe gets.
-        let done = under_pty(&home, &["call", "echo", "echo"], &[]);
+        let done = within_a_pty(&home, &["call", "echo", "echo"], &[]);
         assert!(done.output.contains(TODAYS_ERROR), "{}", done.output);
         assert!(!done.output.contains(QUESTION), "{}", done.output);
         assert!(done.took < BOUND, "took {:?}, the bound", done.took);
         return;
     }
-    let mut child = pty(&home, &call_line(&["call", "echo", "echo"]), &[])
+    let mut child = pty_line(&home, &pty_args(&["call", "echo", "echo"]), &[])
         .spawn()
         .expect("spawn script");
     let mut typing = child.stdin.take().expect("stdin is piped");
@@ -398,7 +204,7 @@ fn a_complete_call_at_a_terminal_is_left_alone() {
         ),
         (vec!["call", "echo", "count"], "count=1"),
     ] {
-        let done = under_pty(&home, &args, &[]);
+        let done = within_a_pty(&home, &args, &[]);
         assert_eq!(done.code, 0, "{args:?}: {}", done.output);
         assert!(done.output.contains(printed), "{args:?}: {}", done.output);
         assert!(
