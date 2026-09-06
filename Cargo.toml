@@ -15,7 +15,7 @@ default = ["rich"]
 # The terminal presentation, and every crate it comes to need. Without it the
 # binary is the agent surface alone: `Rich` is not compiled and output is
 # always `Plain`.
-rich = ["dep:crossterm"]
+rich = ["dep:crossterm", "dep:termimad"]
 
 [dependencies]
 base64 = "0.22"
@@ -28,6 +28,7 @@ rustyline = { version = "18", default-features = false, features = ["with-file-h
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+termimad = { version = "0.35", default-features = false, optional = true }
 ureq = { version = "3.4", default-features = false, features = ["rustls"] }
 
 [target.'cfg(windows)'.dependencies]
