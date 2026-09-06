@@ -338,6 +338,11 @@ impl Presenter for Plain {
     }
 }
 
+/// Erase from the cursor to the end of the line, so that a redraw does not
+/// leave the tail of a longer one standing behind it.
+#[cfg(feature = "rich")]
+const ERASE: &str = "\x1b[K";
+
 /// What a person sees at a terminal. The same as [`Plain`] so far, except
 /// where a terminal has always been treated differently: control characters in
 /// a server's text are shown as escapes, binary resource bodies are refused,
@@ -484,8 +489,12 @@ impl Presenter for Rich {
         Plain.resource(bodies, redirect)
     }
 
+    /// The line is redrawn from its start, so `ERASE` takes the rest of it: a
+    /// server whose status message gets shorter, or stops sending one at all,
+    /// would otherwise be read as its new count with the old words still after
+    /// it, and `progress_end` would leave that on the screen.
     fn progress(&self, text: &str) {
-        self.err(&format!("\r{text}"));
+        self.err(&format!("\r{text}{ERASE}"));
         self.progressing.set(true);
     }
 
