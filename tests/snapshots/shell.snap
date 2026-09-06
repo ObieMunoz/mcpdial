@@ -87,7 +87,7 @@ A readme.
 }
 --- stderr
 error: unknown command "nope"
-commands: tools, schema TOOL, call TOOL {"arg": "value"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {"x": 1}, info, help, quit (or exit)
+commands: tools, schema TOOL, call TOOL {"arg": "value"}, resources, read URI, prompts, prompt NAME, raw METHOD, elicit {"x": 1}, show N, save N, retry, edit, subscribe URI, unsubscribe URI, subscriptions, listen, info, help, quit (or exit)
 error: MCP error -32602: Tool nope not found
 `tools` lists all 2 tools on this server.
 error: MCP error -32602: Prompt nope not found
@@ -106,11 +106,23 @@ commands (one per line; # starts a comment):
   prompt NAME {"arg": "..."} expand a prompt into its messages
   raw METHOD {"json": ...}   send any JSON-RPC method; allow and deny lists do not apply
   elicit {"arg": "value"}    answers for whatever the server elicits from here on
+  show N                     print result N again; _ is the last, $3 the third
+  save N [FILE]              write result N to a file, named after the tool by default
+  retry [TOOL] [key=value]   send the last call again, with those arguments changed
+  edit [N]                   open a call's arguments in $EDITOR and send them again
+  subscribe URI [FILE]       follow a resource, into a file or onto the screen
+  unsubscribe URI            stop following one
+  subscriptions              what this session follows
+  listen [SECONDS]           hold a stream open for updates, where the revision needs one
   info                       the initialize result
   quit (or exit)             close the session
 
-At a terminal: Up and Down walk the history, Tab completes commands, tool and
-prompt names and resource URIs, and ^C abandons the line being typed.
+A command that prints a result can end with | PATH (.key, .key.sub, .[0], .[]) or
+with | jq ARGS. _ and $3 name a result on their own, which a filter can follow.
+
+At a terminal: Up and Down walk the history and ^C abandons the line being typed.
+Tab completes a command, the tool, prompt or resource URI it takes, and the keys
+and values of a call's or a prompt's arguments.
 add  [idempotent]
 usage: call add {"a": <number>, "b": <number>}
    or: call add a=<number> b=<number>
