@@ -22,7 +22,10 @@
    `running` (true while a `start` daemon holds the server open).
 2. **What a server can do.** `mcpdial tools TARGET --json` returns `{"tools": [...]}`
    with each tool's `name`, `description`, and full `inputSchema`. For one tool,
-   `mcpdial schema TARGET TOOL` returns just that object.
+   `mcpdial schema TARGET TOOL` returns just that object. A saved server may carry
+   `allow` and `deny` lists of glob patterns (`mcpdial set NAME --json` shows them);
+   `tools` and `ls` then list and count only the permitted tools, and `tools NAME
+   --all` adds the hidden ones with `"denied": true`.
 3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json` prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text
    content blocks are printed as plain text, one per line, and a result with `isError`
@@ -125,6 +128,16 @@ With `--json`, errors are one JSON object on **stderr**:
 mode the same object is printed on **stdout** in sequence with results, so ordering is
 preserved.
 
+A `call` or `schema` of a tool the saved server's allow or deny list hides is exit 2
+with nothing sent, a `config` error naming the tool:
+
+```json
+{"error":{"kind":"config","message":"delete_file is denied for fs by its deny list; edit with mcpdial set fs","tool":"delete_file"}}
+```
+
+Do not work around it with `raw tools/call`, which the lists never filter: the person
+who saved the server hid that tool on purpose.
+
 When the arguments were the mistake, either unparseable or rejected by the server with
 `-32602`, the error carries a `hint` string holding the tool's usage line and one line
 per parameter, so a retry needs no extra `schema` call:
@@ -149,6 +162,7 @@ one object on stdout instead, so nothing has to be confirmed by parsing a senten
 
 ```
 mcpdial add NAME ... --json      {"saved":{"name":"x","kind":"http","location":"https://u/mcp",...}}
+mcpdial set NAME ... --json      {"saved":{"name":"x","kind":"http","location":"https://u/mcp","allow":[...],"deny":[...]}}
 mcpdial rm NAME --json           {"removed":"x"}
 mcpdial import FILE --json       {"imported":["a","b"],"skipped":["c"],"notes":{"a":["..."]}}
 mcpdial login TARGET --json      {"login":{"name":"x","expires_at":1760000000,"refreshable":true,"registration":"dynamic"}}
@@ -163,7 +177,11 @@ leaves `name`, `kind` and `location` alone, as does `--registry`, which never ru
 it saves. The exit code is 0 whenever the save succeeded, whatever `status` says: read
 it. `add` refuses a name that is already saved unless `--force` is passed, and rejects
 an `--http` value that is not an `http(s)://` URL or a `--stdio` command line with no
-words in it; each is a usage error (exit 2) with nothing written. `token show` with no
+words in it; each is a usage error (exit 2) with nothing written. `add --allow GLOB`
+and `--deny GLOB` (repeatable) save tool allow and deny lists, and `saved` carries each
+list that is not empty. `set NAME --allow ... --deny ...` replaces a list, `--clear-allow`
+and `--clear-deny` empty one, and `set NAME` with no flags prints
+`{"name":"x","allow":[...],"deny":[...]}` instead of a receipt. `token show` with no
 saved credential is a config error (exit 2). `login` prints its progress, including the
 authorization URL, as plain lines on stderr in either mode.
 
@@ -179,7 +197,7 @@ resources                     # resources, then resource templates
 read URI                      # one resource's contents
 prompts                       # list prompts
 prompt NAME {"json":"args"}   # expand a prompt into its messages
-raw METHOD {"json":"params"}  # any JSON-RPC method
+raw METHOD {"json":"params"}  # any JSON-RPC method; allow and deny lists do not apply
 info                          # the initialize result
 help [TOOL]                   # commands, or one tool's parameters
 quit

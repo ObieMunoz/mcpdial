@@ -121,13 +121,15 @@ mcpdial add NAME --http URL [-H 'Name: value']... [--token-env VAR] [--protocol-
 mcpdial add NAME --stdio "command args..." [--env KEY=VALUE]... [--cwd DIR] [--protocol-version V] [--timeout SECS] [--force] [--no-probe]
 mcpdial add NAME --catalog ID    one entry of the reviewed catalog; `mcpdial catalog` lists them
 mcpdial add NAME --registry io.github.owner/server [--package npm|pypi|oci] [--remote] [--arg VALUE]...
+mcpdial add NAME ... [--allow GLOB]... [--deny GLOB]...   offer some of a server's tools, or all but some
+mcpdial set NAME [--allow GLOB]... [--deny GLOB]... [--clear-allow] [--clear-deny]   change those lists; no flags shows them
 mcpdial search QUERY [--limit N] [--refresh] [--offline]   the MCP registry, ranked, from a local copy
 mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor, Windsurf, VS Code, Codex, OpenCode configs
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
-mcpdial tools [TARGET] [--long]  tools on one server, or on every server
+mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
 mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | -]
 mcpdial schema TARGET TOOL       one tool's input schema
@@ -183,6 +185,33 @@ read_wiki_structure
   parameters:
     repoName: string (required) - GitHub repository: owner/repo (e.g. "facebook/react")
 ```
+
+### Allowing and denying tools
+
+A filesystem server with fourteen tools is usually wanted for three of them, and an
+agent that can see `delete_file` will eventually call it. A saved server can carry an
+allow list and a deny list of glob patterns (`*` and `?`, matched against the tool
+name), and the restriction travels with the name into every command, the shell included:
+
+```
+$ mcpdial add fs --stdio "npx -y @modelcontextprotocol/server-filesystem /srv" \
+      --allow 'read_*' --allow list_directory --deny 'delete_*'
+$ mcpdial set fs                     # show the lists
+$ mcpdial set fs --deny 'delete_*' --deny move_file   # replace the deny list
+$ mcpdial set fs --clear-allow       # offer every tool not denied
+```
+
+Deny wins over allow, and an empty allow list means every tool not denied. `tools fs`
+and `ls` count and show only what is permitted; `tools fs --all` shows the hidden ones
+too, marked `(denied)`. Calling a hidden tool is exit 2 with nothing sent:
+
+```
+$ mcpdial call fs delete_file '{"path":"/srv/x"}'
+error: delete_file is denied for fs by its deny list; edit with mcpdial set fs
+```
+
+The lists apply to the saved name alone; an ad-hoc URL or `stdio:` target has no
+config to carry one. `raw` is the escape hatch and is never filtered.
 
 ### Stateful servers and the shell
 

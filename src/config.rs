@@ -56,6 +56,63 @@ pub struct ServerConfig {
     /// registry. Nothing dials with it; `browse` and a later `update` read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+    /// Glob patterns (`*` and `?`) of the tools to offer. Empty means every tool
+    /// not denied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Glob patterns of the tools to hide and refuse. Wins over `allow`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+/// Which list keeps a tool off limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Denial {
+    /// A `deny` pattern matched it.
+    Denied,
+    /// `allow` is not empty and nothing in it matched.
+    NotAllowed,
+}
+
+impl Denial {
+    /// The list to name in a message: "deny list" or "allow list".
+    pub fn list(self) -> &'static str {
+        match self {
+            Denial::Denied => "deny list",
+            Denial::NotAllowed => "allow list",
+        }
+    }
+}
+
+/// Whether `name` matches `pattern`, where `*` stands for any run of characters
+/// and `?` for exactly one; everything else is literal.
+pub fn matches_glob(pattern: &str, name: &str) -> bool {
+    let (p, n): (Vec<char>, Vec<char>) = (pattern.chars().collect(), name.chars().collect());
+    let (mut pi, mut ni) = (0, 0);
+    // The last `*` and how far into the name it has reached, to widen from when
+    // what follows it fails to match.
+    let mut retry: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        match p.get(pi) {
+            Some('*') => {
+                retry = Some((pi, ni));
+                pi += 1;
+            }
+            Some(&c) if c == '?' || c == n[ni] => {
+                pi += 1;
+                ni += 1;
+            }
+            _ => match retry {
+                Some((star, reached)) => {
+                    pi = star + 1;
+                    ni = reached + 1;
+                    retry = Some((star, ni));
+                }
+                None => return false,
+            },
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// The catalog id, registry name and version a server was added from. Either
@@ -120,6 +177,31 @@ impl ServerConfig {
         self.http.as_deref().or(self.stdio.as_deref()).unwrap_or("")
     }
 
+    /// Why `tool` is off limits, or `None` when it may be listed and called.
+    /// Deny wins over allow; an empty allow list means everything not denied.
+    pub fn denial(&self, tool: &str) -> Option<Denial> {
+        let hits = |patterns: &[String]| patterns.iter().any(|p| matches_glob(p, tool));
+        if hits(&self.deny) {
+            Some(Denial::Denied)
+        } else if !self.allow.is_empty() && !hits(&self.allow) {
+            Some(Denial::NotAllowed)
+        } else {
+            None
+        }
+    }
+
+    /// The config error that refuses a call of `tool` on the server saved as
+    /// `name`, before anything is sent; `Ok` when the lists permit it.
+    pub fn refuse_denied(&self, name: &str, tool: &str) -> Result<()> {
+        match self.denial(tool) {
+            None => Ok(()),
+            Some(why) => Err(Error::config(format!(
+                "{tool} is denied for {name} by its {}; edit with mcpdial set {name}",
+                why.list()
+            ))),
+        }
+    }
+
     /// This server with every `${VAR}` placeholder filled in, as [`expand`] does
     /// it: what gets dialed, never what gets saved, so the file keeps naming the
     /// variable instead of holding its value. `token_env` names a variable rather
@@ -155,6 +237,8 @@ impl ServerConfig {
             protocol_version: self.protocol_version.clone(),
             timeout: self.timeout,
             source: self.source.clone(),
+            allow: self.allow.clone(),
+            deny: self.deny.clone(),
         })
     }
 }
@@ -1073,6 +1157,100 @@ mod tests {
         assert_eq!(all["gh"].source.as_ref().unwrap().label(), "github");
         assert_eq!(saved_from_catalog(&all, "github"), Some("gh"));
         assert_eq!(saved_from_catalog(&all, "gitlab"), None);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn globs_match_stars_and_question_marks_only() {
+        assert!(matches_glob("read_*", "read_file"));
+        assert!(matches_glob("read_*", "read_"));
+        assert!(!matches_glob("read_*", "reading"));
+        assert!(matches_glob("*", "anything"));
+        assert!(matches_glob("*", ""));
+        assert!(matches_glob("*_file", "delete_file"));
+        assert!(matches_glob("*file*", "read_file_lines"));
+        assert!(!matches_glob("*file", "read_file_lines"));
+        assert!(matches_glob("a*b*c", "aXXbYYc"));
+        assert!(!matches_glob("a*b*c", "aXXbYY"));
+        assert!(matches_glob("get_?", "get_x"));
+        assert!(!matches_glob("get_?", "get_xy"));
+        assert!(!matches_glob("get_?", "get_"));
+        assert!(matches_glob("list_directory", "list_directory"));
+        assert!(!matches_glob("list_directory", "list_directories"));
+        assert!(!matches_glob("[a]", "a"), "brackets are literal");
+        assert!(matches_glob("[a]", "[a]"));
+        assert!(matches_glob("", ""));
+        assert!(!matches_glob("", "x"));
+        assert!(matches_glob("**", "x"));
+    }
+
+    #[test]
+    fn deny_beats_allow_and_an_empty_allow_list_admits_the_rest() {
+        let open = ServerConfig::stdio("fs");
+        assert_eq!(open.denial("delete_file"), None);
+
+        let mut cfg = ServerConfig::stdio("fs");
+        cfg.deny = vec!["delete_*".into()];
+        assert_eq!(cfg.denial("delete_file"), Some(Denial::Denied));
+        assert_eq!(cfg.denial("read_file"), None, "nothing else is denied");
+
+        cfg.allow = vec!["read_*".into(), "list_directory".into()];
+        assert_eq!(cfg.denial("read_file"), None);
+        assert_eq!(cfg.denial("list_directory"), None);
+        assert_eq!(cfg.denial("write_file"), Some(Denial::NotAllowed));
+        assert_eq!(cfg.denial("delete_file"), Some(Denial::Denied));
+
+        cfg.deny.push("read_?????".into());
+        assert_eq!(
+            cfg.denial("read_lines"),
+            Some(Denial::Denied),
+            "allowed by read_*, then denied: deny wins"
+        );
+        assert_eq!(cfg.denial("read_file"), None);
+
+        assert!(cfg.refuse_denied("fs", "read_file").is_ok());
+        let e = cfg.refuse_denied("fs", "delete_file").unwrap_err();
+        assert!(matches!(e, Error::Config(_)), "{e:?}");
+        assert_eq!(
+            e.to_string(),
+            "delete_file is denied for fs by its deny list; edit with mcpdial set fs"
+        );
+        let e = cfg.refuse_denied("fs", "write_file").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "write_file is denied for fs by its allow list; edit with mcpdial set fs"
+        );
+    }
+
+    #[test]
+    fn the_lists_round_trip_and_are_left_out_when_empty() {
+        let s = temp_store();
+        let mut fenced = ServerConfig::stdio("npx -y fs /srv");
+        fenced.allow = vec!["read_*".into()];
+        fenced.deny = vec!["delete_*".into(), "move_?".into()];
+        s.add_server("fs", fenced.clone()).unwrap();
+        s.add_server("open", ServerConfig::stdio("npx -y open"))
+            .unwrap();
+        let all = s.servers().unwrap();
+        assert_eq!(all["fs"], fenced);
+        assert!(all["open"].allow.is_empty() && all["open"].deny.is_empty());
+
+        let text = fs::read_to_string(s.servers_path()).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            file["servers"]["fs"]["allow"],
+            serde_json::json!(["read_*"])
+        );
+        assert_eq!(
+            file["servers"]["fs"]["deny"],
+            serde_json::json!(["delete_*", "move_?"])
+        );
+        assert!(file["servers"]["open"].get("allow").is_none(), "{text}");
+        assert!(file["servers"]["open"].get("deny").is_none(), "{text}");
+
+        let expanded = fenced.expanded(|_| None).unwrap();
+        assert_eq!(expanded.allow, fenced.allow, "dialing keeps the lists");
+        assert_eq!(expanded.deny, fenced.deny);
         fs::remove_dir_all(&s.dir).unwrap();
     }
 

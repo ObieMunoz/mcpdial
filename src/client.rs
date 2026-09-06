@@ -164,10 +164,51 @@ pub fn resolve(store: &Store, target: &str) -> Result<Resolved> {
 
 pub struct Connection {
     pub name: String,
+    /// What was dialed, kept for its allow and deny lists.
+    pub config: ServerConfig,
     pub session: Session<Box<dyn Transport>>,
     pub server_info: Value,
     /// Which credential was used, for status reporting.
     pub auth: AuthUsed,
+}
+
+impl Connection {
+    /// The tools the server offers that its allow and deny lists permit: what
+    /// every listing, lookup and completion sees. `session.list_tools` is the
+    /// unfiltered escape hatch, as `raw tools/list` is.
+    pub fn list_tools(&mut self) -> Result<Vec<Value>> {
+        Ok(permitted_tools(self.session.list_tools()?, &self.config))
+    }
+
+    /// Every tool, the hidden ones carrying `"denied": true`.
+    pub fn list_all_tools(&mut self) -> Result<Vec<Value>> {
+        Ok(marked_tools(self.session.list_tools()?, &self.config))
+    }
+}
+
+/// `tools` without the ones `cfg` denies.
+pub fn permitted_tools(tools: Vec<Value>, cfg: &ServerConfig) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter(|t| cfg.denial(tool_name(t)).is_none())
+        .collect()
+}
+
+/// `tools` in full, with `"denied": true` on each one `cfg` hides.
+pub fn marked_tools(tools: Vec<Value>, cfg: &ServerConfig) -> Vec<Value> {
+    tools
+        .into_iter()
+        .map(|mut t| {
+            if cfg.denial(tool_name(&t)).is_some() {
+                t["denied"] = json!(true);
+            }
+            t
+        })
+        .collect()
+}
+
+fn tool_name(tool: &Value) -> &str {
+    tool["name"].as_str().unwrap_or("")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,6 +311,7 @@ fn handshake(
     let server_info = session.initialize()?.clone();
     Ok(Connection {
         name: r.name.clone(),
+        config: r.config.clone(),
         session,
         server_info,
         auth,
@@ -440,7 +482,7 @@ pub fn probe(store: &Store, r: &Resolved, opts: &Options, with_tools: bool) -> P
                 _ => n.to_string(),
             });
             if with_tools {
-                match conn.session.list_tools() {
+                match conn.list_tools() {
                     Ok(t) => p.tools = Some(t),
                     Err(e) => {
                         p.status = Status::Error {
@@ -867,6 +909,57 @@ mod tests {
         assert_eq!(r.config.stdio.as_deref(), Some("npx -y thing"));
         assert!(resolve(&store, "stdio:").is_err());
         assert!(resolve(&store, "nope").is_err());
+    }
+
+    #[test]
+    fn the_lists_filter_a_listing_and_mark_the_hidden_ones() {
+        let tools = || {
+            vec![
+                json!({"name": "read_file"}),
+                json!({"name": "list_directory"}),
+                json!({"name": "write_file"}),
+                json!({"name": "delete_file"}),
+                json!({"description": "nameless"}),
+            ]
+        };
+        let open = ServerConfig::stdio("fs");
+        assert_eq!(
+            permitted_tools(tools(), &open),
+            tools(),
+            "no lists, no change"
+        );
+        assert_eq!(marked_tools(tools(), &open), tools());
+
+        let mut fenced = ServerConfig::stdio("fs");
+        fenced.allow = vec!["read_*".into(), "list_directory".into()];
+        fenced.deny = vec!["delete_*".into()];
+        let names = |v: Vec<Value>| -> Vec<String> {
+            v.iter()
+                .map(|t| t["name"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+        assert_eq!(
+            names(permitted_tools(tools(), &fenced)),
+            ["read_file", "list_directory"],
+            "order is the server's"
+        );
+        let marked = marked_tools(tools(), &fenced);
+        assert_eq!(marked.len(), 5, "--all keeps every tool");
+        assert_eq!(
+            marked[0].get("denied"),
+            None,
+            "a permitted tool is untouched"
+        );
+        assert_eq!(marked[2]["denied"], true, "missed the allow list");
+        assert_eq!(marked[3]["denied"], true, "hit the deny list");
+        assert_eq!(marked[4]["denied"], true, "a nameless tool matches nothing");
+
+        let mut deny_only = ServerConfig::stdio("fs");
+        deny_only.deny = vec!["delete_*".into()];
+        assert_eq!(
+            names(permitted_tools(tools(), &deny_only)),
+            ["read_file", "list_directory", "write_file", ""]
+        );
     }
 
     #[test]
