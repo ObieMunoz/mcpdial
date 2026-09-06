@@ -14,11 +14,11 @@ use mcpdial::session::ResourceBody;
 use mcpdial::Error;
 use serde_json::Value;
 use std::io::Write;
+use style::ColorMode;
 
 #[cfg(feature = "rich")]
 mod json;
-#[cfg(feature = "rich")]
-mod style;
+pub mod style;
 
 /// Set (to anything but `0`) to get what a pipe would get, even at a terminal.
 pub const ENV_PLAIN: &str = "MCPDIAL_PLAIN";
@@ -66,27 +66,8 @@ pub trait Presenter {
     fn progress_end(&self) {}
 
     fn table(&self, headers: &[&str], rows: &[Vec<String>]) {
-        let cols = headers.len();
-        let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-        for row in rows {
-            for (i, cell) in row.iter().enumerate().take(cols) {
-                widths[i] = widths[i].max(cell.chars().count());
-            }
-        }
-        let line = |cells: Vec<&str>| {
-            let mut out = String::new();
-            for (i, c) in cells.iter().enumerate() {
-                if i + 1 == cols {
-                    out.push_str(c);
-                } else {
-                    out.push_str(&format!("{:<w$}  ", c, w = widths[i]));
-                }
-            }
-            out.trim_end().to_string()
-        };
-        self.line(&line(headers.to_vec()));
-        for row in rows {
-            self.line(&line(row.iter().map(String::as_str).collect()));
+        for line in table_lines(headers, rows, &|_, cell| cell.to_string()) {
+            self.line(&line);
         }
     }
 
@@ -217,14 +198,27 @@ pub trait Presenter {
 }
 
 impl dyn Presenter {
-    /// The one decision: `Rich` only for a person at a terminal who asked for
-    /// nothing else. `--json`, `--plain`, `MCPDIAL_PLAIN`, a dumb terminal or a
-    /// pipe each mean `Plain`, and so does a build without the `rich` feature.
+    /// The one decision: `Rich` for a person at a terminal who asked for
+    /// nothing else, and for the pipe that asked for colour. `--json`,
+    /// `--plain`, `MCPDIAL_PLAIN`, a dumb terminal or a pipe that said nothing
+    /// each mean `Plain`, and so does a build without the `rich` feature.
     pub fn choose(cli: &Cli) -> Box<dyn Presenter> {
-        if wants_plain(cli) {
+        // `--color always` is the one way a pipe gets `Rich`: colour is what
+        // it asked for, and a pipe into `less -R` is where it wants it. It
+        // does not overrule the four ways of asking for the piped bytes
+        // outright, and it changes nothing for anyone else asking
+        // `wants_plain` whether stdout is a person's.
+        let plain = match cli.color {
+            ColorMode::Always => asked_for_plain(cli),
+            ColorMode::Never | ColorMode::Auto => wants_plain(cli),
+        };
+        if plain {
             Box::new(Plain)
         } else {
-            rich(cli)
+            // Being `Rich` settles stdout; stderr is the other stream colour
+            // is decided for, and the only thing left to look at.
+            use std::io::IsTerminal;
+            rich(cli, std::io::stderr().is_terminal())
         }
     }
 }
@@ -242,23 +236,66 @@ impl dyn Presenter + '_ {
 
 pub(crate) fn wants_plain(cli: &Cli) -> bool {
     use std::io::IsTerminal;
-    let by_env = std::env::var(ENV_PLAIN).is_ok_and(|v| !v.is_empty() && v != "0");
-    let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
-    cli.json || cli.plain || by_env || dumb || !std::io::stdout().is_terminal()
+    asked_for_plain(cli) || !std::io::stdout().is_terminal()
 }
 
+/// The four ways of asking for the piped bytes outright, whatever the stream.
+fn asked_for_plain(cli: &Cli) -> bool {
+    let by_env = std::env::var(ENV_PLAIN).is_ok_and(|v| !v.is_empty() && v != "0");
+    let dumb = std::env::var("TERM").is_ok_and(|t| t == "dumb");
+    cli.json || cli.plain || by_env || dumb
+}
+
+/// Colour is decided per stream: `2>log` at a terminal keeps escapes out of
+/// the log. Stdout takes no second look, since `Rich` at all means either a
+/// terminal or the `--color always` that asked for the pipe.
 #[cfg(feature = "rich")]
-fn rich(cli: &Cli) -> Box<dyn Presenter> {
+fn rich(cli: &Cli, stderr_is_terminal: bool) -> Box<dyn Presenter> {
     Box::new(Rich {
         no_pager: cli.no_pager,
+        color_out: style::color_enabled(cli.color, true),
+        color_err: style::color_enabled(cli.color, stderr_is_terminal),
         ..Rich::default()
     })
 }
 
 /// Without the feature there is nothing but `Plain` to choose.
 #[cfg(not(feature = "rich"))]
-fn rich(_cli: &Cli) -> Box<dyn Presenter> {
+fn rich(_cli: &Cli, _stderr_is_terminal: bool) -> Box<dyn Presenter> {
     Box::new(Plain)
+}
+
+/// A table's lines: every column but the last padded to its widest cell, and
+/// `paint` given each body cell with its column once the width is measured, so
+/// what it adds does not count.
+fn table_lines(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    paint: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
+    let cols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(cols) {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let line = |cells: Vec<&str>, paint: &dyn Fn(usize, &str) -> String| {
+        let mut out = String::new();
+        for (i, c) in cells.iter().enumerate() {
+            out.push_str(&paint(i, c));
+            if i + 1 < cols {
+                out.push_str(&" ".repeat(widths[i] - c.chars().count() + 2));
+            }
+        }
+        out.trim_end().to_string()
+    };
+    let mut lines = vec![line(headers.to_vec(), &|_, h| h.to_string())];
+    lines.extend(
+        rows.iter()
+            .map(|row| line(row.iter().map(String::as_str).collect(), paint)),
+    );
+    lines
 }
 
 /// Today's bytes, exactly: what a pipe, a program and an agent receive.
@@ -294,13 +331,17 @@ impl Presenter for Plain {
 /// What a person sees at a terminal. The same as [`Plain`] so far, except
 /// where a terminal has always been treated differently: control characters in
 /// a server's text are shown as escapes, binary resource bodies are refused,
-/// and a long fetch counts on stderr as it goes.
+/// and a long fetch counts on stderr as it goes. With colour on, the status of
+/// a listed server and the `error:` prefix carry their meaning in colour.
 #[cfg(feature = "rich")]
 #[derive(Default)]
 pub struct Rich {
     progressing: std::cell::Cell<bool>,
     /// `--no-pager`.
     no_pager: bool,
+    /// Whether SGR sequences go to stdout, and whether they go to stderr.
+    color_out: bool,
+    color_err: bool,
     /// What the section since `page_start` has printed, until `page_end`
     /// decides where it goes.
     page: std::cell::RefCell<Option<Vec<u8>>>,
@@ -405,14 +446,62 @@ impl Presenter for Rich {
             self.err_line("");
         }
     }
+
+    fn table(&self, headers: &[&str], rows: &[Vec<String>]) {
+        for line in self.table_lines(headers, rows) {
+            self.line(&line);
+        }
+    }
+
+    fn error(&self, message: &str, hint: Option<&str>) {
+        self.err_line(&format!("{} {message}", self.error_prefix()));
+        if let Some(hint) = hint {
+            self.err_line(hint);
+        }
+    }
 }
 
 #[cfg(feature = "rich")]
 impl Rich {
-    /// `text` in colour when colour is wanted and the text is a pretty-printed
-    /// JSON document; `None` says to print it as it is.
+    /// `text` in colour when colour goes to stdout and the text is a
+    /// pretty-printed JSON document; `None` says to print it as it is.
     fn highlighted(&self, text: &str) -> Option<String> {
-        style::wanted().then(|| json::highlighted(text)).flatten()
+        self.color_out.then(|| json::highlighted(text)).flatten()
+    }
+
+    /// A table whose STATUS column, when it has one, is coloured by what each
+    /// status means.
+    fn table_lines(&self, headers: &[&str], rows: &[Vec<String>]) -> Vec<String> {
+        let status = headers.iter().position(|h| *h == "STATUS");
+        table_lines(headers, rows, &|col, cell| {
+            if Some(col) == status {
+                status_style(cell).when(self.color_out).paint(cell)
+            } else {
+                cell.to_string()
+            }
+        })
+    }
+
+    fn error_prefix(&self) -> String {
+        style::Style::new()
+            .bold()
+            .color(style::Color::Red)
+            .when(self.color_err)
+            .paint("error:")
+    }
+}
+
+/// Green for a server that answered, yellow for one a credential or an older
+/// transport stands between, red for one that is not answering at all.
+#[cfg(feature = "rich")]
+fn status_style(label: &str) -> style::Style {
+    use style::{Color, Style};
+    match label {
+        "connected" => Style::new().color(Color::Green),
+        "auth required" | "token rejected" | "legacy sse" => Style::new().color(Color::Yellow),
+        "unreachable" | "blocked (403)" | "error" => Style::new().color(Color::Red),
+        l if l.starts_with("http ") => Style::new().color(Color::Red),
+        _ => Style::new(),
     }
 }
 
@@ -740,6 +829,85 @@ mod tests {
         assert!(Rich::default()
             .resource(&[ResourceBody::Text("ok".into())], "mcpdial read x y")
             .is_ok());
+    }
+
+    #[cfg(feature = "rich")]
+    fn coloured() -> Rich {
+        Rich {
+            color_out: true,
+            color_err: true,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn every_status_word_has_its_colour_and_the_padding_ignores_it() {
+        let rows: Vec<Vec<String>> = [
+            ("a", "connected"),
+            ("b", "auth required"),
+            ("c", "token rejected"),
+            ("d", "legacy sse"),
+            ("e", "unreachable"),
+            ("f", "blocked (403)"),
+            ("g", "error"),
+            ("h", "http 503"),
+            ("i", "something new"),
+        ]
+        .iter()
+        .map(|(n, s)| vec![n.to_string(), s.to_string(), "x".into()])
+        .collect();
+        assert_eq!(
+            coloured().table_lines(&["NAME", "STATUS", "SERVER"], &rows),
+            [
+                "NAME  STATUS          SERVER",
+                "a     \x1b[32mconnected\x1b[0m       x",
+                "b     \x1b[33mauth required\x1b[0m   x",
+                "c     \x1b[33mtoken rejected\x1b[0m  x",
+                "d     \x1b[33mlegacy sse\x1b[0m      x",
+                "e     \x1b[31munreachable\x1b[0m     x",
+                "f     \x1b[31mblocked (403)\x1b[0m   x",
+                "g     \x1b[31merror\x1b[0m           x",
+                "h     \x1b[31mhttp 503\x1b[0m        x",
+                "i     something new   x",
+            ]
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn colour_stays_in_the_status_column_and_off_when_disabled() {
+        let rows = vec![vec!["error".into(), "connected".into()]];
+        assert_eq!(
+            coloured().table_lines(&["NAME", "STATUS"], &rows),
+            ["NAME   STATUS", "error  \x1b[32mconnected\x1b[0m"]
+        );
+        assert_eq!(
+            coloured().table_lines(&["NAME", "TYPE"], &rows),
+            ["NAME   TYPE", "error  connected"]
+        );
+        assert_eq!(
+            Rich::default().table_lines(&["NAME", "STATUS"], &rows),
+            ["NAME   STATUS", "error  connected"]
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn the_error_prefix_is_bold_red_only_with_colour_on() {
+        assert_eq!(coloured().error_prefix(), "\x1b[1;31merror:\x1b[0m");
+        assert_eq!(Rich::default().error_prefix(), "error:");
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_pretty_printed_document_is_highlighted_only_with_colour_on() {
+        let pretty = serde_json::to_string_pretty(&serde_json::json!({"a": 1})).unwrap();
+        assert_eq!(
+            coloured().highlighted(&pretty).as_deref(),
+            Some("{\n  \x1b[1;34m\"a\"\x1b[0m: \x1b[36m1\x1b[0m\n}")
+        );
+        assert_eq!(Rich::default().highlighted(&pretty), None);
     }
 
     #[cfg(feature = "rich")]
