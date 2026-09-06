@@ -26,7 +26,8 @@
    `allow` and `deny` lists of glob patterns (`mcpdial set NAME --json` shows them);
    `tools` and `ls` then list and count only the permitted tools, and `tools NAME
    --all` adds the hidden ones with `"denied": true`.
-3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json` prints the
+3. **Call it.** `mcpdial call TARGET TOOL '{"json":"arguments"}' --json`, or
+   `mcpdial call TARGET TOOL key=value ... --json`, prints the
    `tools/call` result: `{"content": [...], "isError": bool}`. Without `--json` the text
    content blocks are printed as plain text, one per line, and a result with `isError`
    set is followed by `(tool reported an error)` on stderr.
@@ -60,7 +61,7 @@
 
 ## Passing arguments
 
-Arguments must be a JSON object. Three ways to supply one:
+Arguments are one JSON object. Three ways to supply one:
 
 ```
 mcpdial call fs read_text_file '{"path":"/tmp/x"}'   # inline
@@ -69,6 +70,33 @@ echo '{"path":"/tmp/x"}' | mcpdial call fs read_text_file -   # from stdin
 ```
 
 Use a file or stdin for anything large or containing quotes.
+
+Or they are `key=value` pairs, typed by the tool's own `inputSchema`:
+
+```
+mcpdial call fs read_text_file path=/tmp/x
+mcpdial call ctx7 search query="rust ureq" limit=5 fuzzy=true
+mcpdial call srv tool tags:='["a","b"]' meta:='{"k":1}'
+mcpdial call srv tool id:='"123"'     # a string where the schema says string|number
+```
+
+The first word after the tool name decides: one starting with `{` or `@`, or a bare
+`-`, is the JSON object; anything else means every remaining word is a pair. The two
+forms cannot be mixed, which is exit 2 with nothing sent.
+
+`key=value` reads the text as `inputSchema.properties[key].type` declares it:
+`integer` and `number` parse as a number, `boolean` takes `true` or `false` alone,
+`string`, an unknown key and a union type such as `["string","number"]` all stay text,
+and `array` and `object` are refused, naming the form below. `key:=json` parses the
+value as JSON and ignores the type, which is how arrays, objects and a forced string
+are written. A key that is not in `properties` when the schema says
+`additionalProperties: false` is exit 2 before the call goes out, with the nearest
+property named. A missing required property is not checked here; the server's `-32602`
+and its `hint` answer that. Nested keys (`a.b=1`) are not a form; use `:=`.
+
+Pairs cost one extra request, the `tools/list` the schema comes from, unless every
+pair uses `:=`. In `shell` that list is cached. `prompt` takes pairs too, where every
+value is a string and nothing is fetched.
 
 ## Media
 
@@ -139,12 +167,12 @@ Do not work around it with `raw tools/call`, which the lists never filter: the p
 who saved the server hid that tool on purpose.
 
 When the arguments were the mistake, either unparseable or rejected by the server with
-`-32602`, the error carries a `hint` string holding the tool's usage line and one line
-per parameter, so a retry needs no extra `schema` call:
+`-32602`, the error carries a `hint` string holding the tool's usage line in both
+argument forms and one line per parameter, so a retry needs no extra `schema` call:
 
 ```
 {"error":{"kind":"rpc","code":-32602,"message":"... Required at url",
-          "hint":"usage: call new_page {\"url\": \"<string>\"}\n  url: string (required) - ..."}}
+          "hint":"usage: call new_page {\"url\": \"<string>\"}\n   or: call new_page url=<string>\n  url: string (required) - ..."}}
 ```
 
 If the tool name itself is unknown, `hint` names the nearest one instead. Some servers
@@ -191,6 +219,7 @@ Input, one command per line:
 
 ```
 call TOOL {"json":"args"}     # args optional, default {}
+call TOOL key=value ...       # the same, typed by the tool's schema
 tools                         # list tools
 schema TOOL                   # one tool's inputSchema
 resources                     # resources, then resource templates

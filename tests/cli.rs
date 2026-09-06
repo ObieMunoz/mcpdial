@@ -213,11 +213,14 @@ fn errors_map_to_exit_codes() {
         o.stderr
     );
 
-    // With two keys the shell splits the object at the comma into two words.
+    // With two keys the shell splits the object at the comma into two words,
+    // which are not key=value pairs either.
+    let before = s.requests.lock().unwrap().len();
     let o = run(mcpdial(&home).args(["call", &s.url, "echo", "message:hi", "n:2"]));
     assert_eq!(o.code, 2);
+    assert_eq!(s.requests.lock().unwrap().len(), before, "nothing was sent");
     assert!(
-        o.stderr.contains("unexpected argument 'n:2'")
+        o.stderr.contains(r#""message:hi" is neither"#)
             && o.stderr.contains("split a JSON object at its commas"),
         "{}",
         o.stderr

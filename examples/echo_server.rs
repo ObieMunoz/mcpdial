@@ -22,11 +22,30 @@
 //! Set `ECHO_SERVER_UNKNOWN_TOOL_RESULT=1` to answer a tool name it does not have
 //! with a failed *result*, `Unknown tool: NAME` under `isError`, the way DeepWiki
 //! does, instead of the `-32602` error the rest of the world sends.
+//! Set `ECHO_SERVER_TYPES=1` to add a `typed` tool declaring one property of every
+//! JSON type and refusing any other, which answers with the arguments it was handed
+//! so a test can see what type each one arrived as. It is behind a flag for the same
+//! reason: a sixth tool would renumber every listing assertion.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Lines, StdinLock, Write};
+
+/// One property of every type a schema can name, and nothing else allowed, so a
+/// client coercing `key=value` text has something to coerce it against.
+fn typed_tool() -> Value {
+    json!({"name": "typed", "description": "Echo the arguments back as JSON.",
+    "inputSchema": {"type": "object", "additionalProperties": false, "properties": {
+        "text": {"type": "string"},
+        "count": {"type": "integer"},
+        "ratio": {"type": "number"},
+        "flag": {"type": "boolean"},
+        "tags": {"type": "array"},
+        "meta": {"type": "object"},
+        "id": {"type": ["string", "number"]},
+    }}})
+}
 
 /// A PNG signature padded to 4096 bytes: enough to be a nuisance on stdout.
 fn image_block() -> Value {
@@ -40,6 +59,7 @@ fn main() {
     let ping = std::env::var_os("ECHO_SERVER_PING").is_some();
     let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
     let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
+    let types = std::env::var_os("ECHO_SERVER_TYPES").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
@@ -120,9 +140,8 @@ fn main() {
                 }
                 ok(id, result)
             }
-            "tools/list" => ok(
-                id,
-                json!({"tools": [
+            "tools/list" => {
+                let mut listed = json!({"tools": [
                     {"name": "echo", "description": "Echo a message back.",
                      "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}},
                     {"name": "fail", "description": "Always returns a tool error.",
@@ -133,8 +152,12 @@ fn main() {
                      "inputSchema": {"type": "object", "properties": {"pageId": {"type": "number"}}, "required": ["pageId"]}},
                     {"name": "shot", "description": "A text block, then a 4 KB image block.",
                      "inputSchema": {"type": "object", "properties": {}}},
-                ]}),
-            ),
+                ]});
+                if types {
+                    listed["tools"].as_array_mut().unwrap().push(typed_tool());
+                }
+                ok(id, listed)
+            }
             "prompts/list" if prompts => ok(
                 id,
                 json!({"prompts": [
@@ -181,6 +204,13 @@ fn main() {
                 "shot" => ok(
                     id,
                     json!({"content": [{"type": "text", "text": "done"}, image_block()]}),
+                ),
+                // Handing the arguments straight back is the whole point: the test
+                // reads the JSON types off the answer.
+                "typed" if types => ok(
+                    id,
+                    json!({"content": [{"type": "text",
+                        "text": params["arguments"].to_string()}]}),
                 ),
                 "count" => {
                     count += 1;

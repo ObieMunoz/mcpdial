@@ -131,13 +131,13 @@ mcpdial catalog [--offline]      the reviewed list of servers, grouped by catego
 mcpdial ls [--no-probe]          every saved server, with live status and tool count
 mcpdial tools [TARGET] [--long] [--all]  tools on one server, or on every server
 mcpdial info TARGET              server name, version, capabilities, instructions
-mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | -]
+mcpdial call TARGET TOOL ['{"json":"args"}' | @file.json | - | key=value ...]
 mcpdial schema TARGET TOOL       one tool's input schema
 mcpdial resources TARGET [--long]  every resource, then every URI template
 mcpdial read TARGET URI          one resource: text to stdout, bytes to a redirect or --save-dir
 mcpdial --save-dir DIR ...       file image, audio and blob blocks as DIR/<tool>-<n>.<ext>
 mcpdial prompts TARGET [--long]  every prompt a server offers
-mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | -]
+mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | - | key=value ...]
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET             one session, many commands; state persists between calls
 mcpdial start NAME [--idle SECS] keep a stdio server running; later commands share its session
@@ -171,6 +171,25 @@ answers with, out of `2025-11-25`, `2025-06-18` and `2025-03-26`; `mcpdial info`
 the one agreed. A server that answers with a version mcpdial does not speak is reported
 as such. For a server that misbehaves when offered the newest, `--protocol-version
 2025-06-18` offers that instead, and `add --protocol-version` saves the choice.
+
+### Arguments, without the quoting
+
+A tool's arguments are one JSON object, which a shell fights over every quote of. They
+can be `key=value` pairs instead, and mcpdial types each one from the tool's own
+`inputSchema` before it sends the call:
+
+```
+mcpdial call fs read_text_file path=/tmp/x
+mcpdial call ctx7 search query="rust ureq" limit=5 fuzzy=true   # 5 is a number, true a boolean
+mcpdial call srv tool tags:='["a","b"]' id:='"123"'             # := is JSON, whatever the schema says
+```
+
+A value stays a string unless the schema names one scalar type for it, so a union type
+or a key the schema never mentions is sent as typed. An array or an object has to come
+through `:=`, and a key the schema shuts out (`additionalProperties: false`) is refused
+before anything is sent, with the nearest property named. The first word after the tool
+name picks the form: `{`, `@` or a bare `-` means the JSON object, and the two forms
+cannot be mixed. `prompt` takes pairs too, where every value is a string.
 
 ### Seeing what a server offers
 
@@ -238,8 +257,9 @@ It reads a script from a pipe just as well. Commands are `call`, `tools`, `schem
 a comment. With `--json` each result is one line of JSON. In a script, any failed command
 makes the exit code 1 after the script finishes.
 
-Arguments are one JSON object. When a line does not work, the answer says what the tool
-actually takes rather than leaving you to go read the schema:
+Arguments are one JSON object, or the same `key=value` pairs the command line takes.
+When a line does not work, the answer says what the tool actually takes, in both forms,
+rather than leaving you to go read the schema:
 
 ```
 chrome> list_pages
@@ -248,6 +268,7 @@ usage: call list_pages {}
 chrome> call new_page
 error: MCP error -32602: Invalid arguments for tool new_page: Required at url
 usage: call new_page {"url": "<string>"}
+   or: call new_page url=<string>
   url: string (required) - URL to load in the new page
   timeout: number - Maximum wait time in milliseconds
 ```
@@ -585,9 +606,9 @@ exit=1
 Pass `--json` on every command. Results go to stdout; errors go to stderr as a single
 object with a `kind` to branch on (`rpc`, `http`, `transport`, `auth`, `config`,
 `usage`) and the status or code behind it. `schema TARGET TOOL` returns one tool's
-input schema. Arguments can come from a file (`@args.json`) or stdin (`-`), so quoting
-is never a problem. `shell --json` gives one JSON line per command, errors included, in
-order.
+input schema. Arguments can come from a file (`@args.json`) or stdin (`-`), or be
+`key=value` pairs typed from that schema, so quoting is never a problem. `shell --json`
+gives one JSON line per command, errors included, in order.
 
 The full reference for programs is [docs/AGENTS.md](docs/AGENTS.md), and it is embedded
 in the binary: `mcpdial guide` prints it, so an agent can load it into context without
