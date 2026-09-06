@@ -39,7 +39,9 @@ jobs:
 
   # `build` compiles the working tree; this compiles the tarball crates.io would
   # actually receive, so a file the package leaves out fails on the pull request
-  # rather than after the tag is cut.
+  # rather than after the tag is cut. A dry run never reaches the registry, so it
+  # cannot answer whether crates.io will accept the upload -- it checks the
+  # package, not the metadata rules the server applies to it.
   package:
     runs-on: ubuntu-latest
     steps:
