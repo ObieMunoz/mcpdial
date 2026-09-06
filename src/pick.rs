@@ -77,7 +77,19 @@ pub fn run(
         ));
     }
     let mut chooser = Chooser::new()?;
-    let Some(at) = chooser.one(ui, "server", &server_lines(&servers))? else {
+    let (columns, lines) = server_lines(&servers);
+    let Some(at) = chooser.one(
+        ui,
+        &Offer {
+            what: "server",
+            about: "Pick a server, then a tool, then its arguments, and the call is made.",
+            filters: "name",
+            columns,
+            search: Search::Name,
+        },
+        &lines,
+    )?
+    else {
         return Ok(nothing_picked(ui));
     };
     let name = servers[at].name.clone();
@@ -93,7 +105,19 @@ pub fn run(
             ),
         ));
     }
-    let Some(at) = chooser.one(ui, "tool", &tool_lines(&tools))? else {
+    let (columns, lines) = tool_lines(&tools);
+    let Some(at) = chooser.one(
+        ui,
+        &Offer {
+            what: "tool",
+            about: "Pick a tool. Its arguments come next, from the schema the server sent.",
+            filters: "name and description",
+            columns,
+            search: Search::Everything,
+        },
+        &lines,
+    )?
+    else {
         return Ok(nothing_picked(ui));
     };
     let tool = tools[at]["name"].as_str().unwrap_or_default().to_string();
@@ -139,15 +163,20 @@ fn reproduction(name: &str, tool: &str, arguments: &Value, schema: &Value) -> St
     line
 }
 
+/// Leaving the picker is where someone who did not mean to open it ends up,
+/// so it is the one place that says what the rest of the program is.
 fn nothing_picked(ui: &dyn Presenter) -> u8 {
     ui.err_line("nothing picked");
+    ui.err_line("`mcpdial --help` lists the commands; `mcpdial ls` names the saved servers.");
     0
 }
 
 /// One line per saved server: its name, the status the last probe left, how it
-/// is dialed, and how many tools it answered with.
-fn server_lines(servers: &[Listing]) -> Vec<String> {
+/// is dialed, and how many tools it answered with, under the same column names
+/// `ls` prints them under.
+fn server_lines(servers: &[Listing]) -> (String, Vec<String>) {
     columns(
+        &["NAME", "STATUS", "TYPE", "TOOLS"],
         servers
             .iter()
             .map(|s| {
@@ -165,8 +194,9 @@ fn server_lines(servers: &[Listing]) -> Vec<String> {
 
 /// One line per tool: its name, and the first line of what it is for, which is
 /// where a description says what it is before it says how.
-fn tool_lines(tools: &[Value]) -> Vec<String> {
+fn tool_lines(tools: &[Value]) -> (String, Vec<String>) {
     columns(
+        &["NAME", "DESCRIPTION"],
         tools
             .iter()
             .map(|t| {
@@ -186,10 +216,15 @@ fn tool_lines(tools: &[Value]) -> Vec<String> {
     )
 }
 
-/// The rows with every column but the last padded to its widest cell.
-fn columns(rows: Vec<Vec<String>>) -> Vec<String> {
+/// The header and the rows, every column but the last padded to its widest
+/// cell. The header is measured with the rows rather than after them, so a
+/// column name sits over the column it names however wide the cells under it
+/// turn out to be.
+fn columns(headers: &[&str], rows: Vec<Vec<String>>) -> (String, Vec<String>) {
+    let mut all = vec![headers.iter().map(|h| (*h).to_string()).collect()];
+    all.extend(rows);
     let mut widths: Vec<usize> = Vec::new();
-    for row in &rows {
+    for row in &all {
         for (i, cell) in row.iter().enumerate() {
             let width = cell.chars().count();
             match widths.get_mut(i) {
@@ -198,7 +233,8 @@ fn columns(rows: Vec<Vec<String>>) -> Vec<String> {
             }
         }
     }
-    rows.iter()
+    let mut padded: Vec<String> = all
+        .iter()
         .map(|row| {
             let mut line = String::new();
             for (i, cell) in row.iter().enumerate() {
@@ -209,7 +245,8 @@ fn columns(rows: Vec<Vec<String>>) -> Vec<String> {
             }
             line.trim_end().to_string()
         })
-        .collect()
+        .collect();
+    (padded.remove(0), padded)
 }
 
 /// Picking one of a list, over and over: the line editor is made once, so the
@@ -231,18 +268,27 @@ impl Chooser {
     fn one(
         &mut self,
         ui: &dyn Presenter,
-        what: &str,
+        offer: &Offer<'_>,
         lines: &[String],
     ) -> Result<Option<usize>, Failure> {
-        match fzf(&format!("{what}> "), lines) {
+        match fzf(offer, lines) {
             Fzf::Picked(answer) => return Ok(lines.iter().position(|line| *line == answer)),
             Fzf::Quit => return Ok(None),
             Fzf::Absent => {}
         }
+        // Answered by number rather than by filtering, so it is told that
+        // instead of what `fzf`'s header says.
+        ui.err_line(offer.about);
+        ui.err_line("Answer with a number, or ^D to leave.");
+        // Every row is offered behind its number, right-aligned so that the
+        // tenth row starts where the first one does and the column names sit
+        // over the column they name.
+        let digits = lines.len().to_string().chars().count();
+        ui.err_line(&format!("{}{}", " ".repeat(digits + 4), offer.columns));
         for (i, line) in lines.iter().enumerate() {
-            ui.err_line(&format!("  {}) {line}", i + 1));
+            ui.err_line(&format!("  {:>digits$}) {line}", i + 1));
         }
-        let question = format!("{what} (1-{}): ", lines.len());
+        let question = format!("{} (1-{}): ", offer.what, lines.len());
         loop {
             use rustyline::error::ReadlineError;
             let answer = match self.editor.readline(&question) {
@@ -254,7 +300,11 @@ impl Chooser {
             };
             match numbered(lines, answer.trim()) {
                 Some(at) => return Ok(Some(at)),
-                None => ui.err_line(&format!("  {what} is one of the {} above", lines.len())),
+                None => ui.err_line(&format!(
+                    "  {} is one of the {} above",
+                    offer.what,
+                    lines.len()
+                )),
             }
         }
     }
@@ -281,19 +331,74 @@ pub enum Fzf {
     Absent,
 }
 
+/// One question the picker asks: what it is picking, what a person needs told
+/// before they can answer, the column names the lines sit under, and how much
+/// of a line a query is matched against.
+pub struct Offer<'a> {
+    /// The word the prompt and the numbered question are built from.
+    pub what: &'a str,
+    /// What is being picked and what picking it does. A bare `mcpdial` opens
+    /// straight onto this list with nothing said yet, so it is said here.
+    pub about: &'a str,
+    /// What a typed query is matched against, named for `fzf`'s header. Only
+    /// `fzf` filters; the numbered list is answered by number, and telling it
+    /// to type a filter would be telling it the wrong thing.
+    pub filters: &'a str,
+    /// The column names, padded to sit over the columns they name.
+    pub columns: String,
+    pub search: Search,
+}
+
+impl Offer<'_> {
+    /// What sits above `fzf`'s list: what is being picked, what filters it,
+    /// and the column names where there are any to print.
+    fn header(&self) -> String {
+        let mut lines = vec![self.about.to_string()];
+        if !self.filters.is_empty() {
+            lines.push(format!(
+                "Type to filter by {}. Enter picks, Esc leaves.",
+                self.filters
+            ));
+        }
+        if !self.columns.is_empty() {
+            lines.push(self.columns.clone());
+        }
+        lines.join("\n")
+    }
+}
+
+/// How much of a line a typed query is matched against.
+#[derive(Clone, Copy)]
+pub enum Search {
+    /// The name in the first column and nothing else. A server line carries a
+    /// status, a transport and a tool count beside the name, and those are
+    /// words every row shares: without this, `ect` finds three servers inside
+    /// the `connected` they all say.
+    Name,
+    /// The whole line. A tool's line is its name and the first thing its
+    /// description says, and what a tool is for is half of what there is to
+    /// search it by.
+    Everything,
+}
+
 /// `fzf` over the lines, when it is on the PATH. It is the fuzzy picker the
 /// people who want one already have, which is why there is no crate here.
-pub fn fzf(prompt: &str, choices: &[String]) -> Fzf {
+pub fn fzf(offer: &Offer<'_>, choices: &[String]) -> Fzf {
     let Some(program) = on_path("fzf") else {
         return Fzf::Absent;
     };
-    let started = Command::new(program)
-        .arg(format!("--prompt={prompt}"))
+    let mut command = Command::new(program);
+    command
+        .arg(format!("--prompt={}> ", offer.what))
         .arg("--height=40%")
         .arg("--reverse")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn();
+        .arg(format!("--header={}", offer.header()));
+    if let Search::Name = offer.search {
+        // fzf reads `--nth` against whitespace-separated fields, and a saved
+        // name is one word by the rule that saved it.
+        command.arg("--nth=1");
+    }
+    let started = command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn();
     let Ok(mut child) = started else {
         return Fzf::Absent;
     };
@@ -348,22 +453,73 @@ mod tests {
 
     #[test]
     fn a_server_line_carries_the_status_the_last_probe_left() {
-        let rows = server_lines(&[
+        let (columns, rows) = server_lines(&[
             listing("echo", Status::Connected, Some(5)),
             listing("work", Status::AuthRequired, None),
         ]);
         assert_eq!(rows[0], "echo  connected      stdio  5 tools");
         assert_eq!(rows[1], "work  auth required  stdio  -");
+        // The column names are measured with the rows, so each one starts
+        // where the cells it names start.
+        assert_eq!(columns, "NAME  STATUS         TYPE   TOOLS");
+        for row in [&columns, &rows[0], &rows[1]] {
+            assert_eq!(row.find("stdio").or(row.find("TYPE")), Some(21));
+        }
     }
 
     #[test]
     fn a_tool_line_is_the_name_and_the_first_line_of_what_it_is_for() {
-        let rows = tool_lines(&[
+        let (columns, rows) = tool_lines(&[
             json!({"name": "echo", "description": "Echo a message back.\nThe rest is detail."}),
             json!({"name": "count"}),
         ]);
         assert_eq!(rows[0], "echo   Echo a message back.");
         assert_eq!(rows[1], "count");
+        assert_eq!(columns, "NAME   DESCRIPTION");
+    }
+
+    /// The bug this picker had: a server line ends in words every other line
+    /// also ends in, so `ect` matched all three servers inside the `connected`
+    /// they share. `Search::Name` narrows fzf to `--nth=1`, which is the first
+    /// whitespace-separated field, so what that field holds is the whole fix.
+    #[test]
+    fn the_field_fzf_is_narrowed_to_holds_the_name_and_nothing_else() {
+        let (columns, rows) = server_lines(&[
+            listing("chrome", Status::Connected, Some(29)),
+            listing("playwright", Status::AuthRequired, None),
+        ]);
+        for (row, name) in rows.iter().zip(["chrome", "playwright"]) {
+            // Every row does carry the words that used to catch it, and none
+            // of them is in the field a query is now matched against.
+            assert!(row.contains("stdio"), "{row}");
+            assert_eq!(row.split_whitespace().next(), Some(name), "{row}");
+        }
+        assert_eq!(columns.split_whitespace().next(), Some("NAME"));
+    }
+
+    /// What a bare `mcpdial` puts above the list, which is the whole of what it
+    /// says before someone has to answer it.
+    #[test]
+    fn the_header_says_what_is_picked_what_filters_it_and_what_the_columns_are() {
+        let offer = Offer {
+            what: "server",
+            about: "Pick a server.",
+            filters: "name",
+            columns: "NAME  STATUS".to_string(),
+            search: Search::Name,
+        };
+        assert_eq!(
+            offer.header(),
+            "Pick a server.\nType to filter by name. Enter picks, Esc leaves.\nNAME  STATUS"
+        );
+        // A list with no columns to name does not leave a blank line where
+        // they would have gone.
+        let bare = Offer {
+            columns: String::new(),
+            filters: "",
+            ..offer
+        };
+        assert_eq!(bare.header(), "Pick a server.");
     }
 
     #[test]

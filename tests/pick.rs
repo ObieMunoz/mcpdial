@@ -471,6 +471,23 @@ fn at_a_terminal_a_picked_call_runs_and_prints_the_command_it_ran() {
             "{args:?}: the server was offered with the status of its last probe: {}",
             done.output
         );
+        // A bare `mcpdial` opens straight onto the list, so the list has to say
+        // what it is, how it is answered, and what the columns beside a name
+        // are, aligned over the cells they name.
+        for said in [
+            "Pick a server, then a tool, then its arguments, and the call is made.",
+            "Answer with a number, or ^D to leave.",
+            "     NAME  STATUS     TYPE   TOOLS",
+            "  1) echo  connected  stdio  5 tools",
+            "Pick a tool. Its arguments come next, from the schema the server sent.",
+            "     NAME    DESCRIPTION",
+        ] {
+            assert!(
+                done.output.contains(said),
+                "{args:?}: the picker never said {said:?}: {}",
+                done.output
+            );
+        }
         assert!(
             done.output.contains("Echo a message back."),
             "{args:?}: the tool was offered with the first line of what it is for: {}",
@@ -488,6 +505,65 @@ fn at_a_terminal_a_picked_call_runs_and_prints_the_command_it_ran() {
             done.output
         );
     }
+}
+
+/// What the server picker actually hands `fzf`, captured by putting a shim
+/// named `fzf` on the emptied `PATH` that records its arguments and quits.
+///
+/// Two things have to be true of that command line and neither shows up in the
+/// numbered list every other test here exercises: the header that says what is
+/// being picked, and `--nth=1`, which stops a query matching the `connected`
+/// and `stdio` every row shares.
+#[test]
+fn the_server_picker_hands_fzf_a_header_and_narrows_the_search_to_the_name() {
+    if no_pty() || !cfg!(feature = "rich") {
+        return;
+    }
+    let home = home_with_echo("pick-fzf-argv");
+    let empty = home.join("empty-path");
+    std::fs::create_dir_all(&empty).unwrap();
+    let recorded = home.join("argv.txt");
+    let shim = empty.join("fzf");
+    std::fs::write(
+        &shim,
+        format!(
+            // NUL between arguments: the header is one argument with newlines
+            // inside it, and a newline separator would tear it in half.
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\000' \"$a\"; done > '{}'\ncat > /dev/null\nexit 130\n",
+            recorded.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let done = under_pty(&home, &[], &[]);
+    // Exit 130 from fzf is a person leaving the picker, which is not a failure.
+    assert_eq!(done.code, 0, "{}", done.output);
+    let recorded = std::fs::read_to_string(&recorded).expect("the shim recorded its arguments");
+    let argv: Vec<&str> = recorded.split('\0').collect();
+    assert!(
+        argv.contains(&"--nth=1"),
+        "the search was not narrowed to the name: {argv:?}"
+    );
+    let header = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--header="))
+        .expect("a header was passed");
+    for said in [
+        "Pick a server, then a tool, then its arguments, and the call is made.",
+        "Type to filter by name. Enter picks, Esc leaves.",
+        "NAME  STATUS",
+    ] {
+        assert!(
+            header.contains(said),
+            "the header never said {said:?}: {header}"
+        );
+    }
+    // Leaving is where someone who did not mean to open this ends up.
+    assert!(done.output.contains("mcpdial --help"), "{}", done.output);
 }
 
 /// Leaving the picker sends nothing and is not a failure: `^D` at the first

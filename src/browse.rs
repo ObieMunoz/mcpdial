@@ -310,10 +310,10 @@ fn pick_with_fzf(
     let mut input = String::new();
     for &i in &order {
         let item = &items[i];
-        input.push_str(&format!(
-            "{}\t{} {} {}\t{}\n",
-            item.key, item.category, item.key, item.name, lines[i]
-        ));
+        // The key, hidden, for the preview pane and for reading the answer
+        // back; then the line itself, which is what is shown and what a query
+        // is matched against.
+        input.push_str(&format!("{}\t{}\n", item.key, lines[i]));
     }
     let previews: BTreeMap<&str, String> = items
         .iter()
@@ -336,9 +336,7 @@ fn pick_with_fzf(
             "--delimiter",
             "\t",
             "--with-nth",
-            "3",
-            "--nth",
-            "2,3",
+            "2",
             "--prompt",
             "browse> ",
             "--header",

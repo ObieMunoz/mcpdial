@@ -143,7 +143,23 @@ impl Asker {
         question: &str,
     ) -> Result<Option<Value>> {
         let shown: Vec<String> = values.iter().map(|v| schema::plain(v)).collect();
-        match pick::fzf(&format!("{}: ", p.name), &shown) {
+        let leaving = match p.required {
+            true => "Esc gives up the call.",
+            false => "Esc leaves the value out.",
+        };
+        let offer = pick::Offer {
+            what: p.name,
+            about: &format!(
+                "Pick a value for {}, one of these. Enter picks. {leaving}",
+                p.name
+            ),
+            // Left out: the generic line ends "Esc leaves", and here Esc means
+            // one of two different things, which `leaving` has already said.
+            filters: "",
+            columns: String::new(),
+            search: pick::Search::Everything,
+        };
+        match pick::fzf(&offer, &shown) {
             Fzf::Picked(answer) => return Ok(chosen(values, &shown, &answer)),
             // Quitting the picker leaves the value out, which for a required
             // one is leaving out the call.
