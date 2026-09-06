@@ -22,7 +22,12 @@ fn headers_after_the_handshake(s: &common::FakeServer) -> Vec<Option<String>> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|r| r.json()["method"] != "initialize")
+        .filter(|r| {
+            !matches!(
+                r.json()["method"].as_str(),
+                Some("initialize" | "server/discover")
+            )
+        })
         .map(|r| r.header("mcp-protocol-version").map(str::to_string))
         .collect()
 }

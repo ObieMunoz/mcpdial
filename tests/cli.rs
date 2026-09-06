@@ -1293,7 +1293,9 @@ fn the_protocol_version_header_rides_every_request_after_initialize() {
         let msg = r.json();
         let method = msg["method"].as_str().unwrap_or_default();
         let sent = r.header("mcp-protocol-version");
-        if method == "initialize" {
+        if method == "server/discover" {
+            assert_eq!(sent, Some("2026-07-28"), "the probe names its own era");
+        } else if method == "initialize" {
             assert_eq!(sent, None, "nothing is negotiated yet on initialize");
         } else {
             assert_eq!(sent, Some("2025-06-18"), "missing on {method}");
@@ -1316,8 +1318,15 @@ fn the_version_on_the_wire_is_the_one_the_server_agreed_to() {
     assert_eq!(o.code, 0, "{}", o.stderr);
 
     let reqs = s.requests.lock().unwrap();
-    assert_eq!(reqs[0].json()["params"]["protocolVersion"], "2025-11-25");
-    let after_the_handshake = &reqs[1..];
+    let handshake = reqs
+        .iter()
+        .position(|r| r.json()["method"] == "initialize")
+        .expect("initialize, after the server/discover probe");
+    assert_eq!(
+        reqs[handshake].json()["params"]["protocolVersion"],
+        "2025-11-25"
+    );
+    let after_the_handshake = &reqs[handshake + 1..];
     assert!(!after_the_handshake.is_empty());
     for r in after_the_handshake {
         assert_eq!(

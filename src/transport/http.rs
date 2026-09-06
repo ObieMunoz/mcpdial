@@ -2,7 +2,11 @@
 
 use super::retry::{self, Failed, Failure, Retry};
 use super::{silent, Logger, Transport};
-use crate::protocol::{decode_body, Error, KnownVersion, Result};
+use crate::protocol::{
+    decode_body, error_in_body, requested_version, Error, Handshake, KnownVersion, Result,
+};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io::Read;
@@ -41,9 +45,10 @@ pub struct HttpTransport {
     /// Set by stateful servers on `initialize`; echoed on every later request.
     /// Stateless servers never send one and we simply never echo one.
     pub session_id: Option<String>,
-    /// What the session settled on at `initialize`. Its presence is also the
-    /// handshake flag: the spec puts `MCP-Protocol-Version` on every request after
-    /// initialization and none on `initialize` itself, which has nothing negotiated yet.
+    /// What the session settled on when it opened. Its presence is also the
+    /// handshake flag: before it, a failed POST is worth a look for the older
+    /// transport, and an `initialize` carries no version header because nothing
+    /// is negotiated yet.
     negotiated_version: Option<KnownVersion>,
 }
 
@@ -72,13 +77,17 @@ impl HttpTransport {
         if let Some(sid) = &self.session_id {
             req = req.header("Mcp-Session-Id", sid);
         }
-        if let Some(version) = self.negotiated_version {
-            req = req.header("MCP-Protocol-Version", version.as_str());
-        }
         for (k, v) in &self.extra_headers {
             req = req.header(k, v);
         }
         req
+    }
+
+    /// Whether the session settled on a revision without sessions, where every
+    /// request describes itself and an error body under a 4xx is the answer.
+    fn modern(&self) -> bool {
+        self.negotiated_version
+            .is_some_and(|v| v.handshake() == Handshake::Discover)
     }
 
     /// Whether this URL is serving protocol 2024-11-05's transport: a `GET` that
@@ -256,6 +265,70 @@ fn is_endpoint_event(line: &str) -> bool {
         .is_some_and(|name| name.trim() == "endpoint")
 }
 
+/// What goes beside one request: `MCP-Protocol-Version` for the version it runs
+/// on, and from 2026-07-28 the body fields the specification mirrors into headers
+/// so an intermediary can route on them without parsing the body.
+///
+/// A request that names its version in `_meta` is of that era whatever was
+/// negotiated, which is how the `server/discover` probe carries its headers
+/// before anything is; one that does not carries the version `initialize`
+/// settled on, and nothing on `initialize` itself.
+fn request_headers(
+    payload: &Value,
+    negotiated: Option<KnownVersion>,
+) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    match requested_version(payload) {
+        Some(version) => {
+            headers.push(("MCP-Protocol-Version", version.to_string()));
+            if let Some(method) = payload["method"].as_str() {
+                headers.push(("Mcp-Method", method.to_string()));
+            }
+            let params = &payload["params"];
+            if let Some(name) = params["name"].as_str().or_else(|| params["uri"].as_str()) {
+                headers.push(("Mcp-Name", header_value(name)));
+            }
+        }
+        None => {
+            if let Some(version) = negotiated {
+                headers.push(("MCP-Protocol-Version", version.as_str().to_string()));
+            }
+        }
+    }
+    headers
+}
+
+/// The markers the specification sets aside for a header value that could not
+/// travel as it is.
+const BASE64_OPEN: &str = "=?base64?";
+const BASE64_CLOSE: &str = "?=";
+
+/// `value` as an HTTP field value: itself when it is printable ASCII with no
+/// space at either end, else base64 of its UTF-8 between the markers. A value
+/// that already looks marked is encoded too, so the server never has to guess.
+fn header_value(value: &str) -> String {
+    let printable_ascii = value.bytes().all(|b| (0x20..=0x7e).contains(&b));
+    let looks_marked = value.starts_with(BASE64_OPEN) && value.ends_with(BASE64_CLOSE);
+    let travels_as_is =
+        printable_ascii && !value.starts_with(' ') && !value.ends_with(' ') && !looks_marked;
+    if travels_as_is {
+        value.to_string()
+    } else {
+        format!("{BASE64_OPEN}{}{BASE64_CLOSE}", STANDARD.encode(value))
+    }
+}
+
+/// Whether a body is a JSON-RPC message, whatever the status it came under.
+/// One is proof of a server speaking Streamable HTTP at this URL - a stateful
+/// one refusing a request that named no session answers that way - where the
+/// older transport's endpoint has no such thing to say.
+fn is_json_rpc(body: &str, content_type: &str) -> bool {
+    decode_body(body, content_type)
+        .ok()
+        .flatten()
+        .is_some_and(|msg| msg.get("jsonrpc").is_some())
+}
+
 impl HttpTransport {
     /// One delivery of `body`, with its failure classified for [`Retry`].
     fn attempt(
@@ -265,13 +338,16 @@ impl HttpTransport {
     ) -> std::result::Result<Option<Value>, Failed> {
         (self.log)(&format!("-> POST {}\n   {}", self.url, body));
 
-        let req = self.identify(
+        let mut req = self.identify(
             self.agent
                 .post(&self.url)
                 .header("Content-Type", "application/json")
                 // Advertise both: the server picks the framing.
                 .header("Accept", "application/json, text/event-stream"),
         );
+        for (name, value) in request_headers(payload, self.negotiated_version) {
+            req = req.header(name, &value);
+        }
 
         let mut resp = req.send(body).map_err(|e| Failed {
             failure: retry::before_any_reply(&e),
@@ -312,7 +388,11 @@ impl HttpTransport {
             )));
         }
         if !(200..300).contains(&status) {
-            let never_spoke_streamable_http = self.negotiated_version.is_none();
+            if let Some(answer) = error_in_body(&text, &content_type, self.modern()) {
+                return Err(Failed::final_(answer));
+            }
+            let never_spoke_streamable_http =
+                self.negotiated_version.is_none() && !is_json_rpc(&text, &content_type);
             let worth_probing = never_spoke_streamable_http
                 && failed_like_a_legacy_endpoint(status, www_authenticate.as_deref());
             if worth_probing && self.speaks_legacy_sse() {
@@ -330,7 +410,7 @@ impl HttpTransport {
                 },
             });
         }
-        if let Some(sid) = session_id {
+        if let Some(sid) = session_id.filter(|_| !self.modern()) {
             self.session_id = Some(sid);
         }
         let reply = decode_body(&text, &content_type).map_err(Failed::final_)?;
@@ -364,6 +444,12 @@ impl Transport for HttpTransport {
 
     fn negotiated(&mut self, version: KnownVersion) {
         self.negotiated_version = Some(version);
+        if version.handshake() == Handshake::Discover {
+            // There are no sessions from 2026-07-28 on. Whatever a server that
+            // serves both eras minted for the probe is not one, and echoing it
+            // would only keep it alive.
+            self.session_id = None;
+        }
     }
 
     /// End the session server-side, as Streamable HTTP prescribes; without it the
@@ -376,13 +462,16 @@ impl Transport for HttpTransport {
         let Some(sid) = self.session_id.clone() else {
             return;
         };
-        let req = self.identify(
+        let mut req = self.identify(
             self.agent
                 .delete(&self.url)
                 .config()
                 .timeout_global(Some(CLOSE_TIMEOUT))
                 .build(),
         );
+        if let Some(version) = self.negotiated_version {
+            req = req.header("MCP-Protocol-Version", version.as_str());
+        }
         // After `identify` has read it into the header, before the request goes
         // out: a second close then finds no session and sends nothing.
         self.session_id = None;
@@ -450,6 +539,19 @@ mod tests {
     }
 
     #[test]
+    fn a_json_rpc_body_under_any_status_is_a_streamable_http_server() {
+        let refusal = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"No valid session ID provided"},"id":null}"#;
+        assert!(is_json_rpc(refusal, "application/json"));
+        assert!(is_json_rpc(
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"x\"}}\n\n",
+            "text/event-stream"
+        ));
+        assert!(!is_json_rpc("Method Not Allowed", "text/plain"));
+        assert!(!is_json_rpc("", "application/json"));
+        assert!(!is_json_rpc(r#"{"error":"not found"}"#, "application/json"));
+    }
+
+    #[test]
     fn only_a_post_that_found_no_route_is_probed() {
         assert!(failed_like_a_legacy_endpoint(404, None));
         assert!(failed_like_a_legacy_endpoint(405, None));
@@ -458,6 +560,69 @@ mod tests {
         assert!(!failed_like_a_legacy_endpoint(403, None));
         assert!(!failed_like_a_legacy_endpoint(500, None));
         assert!(!failed_like_a_legacy_endpoint(400, Some("Bearer realm=x")));
+    }
+
+    #[test]
+    fn a_request_naming_its_version_carries_the_mirrored_headers() {
+        use serde_json::json;
+        let call = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+            "name":"get_weather","arguments":{},
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}});
+        assert_eq!(
+            request_headers(&call, None),
+            [
+                ("MCP-Protocol-Version", "2026-07-28".to_string()),
+                ("Mcp-Method", "tools/call".to_string()),
+                ("Mcp-Name", "get_weather".to_string()),
+            ],
+            "before anything is negotiated, the body says what era it is"
+        );
+        let read = json!({"jsonrpc":"2.0","id":2,"method":"resources/read","params":{
+            "uri":"file:///a.txt",
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}});
+        assert_eq!(
+            request_headers(&read, Some(KnownVersion::V2026_07_28))[2],
+            ("Mcp-Name", "file:///a.txt".to_string())
+        );
+        let list = json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{
+            "_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}});
+        assert_eq!(
+            request_headers(&list, Some(KnownVersion::V2026_07_28)),
+            [
+                ("MCP-Protocol-Version", "2026-07-28".to_string()),
+                ("Mcp-Method", "tools/list".to_string()),
+            ],
+            "nothing to name"
+        );
+    }
+
+    #[test]
+    fn an_earlier_request_carries_the_negotiated_version_and_initialize_none() {
+        use serde_json::json;
+        let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}});
+        assert!(request_headers(&init, None).is_empty());
+        let list = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+        assert_eq!(
+            request_headers(&list, Some(KnownVersion::V2025_06_18)),
+            [("MCP-Protocol-Version", "2025-06-18".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_header_value_travels_as_is_or_marked_base64() {
+        assert_eq!(header_value("us-west1"), "us-west1");
+        assert_eq!(header_value("file:///a b.txt"), "file:///a b.txt");
+        assert_eq!(header_value(""), "");
+        assert_eq!(
+            header_value("Hello, 世界"),
+            "=?base64?SGVsbG8sIOS4lueVjA==?="
+        );
+        assert_eq!(header_value(" padded "), "=?base64?IHBhZGRlZCA=?=");
+        assert_eq!(header_value("line1\nline2"), "=?base64?bGluZTEKbGluZTI=?=");
+        assert_eq!(
+            header_value("=?base64?literal?="),
+            "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?="
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 - A **target** is a saved server name (`mcpdial ls --json` lists them), an `http(s)://`
   URL, or `stdio:<command line>` for a local process.
-- Every invocation is a full session: connect, `initialize`, do one thing, exit. Use
+- Every invocation is a full session: connect, handshake, do one thing, exit. Use
   `shell` when state must survive between calls (a browser, a database cursor, a REPL),
   or `start NAME` to keep a saved stdio server running so that separate invocations
   share it.
@@ -227,7 +227,7 @@ read URI                      # one resource's contents
 prompts                       # list prompts
 prompt NAME {"json":"args"}   # expand a prompt into its messages
 raw METHOD {"json":"params"}  # any JSON-RPC method; allow and deny lists do not apply
-info                          # the initialize result
+info                          # the handshake result (server/discover or initialize)
 help [TOOL]                   # commands, or one tool's parameters
 quit
 ```
@@ -272,14 +272,19 @@ terminal; piped input is read one line at a time with no editing and no history.
 - A stdio server that exits before replying reports its exit status and last stderr
   lines in the error message. A wrong package name shows up there as an npm 404.
 - Servers are called at their final URL. A redirect is reported, not followed.
-- `initialize` offers protocol `2025-11-25`; `info --json` reports the version the
-  server agreed to under `protocolVersion`. A `transport` error naming a version
-  mcpdial does not speak means the server wants one it was not offered; retry with
-  `--protocol-version 2025-06-18` (or `2025-03-26`), and save it with `add`.
+- A session opens with `server/discover` (protocol `2026-07-28`) and falls back to
+  `initialize` offering `2025-11-25` on a server that does not know it; `info --json`
+  reports the version settled on under `protocolVersion`, and a saved server's answer
+  is remembered in `probes.json` so later dials skip the probe. A `transport` error
+  naming a version mcpdial does not speak means the server wants one it was not
+  offered; retry with `--protocol-version 2025-06-18` (or `2025-03-26`), and save it
+  with `add`. `--protocol-version 2025-11-25` forces `initialize` on a server that
+  serves both revisions.
 - A transient HTTP failure is retried once, only where that is provably safe: the
-  request is idempotent (`initialize`, a `*/list`, `ping`, or a tool whose listing
-  carries `idempotentHint`), or it failed before the server could have processed
-  it (connection refused or reset with no reply, DNS failure, 429, or 502/503/504
-  before a session was issued). A timeout, any other 4xx, a JSON-RPC error and a
-  stdio server that dies are never retried. `--no-retry` reports the first failure.
+  request is idempotent (`server/discover`, `initialize`, a `*/list`, `ping`, or a
+  tool whose listing carries `idempotentHint`), or it failed before the server could
+  have processed it (connection refused or reset with no reply, DNS failure, 429, or
+  502/503/504 before a session was issued). A timeout, any other 4xx, a JSON-RPC
+  error and a stdio server that dies are never retried. `--no-retry` reports the
+  first failure.
 - `mcpdial guide` prints this document.

@@ -6,11 +6,13 @@
 //!
 //! The wire format is the stdio framing itself, one JSON-RPC message per line
 //! each way, so the foreground side is [`Framed`] with a socket in place of the
-//! child's pipes. The daemon answers `initialize` from the result it already
-//! holds, swallows `notifications/initialized`, forwards everything else to the
-//! server, and hands a request the server makes mid-call to the foreground
-//! process, which is the one that can act on it. Callers are served one at a
-//! time: a second one waits at the socket until the first hangs up.
+//! child's pipes. The daemon answers the handshake it opened with (`initialize`
+//! or `server/discover`) from the result it already holds, swallows
+//! `notifications/initialized`, forwards everything else to the server, so the
+//! other handshake meets the server's own refusal, and hands a request the
+//! server makes mid-call to the foreground process, which is the one that can
+//! act on it. Callers are served one at a time: a second one waits at the
+//! socket until the first hangs up.
 //!
 //! Only Unix domain sockets are implemented; on other platforms `start` and
 //! `stop` say so and every other command dials as before.
@@ -319,7 +321,10 @@ mod unix {
             ..opts.clone()
         };
         let mut session = client::open_stdio(&r, &quiet)?;
-        let init = session.server_info.clone();
+        let held = Held {
+            method: session.version().handshake().method(),
+            result: session.server_info.clone(),
+        };
         let path = socket_path(store, name);
         let listener = bind(store, name, &path)?;
         println!("{}", json!({ "pid": std::process::id() }));
@@ -344,7 +349,7 @@ mod unix {
                     Err(_) => break,
                 },
             };
-            match serve_one(stream, &mut session.transport, &init) {
+            match serve_one(stream, &mut session.transport, &held) {
                 Next::Caller => {}
                 Next::Stop | Next::ServerGone => break,
             }
@@ -386,11 +391,18 @@ mod unix {
         ServerGone,
     }
 
-    /// One caller, start to finish. Its `initialize` is answered from the
-    /// result already in hand, so the server sees one handshake however many
-    /// callers come and go; everything else it sends goes to the server, and
-    /// whatever the server asks mid-request goes back to it.
-    fn serve_one(stream: UnixStream, server: &mut StdioTransport, init: &Value) -> Next {
+    /// The handshake the daemon's own session opened with, and what it
+    /// answered: replayed to each caller that asks the same way.
+    struct Held {
+        method: &'static str,
+        result: Value,
+    }
+
+    /// One caller, start to finish. Its handshake is answered from the result
+    /// already in hand, so the server sees one however many callers come and
+    /// go; everything else it sends goes to the server, and whatever the server
+    /// asks mid-request goes back to it.
+    fn serve_one(stream: UnixStream, server: &mut StdioTransport, held: &Held) -> Next {
         let Ok(read_half) = stream.try_clone() else {
             return Next::Caller;
         };
@@ -408,8 +420,8 @@ mod unix {
             };
             let id = msg.get("id").filter(|id| !id.is_null());
             match (msg["method"].as_str(), id) {
-                (Some("initialize"), Some(id)) => {
-                    if send_line(&mut writer, &reply(id, init.clone())).is_err() {
+                (Some(method), Some(id)) if method == held.method => {
+                    if send_line(&mut writer, &reply(id, held.result.clone())).is_err() {
                         return Next::Caller;
                     }
                 }

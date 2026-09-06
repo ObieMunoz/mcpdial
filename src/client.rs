@@ -3,10 +3,10 @@
 //! whose answers are remembered for [`STATUS_TTL`], so the next listing dials
 //! nothing.
 
-use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
+use crate::config::{now, Credential, HandshakeRecord, ProbeRecord, ServerConfig, Store};
 use crate::oauth;
-use crate::protocol::{Error, KnownVersion, Result};
-use crate::session::Session;
+use crate::protocol::{Error, Handshake, KnownVersion, Result};
+use crate::session::{Opening, Session};
 use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
 use crate::transport::stdio::StdioTransport;
 use crate::transport::{Logger, Transport};
@@ -286,18 +286,56 @@ fn http_transport(
     b.build()
 }
 
-/// The version to offer at `initialize`: the flag, else the one saved with the
-/// server, else the newest. A saved value this build does not know is a config
-/// error, since the file was edited to say something we cannot send.
-fn version_to_offer(r: &Resolved, opts: &Options) -> Result<KnownVersion> {
+/// The version the flag pins, else the one saved with the server, else none. A
+/// saved value this build does not know is a config error, since the file was
+/// edited to say something we cannot send.
+fn pinned_version(r: &Resolved, opts: &Options) -> Result<Option<KnownVersion>> {
     if let Some(pinned) = opts.protocol_version {
-        return Ok(pinned);
+        return Ok(Some(pinned));
     }
     match &r.config.protocol_version {
         Some(saved) => saved
             .parse()
+            .map(Some)
             .map_err(|e| Error::config(format!("{}: protocol_version {e}", r.name))),
-        None => Ok(KnownVersion::LATEST),
+        None => Ok(None),
+    }
+}
+
+/// How to open a session with `r`: asking for a pinned version if there is one,
+/// else with the handshake `probes.json` remembers the server answering, else
+/// by finding out.
+fn opening_for(store: &Store, r: &Resolved, opts: &Options) -> Result<Opening> {
+    if let Some(pinned) = pinned_version(r, opts)? {
+        return Ok(Opening::Pinned(pinned));
+    }
+    let remembered = r
+        .saved
+        .then(|| store.handshake(&r.name).ok().flatten())
+        .flatten()
+        .filter(|rec| rec.key == config_key(&r.config))
+        .and_then(|rec| Handshake::parse(&rec.handshake));
+    Ok(remembered.map_or(Opening::Detect, Opening::Remembered))
+}
+
+/// Keep which handshake a saved server answered, so the next dial starts with
+/// it. A pinned version says nothing about the server, and what was remembered
+/// and held is on disk already. A cache that cannot be written is a slower dial
+/// next time, not a failed one now.
+fn remember_handshake(store: &Store, r: &Resolved, opening: Opening, answered: Handshake) {
+    let news = match opening {
+        Opening::Pinned(_) => false,
+        Opening::Remembered(h) => h != answered,
+        Opening::Detect => true,
+    };
+    if r.saved && news {
+        let _ = store.save_handshake(
+            &r.name,
+            HandshakeRecord {
+                key: config_key(&r.config),
+                handshake: answered.method().to_string(),
+            },
+        );
     }
 }
 
@@ -305,10 +343,10 @@ fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
     auth: AuthUsed,
-    offer: KnownVersion,
+    opening: Opening,
 ) -> Result<Connection> {
-    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>).offering(offer);
-    let server_info = session.initialize()?.clone();
+    let mut session = Session::new(Box::new(transport) as Box<dyn Transport>).opening(opening);
+    let server_info = session.open()?.clone();
     Ok(Connection {
         name: r.name.clone(),
         config: r.config.clone(),
@@ -318,7 +356,7 @@ fn handshake(
     })
 }
 
-/// The process behind a stdio server, spawned and ready for `initialize`.
+/// The process behind a stdio server, spawned and ready for the handshake.
 fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
     let cmd = r
         .config
@@ -342,17 +380,18 @@ fn spawn_stdio(r: &Resolved, opts: &Options) -> Result<StdioTransport> {
     )
 }
 
-/// A stdio server's process with its session opened, offering the version the
-/// flag or the config asks for: what a daemon holds on behalf of its callers.
+/// A stdio server's process with its session opened, asking for the version the
+/// flag or the config pins, else finding out how the server opens: what a
+/// daemon holds on behalf of its callers.
 pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport>> {
     let r = r.dialed()?;
-    let offer = version_to_offer(&r, opts)?;
-    let mut session = Session::new(spawn_stdio(&r, opts)?).offering(offer);
-    session.initialize()?;
+    let opening = pinned_version(&r, opts)?.map_or(Opening::Detect, Opening::Pinned);
+    let mut session = Session::new(spawn_stdio(&r, opts)?).opening(opening);
+    session.open()?;
     Ok(session)
 }
 
-/// Open a session and complete the `initialize` handshake.
+/// Open a session and complete the handshake the server answers.
 ///
 /// A `${VAR}` in the config's headers, env, cwd, URL or command line is read from
 /// the environment first; one that is unset is a config error before anything is
@@ -362,22 +401,27 @@ pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport
 /// before giving up, so an expired token that the clock did not predict still
 /// works without a visible hiccup.
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
+    let opening = opening_for(store, r, opts)?;
     let dialed = r.dialed()?;
-    let r = &dialed;
-    let offer = version_to_offer(r, opts)?;
+    let conn = dial(store, &dialed, opts, opening)?;
+    remember_handshake(store, r, opening, conn.session.version().handshake());
+    Ok(conn)
+}
+
+fn dial(store: &Store, r: &Resolved, opts: &Options, opening: Opening) -> Result<Connection> {
     let timeout = opts.timeout_for(r)?;
     if r.config.stdio.is_some() {
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
             if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger())? {
-                return handshake(r, t, AuthUsed::None, offer);
+                return handshake(r, t, AuthUsed::None, opening);
             }
         }
-        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, offer);
+        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, opening);
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
-    match handshake(r, http_transport(r, token, opts, timeout), auth, offer) {
+    match handshake(r, http_transport(r, token, opts, timeout), auth, opening) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
             let cred = store.credential(&r.name)?.unwrap_or_default();
             if !cred.can_refresh() {
@@ -388,7 +432,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
                 r,
                 http_transport(r, cred.access_token, opts, timeout),
                 auth,
-                offer,
+                opening,
             )
         }
         outcome => outcome,
@@ -634,6 +678,16 @@ impl Listing {
     }
 }
 
+/// What a saved server's records are records *of*: edit the entry and they no
+/// longer describe it.
+fn config_key(cfg: &ServerConfig) -> u64 {
+    let mut h = DefaultHasher::new();
+    serde_json::to_string(cfg)
+        .expect("a server config is serializable")
+        .hash(&mut h);
+    h.finish()
+}
+
 /// What each server's status is a status *of*. Edit the server, or save or drop
 /// a credential for it, and what was remembered no longer describes it.
 fn probe_keys(store: &Store, servers: &BTreeMap<String, ServerConfig>) -> BTreeMap<String, u64> {
@@ -642,9 +696,7 @@ fn probe_keys(store: &Store, servers: &BTreeMap<String, ServerConfig>) -> BTreeM
         .iter()
         .map(|(name, cfg)| {
             let mut h = DefaultHasher::new();
-            serde_json::to_string(cfg)
-                .expect("a server config is serializable")
-                .hash(&mut h);
+            config_key(cfg).hash(&mut h);
             credentials
                 .get(name)
                 .is_some_and(Credential::has_token)

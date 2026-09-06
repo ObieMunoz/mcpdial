@@ -5,7 +5,8 @@
 //! ```text
 //! servers.json      what you configured: transport, URL or command, headers
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
-//! probes.json       what `ls` last saw: one status per server, with its timestamp
+//! probes.json       what `ls` last saw: one status per server, with its timestamp,
+//!                   and which handshake each server answered
 //! run/NAME.sock     where a server kept alive by `start` listens, see [`crate::daemon`]
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
 //! ```
@@ -44,8 +45,9 @@ pub struct ServerConfig {
     /// Working directory for a stdio server's process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Protocol version to offer at `initialize` instead of the newest, for a
-    /// server that misbehaves when offered one it has never heard of.
+    /// Protocol version to open with instead of the newest, for a server that
+    /// misbehaves when asked for one it has never heard of, or one serving both
+    /// 2026-07-28 and `initialize` that is wanted on the older one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
     /// Seconds to wait for a reply from this server when `--timeout` is not given,
@@ -385,6 +387,17 @@ pub struct ProbeRecord {
     pub tools: Option<usize>,
 }
 
+/// Which handshake a saved server answered, so the next dial starts with it
+/// rather than with the one the server has never heard of.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HandshakeRecord {
+    /// What the record is of: the server's config, hashed. Editing the entry
+    /// forgets it; see `client::config_key`.
+    pub key: u64,
+    /// `server/discover` or `initialize`.
+    pub handshake: String,
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -407,6 +420,8 @@ struct CredentialsFile {
 struct ProbesFile {
     #[serde(default)]
     probes: BTreeMap<String, ProbeRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    handshakes: BTreeMap<String, HandshakeRecord>,
 }
 
 /// The config directory and the files in it.
@@ -549,6 +564,25 @@ impl Store {
         let mut file = read_json::<ProbesFile>(&path)?;
         file.probes.extend(taken);
         file.probes.retain(|name, _| saved.contains_key(name));
+        file.handshakes.retain(|name, _| saved.contains_key(name));
+        write_json(&path, &file, false)
+    }
+
+    pub fn handshake(&self, name: &str) -> Result<Option<HandshakeRecord>> {
+        Ok(read_json::<ProbesFile>(&self.probes_path())?
+            .handshakes
+            .remove(name))
+    }
+
+    /// Record which handshake `name` answered, dropping whatever is left over
+    /// from a server that no longer exists.
+    pub fn save_handshake(&self, name: &str, record: HandshakeRecord) -> Result<()> {
+        let saved = self.servers()?;
+        let path = self.probes_path();
+        let _lock = FileLock::acquire(&path)?;
+        let mut file = read_json::<ProbesFile>(&path)?;
+        file.handshakes.insert(name.to_string(), record);
+        file.handshakes.retain(|name, _| saved.contains_key(name));
         write_json(&path, &file, false)
     }
 
@@ -557,7 +591,9 @@ impl Store {
         let path = self.probes_path();
         let _lock = FileLock::acquire(&path)?;
         let mut file = read_json::<ProbesFile>(&path)?;
-        if file.probes.remove(name).is_some() {
+        let probe = file.probes.remove(name).is_some();
+        let handshake = file.handshakes.remove(name).is_some();
+        if probe || handshake {
             write_json(&path, &file, false)?;
         }
         Ok(())

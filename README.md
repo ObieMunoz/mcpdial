@@ -157,7 +157,7 @@ mcpdial completions SHELL        a completion script; see Install above
 Global flags: `--json` for machine output, `-v` to trace every message on stderr,
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, `--protocol-version
-VERSION` to offer an older MCP revision at `initialize`, `--no-daemon` to dial a
+VERSION` to open with an older MCP revision, `--no-daemon` to dial a
 server afresh even while `start` has one running, and `--no-retry` to fail on the
 first transient HTTP failure instead of sending the request once more.
 
@@ -166,11 +166,15 @@ with the server, else 60 seconds. `add --timeout SECS` saves one for a server th
 installs packages on first launch or runs tools for minutes, `ls --no-probe` shows it,
 and `import` keeps a numeric `timeout` (seconds) it finds in a host's config.
 
-`initialize` offers protocol `2025-11-25` and runs on whichever version the server
-answers with, out of `2025-11-25`, `2025-06-18` and `2025-03-26`; `mcpdial info` shows
-the one agreed. A server that answers with a version mcpdial does not speak is reported
-as such. For a server that misbehaves when offered the newest, `--protocol-version
-2025-06-18` offers that instead, and `add --protocol-version` saves the choice.
+A session opens with `server/discover`, protocol `2026-07-28`'s handshake, and falls
+back to `initialize` offering `2025-11-25` on a server that does not know it, running on
+whichever version that server answers with out of `2025-11-25`, `2025-06-18` and
+`2025-03-26`. `mcpdial info` shows the version settled on, and which handshake a saved
+server answered is remembered in `probes.json` so later dials skip the probe. A server
+that answers with a version mcpdial does not speak is reported as such.
+`--protocol-version 2025-11-25` forces `initialize` on a server that serves both
+revisions, `--protocol-version 2025-06-18` offers that instead for a server that
+misbehaves when offered the newest, and `add --protocol-version` saves the choice.
 
 ### Arguments, without the quoting
 
@@ -624,7 +628,7 @@ The binary is a thin layer over a small library with no async runtime:
 use mcpdial::{HttpTransport, Session};
 
 let mut s = Session::new(HttpTransport::new("https://mcp.deepwiki.com/mcp"));
-s.initialize()?;
+s.open()?;
 let result = s.call_tool("read_wiki_structure", serde_json::json!({"repoName": "x/y"}))?;
 println!("{}", mcpdial::render_content(&result));
 # Ok::<(), mcpdial::Error>(())
@@ -637,7 +641,8 @@ servers, token selection, and status probing if you want them.
 
 1. Every message is a JSON-RPC 2.0 object.
 2. Transport is either HTTP POST to one endpoint, or newline-delimited JSON over stdio.
-3. The methods you need are `initialize`, `tools/list`, and `tools/call`.
+3. The methods you need are `server/discover` (`initialize` before protocol
+   2026-07-28), `tools/list`, and `tools/call`.
 
 Two details make a naive `curl` attempt fail, and both are handled here: Streamable HTTP
 servers may frame the reply as `text/event-stream` rather than JSON - carrying their own

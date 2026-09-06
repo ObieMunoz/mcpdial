@@ -26,6 +26,9 @@
 //! JSON type and refusing any other, which answers with the arguments it was handed
 //! so a test can see what type each one arrived as. It is behind a flag for the same
 //! reason: a sixth tool would renumber every listing assertion.
+//! Set `ECHO_SERVER_MODERN=1` to speak protocol 2026-07-28 and nothing earlier:
+//! `server/discover` in place of `initialize`, which it calls unknown, and every
+//! request required to name that version in `_meta`.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -60,6 +63,7 @@ fn main() {
     let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
     let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
     let types = std::env::var_os("ECHO_SERVER_TYPES").is_some();
+    let modern = std::env::var_os("ECHO_SERVER_MODERN").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let exit_on_call: Option<u32> = std::env::var("ECHO_SERVER_EXIT_ON_CALL")
         .ok()
@@ -92,6 +96,44 @@ fn main() {
 
         let method = msg["method"].as_str().unwrap_or("");
         let params = &msg["params"];
+
+        if modern {
+            let version = params["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str();
+            let refusal = if method == "initialize" {
+                Some(err(
+                    id.clone(),
+                    -32601,
+                    "Method not found: initialize (this server speaks 2026-07-28)",
+                ))
+            } else if version.is_none() {
+                Some(err(
+                    id.clone(),
+                    -32602,
+                    "Invalid params: _meta must name io.modelcontextprotocol/protocolVersion",
+                ))
+            } else if version != Some("2026-07-28") {
+                Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32022,
+                    "message": "Unsupported protocol version",
+                    "data": {"supported": ["2026-07-28"], "requested": version}}}))
+            } else if method == "server/discover" {
+                Some(ok(
+                    id.clone(),
+                    json!({
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "_meta": {"io.modelcontextprotocol/serverInfo":
+                            {"name": "echo-server", "version": "0.0.1"}},
+                    }),
+                ))
+            } else {
+                None
+            };
+            if let Some(reply) = refusal {
+                tell(&mut out, &reply);
+                continue;
+            }
+        }
 
         if method == "tools/call" {
             calls += 1;

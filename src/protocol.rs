@@ -10,13 +10,25 @@ use serde_json::{json, Value};
 use std::fmt;
 use std::str::FromStr;
 
-/// What `initialize` offers unless a version is pinned: the newest one we speak.
-pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST.as_str();
+/// What `initialize` offers unless a version is pinned: the newest revision that
+/// still has an `initialize`. 2026-07-28 opens with `server/discover` instead.
+pub const PROTOCOL_VERSION: &str = KnownVersion::LATEST_LEGACY.as_str();
 pub const CLIENT_NAME: &str = "mcpdial";
 pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// JSON-RPC's "method not found", the honest answer to a request we do not serve.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+
+/// A 2026-07-28 server declining the version a request named; `data.supported`
+/// lists the ones it takes.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The `_meta` keys 2026-07-28 moved the handshake into: every request names its
+/// version, capabilities and client, and every result may name the server.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -25,24 +37,38 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Ordered by date, so a feature gate reads `session.version() >= V2025_11_25`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KnownVersion {
+    V2026_07_28,
     V2025_11_25,
     V2025_06_18,
     V2025_03_26,
 }
 
 impl KnownVersion {
-    pub const ALL: [KnownVersion; 3] = [
+    pub const ALL: [KnownVersion; 4] = [
+        KnownVersion::V2026_07_28,
         KnownVersion::V2025_11_25,
         KnownVersion::V2025_06_18,
         KnownVersion::V2025_03_26,
     ];
     pub const LATEST: KnownVersion = KnownVersion::ALL[0];
+    /// The newest revision opened with `initialize`, and so what that handshake
+    /// offers: a server that has never heard of `server/discover` is at most this.
+    pub const LATEST_LEGACY: KnownVersion = KnownVersion::V2025_11_25;
 
     pub const fn as_str(self) -> &'static str {
         match self {
+            KnownVersion::V2026_07_28 => "2026-07-28",
             KnownVersion::V2025_11_25 => "2025-11-25",
             KnownVersion::V2025_06_18 => "2025-06-18",
             KnownVersion::V2025_03_26 => "2025-03-26",
+        }
+    }
+
+    /// The request that opens a session on this revision.
+    pub const fn handshake(self) -> Handshake {
+        match self {
+            KnownVersion::V2026_07_28 => Handshake::Discover,
+            _ => Handshake::Initialize,
         }
     }
 
@@ -56,6 +82,57 @@ impl KnownVersion {
             .map(|v| v.as_str())
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    fn listed_for(handshake: Handshake) -> String {
+        KnownVersion::ALL
+            .iter()
+            .filter(|v| v.handshake() == handshake)
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The two ways a session opens, which is also the line the specification draws
+/// between its "modern" and "legacy" revisions: from 2026-07-28 every request
+/// carries its version and capabilities in `_meta` and `server/discover` merely
+/// asks what the server offers; before that, `initialize` settled them once for
+/// a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Handshake {
+    Discover,
+    Initialize,
+}
+
+impl Handshake {
+    pub const fn method(self) -> &'static str {
+        match self {
+            Handshake::Discover => "server/discover",
+            Handshake::Initialize => "initialize",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Handshake> {
+        [Handshake::Discover, Handshake::Initialize]
+            .into_iter()
+            .find(|h| h.method() == s)
+    }
+
+    /// The one a server that refused `self` may answer instead.
+    pub const fn other(self) -> Handshake {
+        match self {
+            Handshake::Discover => Handshake::Initialize,
+            Handshake::Initialize => Handshake::Discover,
+        }
+    }
+
+    /// What to ask for when opening this way: the newest revision it opens.
+    pub const fn offer(self) -> KnownVersion {
+        match self {
+            Handshake::Discover => KnownVersion::LATEST,
+            Handshake::Initialize => KnownVersion::LATEST_LEGACY,
+        }
     }
 }
 
@@ -101,14 +178,131 @@ pub fn negotiate(offered: KnownVersion, answered: &Value) -> Result<KnownVersion
         Value::String(s) => s.clone(),
         other => other.to_string(),
     };
-    KnownVersion::parse(&answered).ok_or_else(|| {
-        Error::transport(format!(
+    match KnownVersion::parse(&answered) {
+        Some(v) if v.handshake() == Handshake::Initialize => Ok(v),
+        _ => Err(Error::transport(format!(
             "the server answered initialize with protocol version {answered}, which mcpdial \
-             does not speak (offered {offered}; known: {}).\n\
+             does not speak there (offered {offered}; known: {}).\n\
              Hint: offer one the server accepts with --protocol-version VERSION.",
-            KnownVersion::listed()
-        ))
-    })
+            KnownVersion::listed_for(Handshake::Initialize)
+        ))),
+    }
+}
+
+/// The version a session runs on, given what `server/discover` asked for and the
+/// `supportedVersions` the server answered with: the newest of those that opens
+/// the same way. A server that names none is taken to support what was asked.
+pub fn choose(asked: KnownVersion, supported: &Value) -> Result<KnownVersion> {
+    let Some(list) = supported.as_array() else {
+        return Ok(asked);
+    };
+    let theirs: Vec<&str> = list.iter().filter_map(Value::as_str).collect();
+    KnownVersion::ALL
+        .into_iter()
+        .filter(|v| v.handshake() == Handshake::Discover)
+        .find(|v| theirs.contains(&v.as_str()))
+        .ok_or_else(|| no_common_version(asked, &theirs))
+}
+
+/// A 2026-07-28 server and mcpdial with no revision in common, naming the
+/// server's own list so the user can see how far apart the two are.
+pub fn no_common_version(asked: KnownVersion, theirs: &[&str]) -> Error {
+    let theirs = if theirs.is_empty() {
+        "none it would name".to_string()
+    } else {
+        theirs.join(", ")
+    };
+    Error::transport(format!(
+        "the server answered server/discover naming protocol version(s) {theirs}, none of \
+         which mcpdial speaks (asked for {asked}; known: {}).\n\
+         Hint: --protocol-version VERSION opens with an earlier revision if the server \
+         still serves one.",
+        KnownVersion::listed_for(Handshake::Discover)
+    ))
+}
+
+/// `params` with what every 2026-07-28 request carries under `_meta`: its
+/// protocol version, the client's capabilities (none) and the client's name. A
+/// key the caller set already, as `raw` may, is kept.
+pub fn with_request_meta(params: Option<Value>, version: KnownVersion) -> Value {
+    let mut params = match params {
+        Some(p) if p.is_object() => p,
+        _ => json!({}),
+    };
+    let slot = params
+        .as_object_mut()
+        .expect("an object")
+        .entry("_meta")
+        .or_insert_with(|| json!({}));
+    if !slot.is_object() {
+        *slot = json!({});
+    }
+    let meta = slot.as_object_mut().expect("an object");
+    let ours = [
+        (META_PROTOCOL_VERSION, json!(version.as_str())),
+        (META_CLIENT_CAPABILITIES, json!({})),
+        (
+            META_CLIENT_INFO,
+            json!({ "name": CLIENT_NAME, "version": CLIENT_VERSION }),
+        ),
+    ];
+    for (key, value) in ours {
+        meta.entry(key).or_insert(value);
+    }
+    params
+}
+
+/// The version a request names in its `_meta`, which a 2026-07-28 request always
+/// does and an earlier one never does. HTTP mirrors it into a header.
+pub fn requested_version(payload: &Value) -> Option<&str> {
+    payload["params"]["_meta"][META_PROTOCOL_VERSION].as_str()
+}
+
+/// Whether `code` is one the specification allocated from 2026-07-28 on
+/// (`-32020` to `-32099`), which only a server of that era sends.
+pub fn is_modern_error_code(code: i64) -> bool {
+    (-32099..=-32020).contains(&code)
+}
+
+/// Whether the answer to `server/discover` came from a server that has never
+/// heard of it. An earlier server calls the method unknown (`-32601`, `-32602`
+/// or a code of its own) and a stateful one complains under a 400 that no
+/// session was named; a 404 or 405 is a route that is not there. A code from
+/// the range the specification reserves is a 2026-07-28 server declining, and a
+/// challenge, a block or a dead socket says nothing about the era at all.
+pub fn refused_as_a_legacy_server(e: &Error) -> bool {
+    match e {
+        Error::Rpc { code, .. } => !is_modern_error_code(*code),
+        Error::Http {
+            status: 400 | 404 | 405,
+            www_authenticate: None,
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// The JSON-RPC error a server put under a 4xx status when that error is the
+/// answer rather than the transport failing. From 2026-07-28 an unknown method
+/// is `-32601` under a 404 and the server's own refusals sit under a 400, so on
+/// a session known to be of that era any error body counts; before the era is
+/// known only a code the specification allocated does, since an earlier
+/// server's 400 body merely says a session is missing and stays the HTTP status
+/// it has always been reported as.
+pub fn error_in_body(body: &str, content_type: &str, modern_session: bool) -> Option<Error> {
+    let msg = decode_body(body, content_type).ok().flatten()?;
+    match check(Some(msg)) {
+        Err(Error::Rpc {
+            code,
+            message,
+            data,
+        }) if modern_session || is_modern_error_code(code) => Some(Error::Rpc {
+            code,
+            message,
+            data,
+        }),
+        _ => None,
+    }
 }
 
 /// Everything that can go wrong, sorted by who is to blame.
@@ -617,13 +811,168 @@ mod tests {
     #[test]
     fn known_versions_order_by_date_and_the_newest_is_offered() {
         use KnownVersion::*;
-        assert!(V2025_11_25 > V2025_06_18 && V2025_06_18 > V2025_03_26);
-        assert_eq!(KnownVersion::LATEST, V2025_11_25);
-        assert_eq!(PROTOCOL_VERSION, "2025-11-25");
+        assert!(V2026_07_28 > V2025_11_25 && V2025_11_25 > V2025_06_18);
+        assert!(V2025_06_18 > V2025_03_26);
+        assert_eq!(KnownVersion::LATEST, V2026_07_28);
+        assert_eq!(KnownVersion::LATEST_LEGACY, V2025_11_25);
+        assert_eq!(
+            PROTOCOL_VERSION, "2025-11-25",
+            "initialize offers the newest revision that has one"
+        );
+        assert_eq!(V2026_07_28.handshake(), Handshake::Discover);
+        assert_eq!(V2025_11_25.handshake(), Handshake::Initialize);
+        assert_eq!(Handshake::Discover.offer(), V2026_07_28);
+        assert_eq!(Handshake::Initialize.offer(), V2025_11_25);
+        assert_eq!(
+            Handshake::parse("server/discover"),
+            Some(Handshake::Discover)
+        );
+        assert_eq!(Handshake::parse("initialize"), Some(Handshake::Initialize));
+        assert_eq!(Handshake::parse("ping"), None);
+        assert_eq!("2026-07-28".parse::<KnownVersion>(), Ok(V2026_07_28));
         assert_eq!("2025-03-26".parse::<KnownVersion>(), Ok(V2025_03_26));
         let e = "2024-11-05".parse::<KnownVersion>().unwrap_err();
         assert!(e.contains("2024-11-05") && e.contains("2025-11-25"), "{e}");
         assert_eq!(V2025_06_18.to_string(), "2025-06-18");
+    }
+
+    #[test]
+    fn a_2026_07_28_answer_to_initialize_is_refused() {
+        let e = negotiate(KnownVersion::V2025_11_25, &json!("2026-07-28")).unwrap_err();
+        assert!(matches!(e, Error::Transport(_)), "{e:?}");
+        let text = e.to_string();
+        assert!(
+            text.contains("2026-07-28") && text.contains("2025-11-25"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("known: 2026-07-28"),
+            "only the versions initialize can settle on are listed: {text}"
+        );
+    }
+
+    #[test]
+    fn the_version_chosen_from_discover_is_the_newest_in_common() {
+        use KnownVersion::*;
+        assert_eq!(
+            choose(V2026_07_28, &json!(["2026-07-28", "2025-11-25"])).unwrap(),
+            V2026_07_28
+        );
+        assert_eq!(
+            choose(V2026_07_28, &Value::Null).unwrap(),
+            V2026_07_28,
+            "a server that names none is taken to support what was asked"
+        );
+        for theirs in [json!(["2099-01-01"]), json!(["2025-11-25"]), json!([])] {
+            let e = choose(V2026_07_28, &theirs).unwrap_err();
+            assert!(matches!(e, Error::Transport(_)), "{e:?}");
+            let text = e.to_string();
+            assert!(text.contains("2026-07-28"), "{text}");
+            assert!(text.contains("--protocol-version"), "{text}");
+        }
+        let text = choose(V2026_07_28, &json!(["2099-01-01"]))
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("2099-01-01"), "{text}");
+    }
+
+    #[test]
+    fn request_meta_is_added_where_the_caller_left_it_out() {
+        let bare = with_request_meta(None, KnownVersion::V2026_07_28);
+        assert_eq!(bare["_meta"][META_PROTOCOL_VERSION], "2026-07-28");
+        assert_eq!(bare["_meta"][META_CLIENT_CAPABILITIES], json!({}));
+        assert_eq!(bare["_meta"][META_CLIENT_INFO]["name"], CLIENT_NAME);
+        assert_eq!(bare.as_object().unwrap().len(), 1);
+
+        let with_own = with_request_meta(
+            Some(
+                json!({"cursor": "c1", "_meta": {"io.modelcontextprotocol/logLevel": "debug",
+                META_PROTOCOL_VERSION: "2099-01-01"}}),
+            ),
+            KnownVersion::V2026_07_28,
+        );
+        assert_eq!(with_own["cursor"], "c1");
+        assert_eq!(
+            with_own["_meta"]["io.modelcontextprotocol/logLevel"], "debug",
+            "the caller's keys stay"
+        );
+        assert_eq!(
+            with_own["_meta"][META_PROTOCOL_VERSION], "2099-01-01",
+            "and so does a value the caller set for one of ours"
+        );
+        assert_eq!(with_own["_meta"][META_CLIENT_CAPABILITIES], json!({}));
+
+        let odd_meta = with_request_meta(
+            Some(json!({"_meta": "not an object"})),
+            KnownVersion::V2026_07_28,
+        );
+        assert_eq!(odd_meta["_meta"][META_PROTOCOL_VERSION], "2026-07-28");
+        assert_eq!(
+            requested_version(&json!({"params": odd_meta})),
+            Some("2026-07-28")
+        );
+        assert_eq!(
+            requested_version(&json!({"method": "initialize", "params": {}})),
+            None
+        );
+    }
+
+    #[test]
+    fn only_an_earlier_servers_refusal_of_discover_falls_back() {
+        let rpc = |code| Error::Rpc {
+            code,
+            message: String::new(),
+            data: None,
+        };
+        let http = |status, www: Option<&str>| Error::Http {
+            status,
+            body: String::new(),
+            www_authenticate: www.map(str::to_string),
+        };
+        assert!(refused_as_a_legacy_server(&rpc(METHOD_NOT_FOUND)));
+        assert!(refused_as_a_legacy_server(&rpc(-32602)));
+        assert!(
+            refused_as_a_legacy_server(&rpc(-32000)),
+            "a session complaint"
+        );
+        assert!(!refused_as_a_legacy_server(&rpc(
+            UNSUPPORTED_PROTOCOL_VERSION
+        )));
+        assert!(!refused_as_a_legacy_server(&rpc(-32020)));
+        assert!(refused_as_a_legacy_server(&http(400, None)));
+        assert!(refused_as_a_legacy_server(&http(404, None)));
+        assert!(refused_as_a_legacy_server(&http(405, None)));
+        assert!(!refused_as_a_legacy_server(&http(401, None)));
+        assert!(!refused_as_a_legacy_server(&http(403, None)));
+        assert!(!refused_as_a_legacy_server(&http(
+            400,
+            Some("Bearer realm=x")
+        )));
+        assert!(!refused_as_a_legacy_server(&http(500, None)));
+        assert!(!refused_as_a_legacy_server(&Error::transport("no route")));
+    }
+
+    #[test]
+    fn an_error_body_under_a_4xx_is_the_answer_on_a_modern_session() {
+        let declined = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2099-01-01"]}}}"#;
+        let unknown =
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let session_missing = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"No valid session ID provided"},"id":null}"#;
+
+        let e = error_in_body(declined, "application/json", false).unwrap();
+        assert!(matches!(e, Error::Rpc { code: -32022, .. }), "{e:?}");
+        assert!(error_in_body(unknown, "application/json", false).is_none());
+        assert!(error_in_body(session_missing, "application/json", false).is_none());
+
+        let e = error_in_body(unknown, "application/json", true).unwrap();
+        assert!(matches!(e, Error::Rpc { code: -32601, .. }), "{e:?}");
+        let e = error_in_body(session_missing, "application/json", true).unwrap();
+        assert!(matches!(e, Error::Rpc { code: -32000, .. }), "{e:?}");
+
+        assert!(error_in_body("<html>nope</html>", "text/html", true).is_none());
+        assert!(error_in_body("", "application/json", true).is_none());
+        let result = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
+        assert!(error_in_body(result, "application/json", true).is_none());
     }
 
     #[test]

@@ -63,6 +63,15 @@ pub enum Mode {
     /// The first `tools/call` gets a 503; everything else is served, with or
     /// without a session.
     CallUnavailableOnce { stateful: bool },
+    /// Protocol 2026-07-28 and nothing earlier: `server/discover` in place of
+    /// `initialize`, every request self-describing under `_meta` and checked
+    /// against the headers mirrored from it, no session.
+    Modern,
+    /// Serves both eras: 2026-07-28 to a request that names its version in
+    /// `_meta`, 2025-06-18 to an `initialize`.
+    DualEra,
+    /// 2026-07-28's shape, but the only version it supports is one nobody speaks yet.
+    ModernFromTheFuture,
 }
 
 /// The client the administrator registered out of band. The secret carries the
@@ -105,8 +114,17 @@ pub struct FakeServer {
     pub base: String,
     pub url: String,
     pub requests: Arc<Mutex<Vec<Recorded>>>,
+    mode: Arc<Mutex<Mode>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+impl FakeServer {
+    /// Serve `mode` from the next request on, at the same URL: a server upgraded
+    /// under a client that remembers how it used to answer.
+    pub fn switch_to(&self, mode: Mode) {
+        *self.mode.lock().unwrap() = mode;
+    }
 }
 
 impl Drop for FakeServer {
@@ -140,10 +158,12 @@ pub fn start(mode: Mode) -> FakeServer {
         ..Default::default()
     }));
 
+    let mode = Arc::new(Mutex::new(mode));
     let handle = {
         let requests = requests.clone();
         let stop = stop.clone();
         let base = base.clone();
+        let mode = mode.clone();
         thread::spawn(move || {
             // What a black hole swallows: kept unanswered until the thread ends.
             let mut held = Vec::new();
@@ -164,6 +184,7 @@ pub fn start(mode: Mode) -> FakeServer {
                     body,
                 };
                 requests.lock().unwrap().push(rec.clone());
+                let mode = mode.lock().unwrap().clone();
                 if matches!(mode, Mode::BlackHole) {
                     held.push(req);
                     continue;
@@ -178,6 +199,7 @@ pub fn start(mode: Mode) -> FakeServer {
         base,
         url,
         requests,
+        mode,
         stop,
         handle: Some(handle),
     }
@@ -609,6 +631,18 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         }
     }
 
+    let msg = rec.json();
+    let names_its_version =
+        msg["params"]["_meta"]["io.modelcontextprotocol/protocolVersion"].is_string();
+    let of_the_new_era = match mode {
+        Mode::Modern | Mode::ModernFromTheFuture => true,
+        Mode::DualEra => names_its_version,
+        _ => false,
+    };
+    if of_the_new_era {
+        return modern(mode, rec, &msg);
+    }
+
     let stateful = matches!(
         mode,
         Mode::Stateful | Mode::StatefulNoDelete | Mode::CallUnavailableOnce { stateful: true }
@@ -628,7 +662,6 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         return Response::from_string("").with_status_code(204);
     }
 
-    let msg = rec.json();
     let Some(id) = msg.get("id").cloned() else {
         // A notification. Remember that the client finished the handshake.
         if msg["method"] == "notifications/initialized" {
@@ -673,33 +706,11 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         "tools/list" if matches!(mode, Mode::StuckCursor) => stuck_page(&id, state),
         "tools/list" => tools_list(&id, params["cursor"].as_str()),
         "resources/list" => resources_list(&id, params["cursor"].as_str()),
-        "resources/templates/list" => json!({"jsonrpc":"2.0","id":id,"result":{
-            "resourceTemplates":[{"uriTemplate":"file:///notes/{name}.md","name":"note",
-                "description":"One note, by name.","mimeType":"text/markdown"}]}}),
+        "resources/templates/list" => resource_templates_list(&id),
         "resources/read" => resources_read(&id, params["uri"].as_str().unwrap_or("")),
         "prompts/list" => prompts_list(&id, params["cursor"].as_str()),
         "prompts/get" => prompts_get(&id, params),
-        "tools/call" => match params["name"].as_str().unwrap_or("") {
-            "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
-                "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
-            "add" => {
-                let (a, b) = (
-                    params["arguments"]["a"].as_f64().unwrap_or(0.0),
-                    params["arguments"]["b"].as_f64().unwrap_or(0.0),
-                );
-                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}],"structuredContent":{"sum": a + b}}})
-            }
-            // Left out of tools/list on purpose: a third tool renumbers every listing assertion.
-            "reading" => {
-                json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"celsius":20},"isError":false}})
-            }
-            "fail" => {
-                json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}})
-            }
-            other => {
-                json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Tool {other} not found")}})
-            }
-        },
+        "tools/call" => tools_call(&id, params),
         other => {
             json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":format!("Method not found: {other}")}})
         }
@@ -725,6 +736,129 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         r
     } else {
         json_resp(200, &reply)
+    }
+}
+
+/// Protocol 2026-07-28: no handshake, every request self-describing, and the
+/// headers the transport mirrors from the body checked against it the way the
+/// specification has a server do.
+fn modern(mode: &Mode, rec: &Recorded, msg: &Value) -> Resp {
+    if rec.method != "POST" {
+        return Response::from_string("").with_status_code(405);
+    }
+    let Some(id) = msg.get("id").cloned() else {
+        return Response::from_string("").with_status_code(202);
+    };
+    let method = msg["method"].as_str().unwrap_or("");
+    let params = &msg["params"];
+    let meta = &params["_meta"];
+    let supported: &[&str] = match mode {
+        Mode::ModernFromTheFuture => &["2099-01-01"],
+        _ => &["2026-07-28"],
+    };
+    let Some(version) = meta["io.modelcontextprotocol/protocolVersion"].as_str() else {
+        // A client of the earlier era, or one that forgot what every request carries.
+        return if method == "initialize" {
+            rpc_error(
+                404,
+                &id,
+                -32601,
+                &format!(
+                    "Method not found: initialize (this server speaks {})",
+                    supported.join(", ")
+                ),
+            )
+        } else {
+            rpc_error(
+                400,
+                &id,
+                -32602,
+                "Invalid params: _meta must name io.modelcontextprotocol/protocolVersion",
+            )
+        };
+    };
+    if !meta["io.modelcontextprotocol/clientCapabilities"].is_object() {
+        return rpc_error(
+            400,
+            &id,
+            -32602,
+            "Invalid params: _meta must carry io.modelcontextprotocol/clientCapabilities",
+        );
+    }
+    if !supported.contains(&version) {
+        return json_resp(
+            400,
+            &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32022,
+                "message":"Unsupported protocol version",
+                "data":{"supported":supported,"requested":version}}}),
+        );
+    }
+    let mismatch = |what: String| rpc_error(400, &id, -32020, &format!("Header mismatch: {what}"));
+    if rec.header("mcp-protocol-version") != Some(version) {
+        return mismatch(format!(
+            "MCP-Protocol-Version {:?} is not the {version} in _meta",
+            rec.header("mcp-protocol-version")
+        ));
+    }
+    if rec.header("mcp-method") != Some(method) {
+        return mismatch(format!(
+            "Mcp-Method {:?} is not {method}",
+            rec.header("mcp-method")
+        ));
+    }
+    if matches!(method, "tools/call" | "resources/read" | "prompts/get") {
+        let expected = params["name"]
+            .as_str()
+            .or(params["uri"].as_str())
+            .unwrap_or("");
+        let carried = rec.header("mcp-name").map(decode_sentinel);
+        if carried.as_deref() != Some(expected) {
+            return mismatch(format!("Mcp-Name {carried:?} is not {expected:?}"));
+        }
+    }
+
+    let server_info = json!({"name":"fake-mcp","version":"1.0"});
+    let mut reply = match method {
+        "server/discover" => json!({"jsonrpc":"2.0","id":id,"result":{
+            "supportedVersions":supported,
+            "capabilities":{"tools":{},"resources":{},"prompts":{}},
+            "instructions":"Discovered, not initialized.",
+            "_meta":{"io.modelcontextprotocol/serverInfo":server_info.clone()}}}),
+        "tools/list" => tools_list(&id, params["cursor"].as_str()),
+        "resources/list" => resources_list(&id, params["cursor"].as_str()),
+        "resources/templates/list" => resource_templates_list(&id),
+        "resources/read" => resources_read(&id, params["uri"].as_str().unwrap_or("")),
+        "prompts/list" => prompts_list(&id, params["cursor"].as_str()),
+        "prompts/get" => prompts_get(&id, params),
+        "tools/call" => tools_call(&id, params),
+        other => {
+            return rpc_error(404, &id, -32601, &format!("Method not found: {other}"));
+        }
+    };
+    if let Some(result) = reply.get_mut("result").and_then(Value::as_object_mut) {
+        result.entry("resultType").or_insert(json!("complete"));
+        result.entry("_meta").or_insert_with(|| json!({}))["io.modelcontextprotocol/serverInfo"] =
+            server_info;
+    }
+    json_resp(200, &reply)
+}
+
+fn rpc_error(status: u16, id: &Value, code: i64, message: &str) -> Resp {
+    json_resp(
+        status,
+        &json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}),
+    )
+}
+
+/// A header value the client could not send as it was, decoded the way the
+/// specification has a server do before comparing it to the body.
+fn decode_sentinel(value: &str) -> String {
+    match value
+        .strip_prefix("=?base64?")
+        .and_then(|v| v.strip_suffix("?="))
+    {
+        Some(b64) => String::from_utf8(STANDARD.decode(b64).expect("base64")).expect("utf-8"),
+        None => value.to_string(),
     }
 }
 
@@ -767,6 +901,36 @@ fn tools_list(id: &Value, cursor: Option<&str>) -> Value {
         Some(other) => json!({"jsonrpc":"2.0","id":id,
             "error":{"code":-32602,"message":format!("Invalid cursor: {other}")}}),
     }
+}
+
+fn tools_call(id: &Value, params: &Value) -> Value {
+    match params["name"].as_str().unwrap_or("") {
+        "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
+            "text":format!("Echo: {}", params["arguments"]["message"].as_str().unwrap_or(""))}]}}),
+        "add" => {
+            let (a, b) = (
+                params["arguments"]["a"].as_f64().unwrap_or(0.0),
+                params["arguments"]["b"].as_f64().unwrap_or(0.0),
+            );
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":format!("The sum of {a} and {b} is {}.", a + b)}],"structuredContent":{"sum": a + b}}})
+        }
+        // Left out of tools/list on purpose: a third tool renumbers every listing assertion.
+        "reading" => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"celsius":20},"isError":false}})
+        }
+        "fail" => {
+            json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":"it failed"}],"isError":true}})
+        }
+        other => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":format!("Tool {other} not found")}})
+        }
+    }
+}
+
+fn resource_templates_list(id: &Value) -> Value {
+    json!({"jsonrpc":"2.0","id":id,"result":{
+        "resourceTemplates":[{"uriTemplate":"file:///notes/{name}.md","name":"note",
+            "description":"One note, by name.","mimeType":"text/markdown"}]}})
 }
 
 /// The first eight bytes of every PNG, and not valid UTF-8, so a test can prove
