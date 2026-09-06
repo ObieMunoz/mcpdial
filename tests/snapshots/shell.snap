@@ -106,11 +106,13 @@ commands (one per line; # starts a comment):
 
 At a terminal: Up and Down walk the history, Tab completes commands, tool and
 prompt names and resource URIs, and ^C abandons the line being typed.
+add  [idempotent]
 usage: call add {"a": <number>, "b": <number>}
    or: call add a=<number> b=<number>
   a: number (required)
   b: number (required)
 error: add is a tool, not a command
+add  [idempotent]
 usage: call add {"a": <number>, "b": <number>}
    or: call add a=<number> b=<number>
   a: number (required)

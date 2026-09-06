@@ -544,6 +544,51 @@ fn saved_servers_and_status_listing() {
     assert!(!o.stdout.contains("dead"));
 }
 
+/// A tool's annotations are how a server says a call cannot be taken back, and
+/// they are no use buried in the raw JSON. Every listing that names the tool has
+/// to carry them: the long one spelled out, the short one as a mark on the name,
+/// and the block a refused call prints.
+#[test]
+fn what_a_tool_says_about_itself_reaches_every_listing_that_names_it() {
+    let home = temp_home("annotations");
+    let o = run(mcpdial(&home).args(["add", "erasers", "--stdio", &echo_command(), "--no-probe"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    let annotated = || {
+        let mut c = mcpdial(&home);
+        c.env("ECHO_SERVER_ANNOTATED", "1");
+        c
+    };
+
+    let o = run(annotated().args(["tools", "erasers", "--long"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stdout
+            .contains(r#"erase  "Erase a file"  [destructive] [open-world] [task:optional]"#),
+        "{}",
+        o.stdout
+    );
+    // A tool the server annotated with nothing is tagged with nothing.
+    assert!(o.stdout.contains("\necho\n"), "{}", o.stdout);
+
+    // The short listing has room for the one hint that matters most.
+    let o = run(annotated().args(["tools", "erasers"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(o.stdout.contains("erase*"), "{}", o.stdout);
+    assert!(!o.stdout.contains("echo*"), "{}", o.stdout);
+
+    // The same tags where a caller looks the tool up, with stdout still the
+    // tool object and nothing else.
+    let o = run(annotated().args(["schema", "erasers", "erase"]));
+    assert_eq!(o.code, 0, "{}", o.stderr);
+    assert!(
+        o.stderr.contains(r#"erase  "Erase a file"  [destructive]"#),
+        "{}",
+        o.stderr
+    );
+    let object: Value = serde_json::from_str(&o.stdout).unwrap();
+    assert_eq!(object["annotations"]["destructiveHint"], true);
+}
+
 /// A program reading `ls --json` must not have to know which flag produced it,
 /// and every `--json` document is an object.
 #[test]

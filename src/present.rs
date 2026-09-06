@@ -91,13 +91,15 @@ pub trait Presenter {
     }
 
     /// Tools and prompts list identically; only the word for what they take
-    /// differs, and `describe` knows how to read it.
+    /// differs, `describe` knows how to read it, and `hints` says what the item's
+    /// own metadata adds after its name, which for a prompt is nothing.
     fn named(
         &self,
         items: &[Value],
         long: bool,
         takes: &str,
         describe: &dyn Fn(&Value) -> Vec<String>,
+        hints: &dyn Fn(&Value) -> String,
     ) {
         for item in items {
             // `tools --all` marks what the allow and deny lists hide.
@@ -106,7 +108,11 @@ pub trait Presenter {
             } else {
                 ""
             };
-            let name = format!("{}{marker}", item["name"].as_str().unwrap_or("?"));
+            let name = format!(
+                "{}{}{marker}",
+                item["name"].as_str().unwrap_or("?"),
+                hints(item)
+            );
             let desc = item["description"].as_str().unwrap_or("").trim();
             if long {
                 self.line(&name);
