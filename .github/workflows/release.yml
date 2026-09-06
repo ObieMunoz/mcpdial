@@ -37,6 +37,21 @@ jobs:
           name: notes
           path: notes.md
 
+  # `build` compiles the working tree; this compiles the tarball crates.io would
+  # actually receive, so a file the package leaves out fails on the pull request
+  # rather than after the tag is cut. A dry run never reaches the registry, so it
+  # cannot answer whether crates.io will accept the upload -- it checks the
+  # package, not the metadata rules the server applies to it.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - run: cargo publish --dry-run --locked
+
   build:
     needs: verify
     strategy:
@@ -100,3 +115,24 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file dist/notes.md dist/*.tar.gz dist/*.zip dist/SHA256SUMS
+
+  # A crates.io version can be yanked but never replaced or reused, so this runs
+  # only once the binaries are built and the GitHub release exists. Auth is
+  # crates.io Trusted Publishing: the job trades a GitHub OIDC token for one
+  # scoped to this run, which the action revokes when the job ends. Nothing
+  # long-lived is stored, so there is no registry token in this repository's
+  # secrets. Configured at crates.io -> mcpdial -> Settings -> Trusted Publishing.
+  publish:
+    if: github.ref_type == 'tag'
+    needs: [package, release]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

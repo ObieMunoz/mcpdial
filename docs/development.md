@@ -47,5 +47,19 @@ how things look at a terminal should never need to.
 The release workflow refuses a tag that does not match `Cargo.toml`, builds every
 target in the README's platform table, checks that each binary reports the tagged
 version, and publishes a GitHub Release whose notes are that changelog section, with
-the archives and their `SHA256SUMS` attached. Nothing is published to crates.io.
+the archives and their `SHA256SUMS` attached. It then publishes the crate to
+crates.io. That step is last because it is the only one that cannot be taken back: a
+version there can be yanked, but the number is never free again, so everything that
+might fail runs before it. A pull request touching `Cargo.toml`, `Cargo.lock` or the
+workflow itself builds the packaged tarball too, which is how a file the package
+leaves out is caught before a tag exists.
+
+The workflow holds no registry token. It authenticates by crates.io [Trusted
+Publishing](https://crates.io/docs/trusted-publishing), trading the run's GitHub OIDC
+token for one scoped to that run and revoked when the job ends, which is why the
+`publish` job asks for `id-token: write`. The trust is configured once on crates.io,
+under mcpdial -> Settings -> Trusted Publishing, naming this repository and
+`release.yml`. crates.io only accepts that configuration for a crate that already
+exists, so the first version was published by hand from a maintainer's machine; every
+version since has come from a tag.
 

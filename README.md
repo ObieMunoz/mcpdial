@@ -47,8 +47,8 @@ does not set that flag. Or install it with
 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), or from source:
 
 ```bash
-cargo binstall --git https://github.com/ObieMunoz/mcpdial mcpdial
-cargo install --git https://github.com/ObieMunoz/mcpdial
+cargo binstall mcpdial
+cargo install mcpdial
 ```
 
 `mcpdial completions SHELL` prints a completion script for bash, zsh, fish, elvish or

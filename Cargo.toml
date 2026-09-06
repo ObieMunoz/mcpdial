@@ -7,7 +7,7 @@ description = "Dial any MCP server from the shell: named servers, saved OAuth to
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/ObieMunoz/mcpdial"
-keywords = ["mcp", "model-context-protocol", "json-rpc", "cli", "oauth"]
+keywords = ["mcp", "mcp-client", "json-rpc", "cli", "oauth"]
 categories = ["command-line-utilities", "development-tools"]
 
 [features]
