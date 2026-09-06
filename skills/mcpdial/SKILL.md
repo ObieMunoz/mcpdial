@@ -17,6 +17,7 @@ mcpdial tools TARGET --json             # every tool with its inputSchema
 mcpdial schema TARGET TOOL              # one tool's schema
 mcpdial call TARGET TOOL '{"k":"v"}' --json
 mcpdial call TARGET TOOL @args.json --json      # large arguments from a file
+mcpdial call TARGET TOOL k=v n=5 --json         # pairs typed from the tool's schema
 mcpdial shell TARGET --json             # one session; one command per stdin line
 mcpdial start NAME [--idle SECS]        # keep a stdio server running; calls share it
 mcpdial stop NAME

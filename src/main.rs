@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod args;
+
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
 const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
 
@@ -247,9 +249,8 @@ enum Cmd {
     Call {
         target: String,
         tool: String,
-        /// JSON object of arguments: inline, @file, or - for stdin
-        #[arg(default_value = "{}")]
-        arguments: String,
+        /// One JSON object (inline, @file, or - for stdin), or key=value pairs
+        arguments: Vec<String>,
     },
     /// Show one tool's name, description, and input and output schemas
     Schema { target: String, tool: String },
@@ -273,9 +274,8 @@ enum Cmd {
     Prompt {
         target: String,
         name: String,
-        /// JSON object of arguments: inline, @file, or - for stdin
-        #[arg(default_value = "{}")]
-        arguments: String,
+        /// One JSON object (inline, @file, or - for stdin), or key=value pairs
+        arguments: Vec<String>,
     },
     /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
     Raw {
@@ -360,14 +360,7 @@ enum TokenCmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::try_parse().unwrap_or_else(|e| {
-        let hint = split_object_hint(&e);
-        let _ = e.print();
-        if let Some(hint) = hint {
-            eprintln!("{hint}");
-        }
-        std::process::exit(e.exit_code());
-    });
+    let cli = Cli::parse();
     let json = cli.json;
     match run(cli) {
         Ok(code) => ExitCode::from(code),
@@ -766,23 +759,6 @@ fn json_arg_hint(arguments: &str, command: &str, lookup: String) -> String {
     }
 }
 
-/// The hint when the shell split an unquoted JSON object at its commas, so that
-/// `{"a": 1, "b": 2}` reached clap as the two words `a:1` and `b:2`.
-fn split_object_hint(e: &clap::Error) -> Option<String> {
-    use clap::error::{ContextKind, ContextValue, ErrorKind};
-    if e.kind() != ErrorKind::UnknownArgument {
-        return None;
-    }
-    let ContextValue::String(word) = e.get(ContextKind::InvalidArg)? else {
-        return None;
-    };
-    let looks_like_field = word.contains(':') && !word.starts_with('-');
-    let takes_json = std::env::args().any(|a| a == "call" || a == "prompt");
-    (looks_like_field && takes_json).then(|| {
-        "the shell split a JSON object at its commas; single quotes keep it whole: '{\"key\": \"value\", ...}'".to_string()
-    })
-}
-
 /// What a JSON value is, for an error message.
 fn json_kind(v: &Value) -> &'static str {
     match v {
@@ -847,11 +823,17 @@ fn field_values(items: &[Value], key: &str) -> Vec<String> {
 /// parameter. `prefix` is whatever comes before the tool name in that call, and
 /// `quote` wraps the argument object, which a shell needs quoted and the REPL does not.
 fn tool_usage(tool: &Value, prefix: &str, quote: &str) -> String {
+    let name = tool["name"].as_str().unwrap_or("?");
     let mut out = format!(
-        "usage: {prefix} {} {quote}{}{quote}",
-        tool["name"].as_str().unwrap_or("?"),
+        "usage: {prefix} {name} {quote}{}{quote}",
         client::example_arguments(tool)
     );
+    // The same call in the other form, so a retry after either one goes wrong
+    // needs no second lookup.
+    let pairs = args::example_pairs(tool);
+    if !pairs.is_empty() {
+        out.push_str(&format!("\n   or: {prefix} {name} {pairs}"));
+    }
     for p in describe_params(tool) {
         out.push_str("\n  ");
         out.push_str(&p);
@@ -1255,6 +1237,7 @@ const SHELL_HELP: &str = r#"commands (one per line; # starts a comment):
   schema TOOL                one tool's full JSON input schema
   help [TOOL]                this list, or one tool's parameters
   call TOOL {"arg": "value"} call a tool; arguments are one JSON object, default {}
+  call TOOL arg=value        the same, as pairs the tool's schema types
   resources [--long]         every resource, then every URI template
   read URI                   one resource's contents
   prompts [--long]           every prompt this server offers
@@ -2018,7 +2001,7 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                                 "usage: prompt NAME {\"arg\": \"value\"}   (`prompts` lists what this server offers)",
                             ))
                         } else {
-                            parse_object(args, "arguments")
+                            args::shell_arguments(args, || Value::Null)
                                 .and_then(|a| conn.session.get_prompt(name, a))
                                 .map_err(|e| missing_capability(e, "prompts", info_cmd))
                                 .and_then(|mut result| {
@@ -2043,7 +2026,11 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                             // Arguments that do not parse and arguments the server
                             // rejects mean the same thing to whoever typed the line:
                             // show them what this tool takes.
-                            match parse_object(args, "arguments") {
+                            let parsed = args::shell_arguments(args, || {
+                                find_tool(shell_tools(&mut cache, &mut conn), tool)
+                                    .map_or(Value::Null, |t| t["inputSchema"].clone())
+                            });
+                            match parsed {
                                 Err(e) => Err(Failure {
                                     error: e,
                                     hint: shell_call_hint(&mut cache, &mut conn, tool, true),
@@ -2282,19 +2269,24 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             name,
             arguments,
         } => {
-            let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
-                Failure::hinted(
-                    e,
-                    json_arg_hint(
-                        &arguments,
-                        &format!("mcpdial prompt {} {name}", shell_word(&target)),
-                        format!(
-                            "`mcpdial prompts {} --long` shows what {name} takes",
-                            shell_word(&target)
+            let form = args::form(&arguments)?;
+            let arguments = match form.json() {
+                Some(text) => read_json_arg(text, "arguments").map_err(|e| {
+                    Failure::hinted(
+                        e,
+                        json_arg_hint(
+                            text,
+                            &format!("mcpdial prompt {} {name}", shell_word(&target)),
+                            format!(
+                                "`mcpdial prompts {} --long` shows what {name} takes",
+                                shell_word(&target)
+                            ),
                         ),
-                    ),
-                )
-            })?;
+                    )
+                })?,
+                // A prompt's arguments carry no schema: every one is a string.
+                None => args::parse_pairs(form.pairs(), &Value::Null)?,
+            };
             let mut conn = dial(&store, &opts, &target)?;
             let mut result = conn
                 .session
@@ -2541,32 +2533,53 @@ fn run(cli: Cli) -> Result<u8, Failure> {
             tool,
             arguments,
         } => {
-            let arguments = read_json_arg(&arguments, "arguments").map_err(|e| {
-                Failure::hinted(
-                    e,
-                    json_arg_hint(
-                        &arguments,
-                        &format!("mcpdial call {} {tool}", shell_word(&target)),
-                        format!(
-                            "`mcpdial schema {} {tool}` shows what {tool} takes",
-                            shell_word(&target)
-                        ),
-                    ),
-                )
-            })?;
+            let form = args::form(&arguments)?;
+            // A JSON object is settled before anything is dialed, as it always
+            // was; pairs wait for the schema only an open session can supply.
+            let object = form
+                .json()
+                .map(|text| {
+                    read_json_arg(text, "arguments").map_err(|e| {
+                        Failure::hinted(
+                            e,
+                            json_arg_hint(
+                                text,
+                                &format!("mcpdial call {} {tool}", shell_word(&target)),
+                                format!(
+                                    "`mcpdial schema {} {tool}` shows what {tool} takes",
+                                    shell_word(&target)
+                                ),
+                            ),
+                        )
+                    })
+                })
+                .transpose()?;
             let r = client::resolve(&store, &target)?;
             refuse_denied(&r.config, &r.name, &tool)?;
             let mut conn = client::connect(&store, &r, &opts)?;
+            let prefix = format!("mcpdial call {}", shell_word(&target));
+            let tools_cmd = format!("`mcpdial tools {}`", shell_word(&target));
             let hint = |conn: &mut client::Connection, argument_error: bool| {
                 let tools = conn.list_tools().unwrap_or_default();
-                call_hint(
-                    &tools,
-                    &tool,
-                    argument_error,
-                    &format!("mcpdial call {}", shell_word(&target)),
-                    "'",
-                    &format!("`mcpdial tools {}`", shell_word(&target)),
-                )
+                call_hint(&tools, &tool, argument_error, &prefix, "'", &tools_cmd)
+            };
+            let arguments = match object {
+                Some(object) => object,
+                None => {
+                    let pairs = form.pairs();
+                    let tools = if args::needs_schema(pairs) {
+                        conn.list_tools().unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    let schema =
+                        find_tool(&tools, &tool).map_or(Value::Null, |t| t["inputSchema"].clone());
+                    args::parse_pairs(pairs, &schema).map_err(|e| Failure {
+                        error: e,
+                        hint: call_hint(&tools, &tool, true, &prefix, "'", &tools_cmd),
+                        tool: None,
+                    })?
+                }
             };
             let mut result = match conn.session.call_tool(&tool, arguments) {
                 Ok(result) => result,
