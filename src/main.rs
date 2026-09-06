@@ -67,6 +67,11 @@ struct Cli {
     #[arg(long, global = true)]
     plain: bool,
 
+    /// Print long output straight to the terminal instead of through a pager
+    /// (MCPDIAL_PAGER= does the same everywhere)
+    #[arg(long, global = true)]
+    no_pager: bool,
+
     /// Trace every message on stderr (and pass a stdio server's stderr through)
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -1914,7 +1919,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             let tools = shell_tools(&mut cache, &mut conn);
                             match find_tool(tools, rest) {
                                 Some(t) => {
-                                    print_value(ui, t, cli.json);
+                                    ui.paged(|| print_value(ui, t, cli.json));
                                     Ok(())
                                 }
                                 None => Err(no_such_tool(tools, rest)),
@@ -1922,15 +1927,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                         }
                     },
                     "info" => {
-                        print_value(ui, &conn.server_info, cli.json);
+                        ui.paged(|| print_value(ui, &conn.server_info, cli.json));
                         Ok(())
                     }
                     "tools" => conn.list_tools().map_err(Failure::from).map(|tools| {
                         if cli.json {
                             print_value(ui, &json!({ "tools": tools }), true);
                         } else {
-                            ui.line(&format!("{} tool(s):", tools.len()));
-                            print_tools(ui, &tools, long);
+                            listed(ui, long, || {
+                                ui.line(&format!("{} tool(s):", tools.len()));
+                                print_tools(ui, &tools, long);
+                            });
                         }
                         cache = Some(tools);
                     }),
@@ -1968,7 +1975,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 dir: save_dir,
                                 stem: resource_stem(rest),
                             };
-                            emit_resource(ui, &mut result, cli.json, true, &files, &redirect)
+                            ui.paged(|| {
+                                emit_resource(ui, &mut result, cli.json, true, &files, &redirect)
+                            })
                         }
                     },
                     "prompts" => match conn.session.list_prompts() {
@@ -2000,7 +2009,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         dir: save_dir,
                                         stem: file_stem(name),
                                     };
-                                    emit(ui, &mut result, cli.json, true, &files, render_messages)
+                                    ui.paged(|| {
+                                        emit(
+                                            ui,
+                                            &mut result,
+                                            cli.json,
+                                            true,
+                                            &files,
+                                            render_messages,
+                                        )
+                                    })
                                 })
                         }
                     }
@@ -2035,9 +2053,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         };
                                         rendered(&mut result, cli.json, &files, render_content).map(
                                             |out| {
-                                                let failed = print_tool_result(
-                                                    ui, &result, &out, cli.json, true,
-                                                );
+                                                let failed = ui.paged(|| {
+                                                    print_tool_result(
+                                                        ui, &result, &out, cli.json, true,
+                                                    )
+                                                });
                                                 if failed {
                                                     let argument_error =
                                                         reads_as_argument_error(&out);
@@ -2085,7 +2105,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             parse_object(params, "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
                                 .map_err(Failure::from)
-                                .map(|result| print_value(ui, &result, cli.json))
+                                .map(|result| ui.paged(|| print_value(ui, &result, cli.json)))
                         }
                     }
                     // Only reachable when line editing is off, since a terminal
@@ -2201,7 +2221,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     tool: None,
                 });
             };
-            print_json(ui, t);
+            ui.paged(|| print_json(ui, t));
             if t.get("outputSchema").is_some() {
                 ui.err_line("this tool declares an outputSchema: results carry structuredContent");
             }
@@ -2244,7 +2264,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: resource_stem(&uri),
             };
-            emit_resource(ui, &mut result, cli.json, false, &files, &redirect)?;
+            ui.paged(|| emit_resource(ui, &mut result, cli.json, false, &files, &redirect))?;
             Ok(0)
         }
 
@@ -2300,7 +2320,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 dir: save_dir,
                 stem: file_stem(&name),
             };
-            emit(ui, &mut result, cli.json, false, &files, render_messages)?;
+            ui.paged(|| emit(ui, &mut result, cli.json, false, &files, render_messages))?;
             Ok(0)
         }
 
@@ -2464,31 +2484,33 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 ui.err_line(NO_SERVERS);
                 return Ok(0);
             }
-            for (i, p) in probes.iter().enumerate() {
-                if i > 0 {
-                    ui.line("");
-                }
-                match &p.tools {
-                    Some(tools) => {
-                        ui.line(&format!(
-                            "## {}  {}  ({} tools)",
-                            p.name,
-                            p.server.as_deref().unwrap_or(""),
-                            tools.len()
-                        ));
-                        print_tools(ui, tools, long);
+            listed(ui, long, || {
+                for (i, p) in probes.iter().enumerate() {
+                    if i > 0 {
+                        ui.line("");
                     }
-                    None => ui.line(&format!(
-                        "## {}  {}{}",
-                        p.name,
-                        p.status.label(),
-                        p.status
-                            .detail()
-                            .map(|d| format!(": {}", truncate(d)))
-                            .unwrap_or_default()
-                    )),
+                    match &p.tools {
+                        Some(tools) => {
+                            ui.line(&format!(
+                                "## {}  {}  ({} tools)",
+                                p.name,
+                                p.server.as_deref().unwrap_or(""),
+                                tools.len()
+                            ));
+                            print_tools(ui, tools, long);
+                        }
+                        None => ui.line(&format!(
+                            "## {}  {}{}",
+                            p.name,
+                            p.status.label(),
+                            p.status
+                                .detail()
+                                .map(|d| format!(": {}", truncate(d)))
+                                .unwrap_or_default()
+                        )),
+                    }
                 }
-            }
+            });
             Ok(0)
         }
 
@@ -2506,8 +2528,10 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             if cli.json {
                 print_json(ui, &json!({ "tools": tools }));
             } else {
-                ui.line(&format!("{} tool(s):\n", tools.len()));
-                print_tools(ui, &tools, long);
+                listed(ui, long, || {
+                    ui.line(&format!("{} tool(s):\n", tools.len()));
+                    print_tools(ui, &tools, long);
+                });
             }
             Ok(0)
         }
@@ -2518,31 +2542,33 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             if cli.json {
                 print_json(ui, init);
             } else {
-                let si = &init["serverInfo"];
-                ui.line(&format!(
-                    "{} {}",
-                    si["name"].as_str().unwrap_or("?"),
-                    si["version"].as_str().unwrap_or("")
-                ));
-                ui.line(&format!(
-                    "protocol {}",
-                    init["protocolVersion"].as_str().unwrap_or("?")
-                ));
-                let caps: Vec<&str> = init["capabilities"]
-                    .as_object()
-                    .map(|o| o.keys().map(String::as_str).collect())
-                    .unwrap_or_default();
-                ui.line(&format!(
-                    "capabilities: {}",
-                    if caps.is_empty() {
-                        "(none)".into()
-                    } else {
-                        caps.join(", ")
+                ui.paged(|| {
+                    let si = &init["serverInfo"];
+                    ui.line(&format!(
+                        "{} {}",
+                        si["name"].as_str().unwrap_or("?"),
+                        si["version"].as_str().unwrap_or("")
+                    ));
+                    ui.line(&format!(
+                        "protocol {}",
+                        init["protocolVersion"].as_str().unwrap_or("?")
+                    ));
+                    let caps: Vec<&str> = init["capabilities"]
+                        .as_object()
+                        .map(|o| o.keys().map(String::as_str).collect())
+                        .unwrap_or_default();
+                    ui.line(&format!(
+                        "capabilities: {}",
+                        if caps.is_empty() {
+                            "(none)".into()
+                        } else {
+                            caps.join(", ")
+                        }
+                    ));
+                    if let Some(instr) = init["instructions"].as_str() {
+                        ui.line(&format!("\n{}", instr.trim()));
                     }
-                ));
-                if let Some(instr) = init["instructions"].as_str() {
-                    ui.line(&format!("\n{}", instr.trim()));
-                }
+                });
             }
             Ok(0)
         }
@@ -2619,7 +2645,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 stem: file_stem(&tool),
             };
             let text = rendered(&mut result, cli.json, &files, render_content)?;
-            let is_error = print_tool_result(ui, &result, &text, cli.json, false);
+            let is_error = ui.paged(|| print_tool_result(ui, &result, &text, cli.json, false));
             // A failed result that is really a schema complaint, or a server's way
             // of saying it has no such tool, gets the same answer as the JSON-RPC
             // error other servers would have sent.
@@ -2639,7 +2665,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let params = read_json_arg(&params, "params")?;
             let mut conn = dial(&store, &opts, &target)?;
             let result = conn.session.request(&method, Some(params))?;
-            print_json(ui, &result);
+            ui.paged(|| print_json(ui, &result));
             Ok(0)
         }
 
@@ -2941,6 +2967,16 @@ fn truncate(s: &str) -> String {
 
 fn print_tools(ui: &dyn Presenter, tools: &[Value], long: bool) {
     ui.named(tools, long, "parameters", &describe_params);
+}
+
+/// A `--long` listing reads like a document and may run past the screen; the
+/// short one is a summary that belongs on it.
+fn listed(ui: &dyn Presenter, long: bool, print: impl FnOnce()) {
+    if long {
+        ui.paged(print);
+    } else {
+        print();
+    }
 }
 
 fn print_prompts(ui: &dyn Presenter, prompts: &[Value], long: bool) {
