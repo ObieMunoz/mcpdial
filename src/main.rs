@@ -13,7 +13,8 @@ use mcpdial::session::{
 };
 use mcpdial::transport::trace::Trace;
 use mcpdial::{
-    daemon, oauth, Credential, Elicit, Error, KnownVersion, Level, ServerConfig, Store, USER_AGENT,
+    daemon, keychain, oauth, Backend, Credential, Elicit, Error, KnownVersion, Level, ServerConfig,
+    Store, USER_AGENT,
 };
 use notices::Notices;
 use output::{As, Output, Payload};
@@ -543,6 +544,19 @@ enum Cmd {
     /// Manage saved tokens without the browser
     #[command(subcommand)]
     Token(TokenCmd),
+    /// Show or change how mcpdial itself behaves
+    #[command(subcommand)]
+    Config(ConfigCmd),
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show where saved tokens are kept, or move them: `file` (default) or `keychain`
+    Credentials {
+        /// The store to move every saved token into. Omit to show the current one.
+        #[arg(value_name = "STORE", value_parser = ["file", "keychain"])]
+        store: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3270,27 +3284,36 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             let Some(cred) = store.credential(&key)? else {
                 return Err(Error::config(format!("no credential saved for {key}")).into());
             };
+            // Where it is kept earns its line only once that is not the default,
+            // which is also the only time reading it off `token show` tells anyone
+            // anything they could not assume.
+            let backend = store.backend()?;
+            let elsewhere = (backend != Backend::File).then(|| backend.label());
             if cli.json {
-                // Metadata only. The secrets never leave the file through this path.
-                print_json(
-                    ui,
-                    &json!({
-                        "name": key,
-                        "has_access_token": cred.has_token(),
-                        "has_refresh_token": cred.refresh_token.is_some(),
-                        "expires_at": cred.expires_at,
-                        "expired": cred.is_expired(),
-                        "scope": cred.scope,
-                        "source": cred.source,
-                        "client_id": cred.client_id,
-                        "registration": cred.registration,
-                        "has_client_secret": cred.client_secret.is_some(),
-                        "issuer": cred.issuer,
-                        "token_endpoint": cred.token_endpoint,
-                    }),
-                );
+                // Metadata only. The secrets never leave the store through this path.
+                let mut shown = json!({
+                    "name": key,
+                    "has_access_token": cred.has_token(),
+                    "has_refresh_token": cred.refresh_token.is_some(),
+                    "expires_at": cred.expires_at,
+                    "expired": cred.is_expired(),
+                    "scope": cred.scope,
+                    "source": cred.source,
+                    "client_id": cred.client_id,
+                    "registration": cred.registration,
+                    "has_client_secret": cred.client_secret.is_some(),
+                    "issuer": cred.issuer,
+                    "token_endpoint": cred.token_endpoint,
+                });
+                if let Some(label) = elsewhere {
+                    shown["backend"] = json!(label);
+                }
+                print_json(ui, &shown);
             } else {
                 ui.line(&key);
+                if let Some(label) = elsewhere {
+                    ui.line(&format!("  kept in:       {label}"));
+                }
                 ui.line(&format!(
                     "  access token:  {}",
                     if cred.has_token() { "present" } else { "none" }
@@ -3338,6 +3361,54 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             }
             Ok(0)
         }
+
+        Cmd::Config(ConfigCmd::Credentials { store: chosen }) => {
+            let Some(chosen) = chosen else {
+                let (backend, source) = match store.forced_backend() {
+                    Some(forced) => (forced?, keychain::ENV_BACKEND),
+                    None => match store.saved_backend()? {
+                        Some(saved) => (saved, "config.json"),
+                        None => (Backend::default(), "default"),
+                    },
+                };
+                if cli.json {
+                    print_json(
+                        ui,
+                        &json!({ "credentials": backend.label(), "source": source }),
+                    );
+                } else {
+                    ui.line(&format!("{} ({source})", backend.label()));
+                }
+                return Ok(0);
+            };
+            let to = Backend::parse(&chosen)?;
+            let moved = store.use_backend(to)?;
+            if cli.json {
+                print_json(ui, &json!({ "credentials": to.label(), "moved": moved }));
+            } else {
+                ui.err_line(&match moved {
+                    None => format!("credentials are already kept in {}", credential_store(to)),
+                    Some(0) => format!(
+                        "credentials are kept in {} now; there were none to move",
+                        credential_store(to)
+                    ),
+                    Some(n) => format!(
+                        "moved {n} credential{} to {}",
+                        if n == 1 { "" } else { "s" },
+                        credential_store(to)
+                    ),
+                });
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// How a credential store is named in a sentence.
+fn credential_store(backend: Backend) -> &'static str {
+    match backend {
+        Backend::File => "credentials.json",
+        Backend::Keychain => "the OS keychain",
     }
 }
 

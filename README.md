@@ -971,6 +971,7 @@ host config, and `add --registry` writes them for what an entry marks as require
 ```
 ~/.config/mcpdial/servers.json       what you configured (safe to share)
 ~/.config/mcpdial/credentials.json   tokens, refresh tokens, client ids (owner only)
+~/.config/mcpdial/config.json        how mcpdial behaves: where credentials are kept
 ~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
 ~/.config/mcpdial/registry/          a copy of the registry's list, for `search`
 ~/.config/mcpdial/run/NAME.sock      where a server kept running by `start` listens
@@ -997,6 +998,7 @@ Every environment variable mcpdial reads:
 | `MCPDIAL_TRACE=FILE` | `--trace FILE` on every command |
 | `MCPDIAL_REGISTRY=URL` | The registry `search` and `add --registry` consult |
 | `MCPDIAL_CATALOG=URL` | A URL or a file to read the catalog from, instead of the official list |
+| `MCPDIAL_CREDENTIALS=file\|keychain` | Where tokens are kept, whatever `config.json` says |
 
 A flag on the command line beats its variable, which beats the built-in default. The
 `=1` ones are off when unset, empty or `0`, and on for anything else. A
@@ -1006,6 +1008,39 @@ typo that silently left every call on 60 seconds would never be found.
 "Owner only" is mode 0600 on unix. On Windows it is an access list naming the account
 that ran `login`, applied as the file is created rather than after, so the tokens are
 never on disk under the permissions the profile directory hands down.
+
+### Keeping tokens in the OS keychain instead
+
+An owner-only file is still a plaintext file, readable by anything else running as
+you. If that is not good enough, move the tokens into the keychain the system
+already has:
+
+```
+mcpdial config credentials keychain   # moves every saved token in, deletes the file
+mcpdial config credentials            # says which store is in use, and why
+mcpdial config credentials file       # moves them back out again
+```
+
+Each credential becomes one item under the service `mcpdial` with the server's name
+as the account: the macOS keychain through `security`, the Secret Service
+(GNOME Keyring, KWallet) through `secret-tool`, and the Windows Credential Manager
+through its own API. No crate is added for any of it and the binary stays one file.
+Every command reads and writes tokens the same way whichever store is in use;
+`token show` names the keychain when that is where the token is.
+
+Switching stores copies before it deletes, so an interrupted move leaves every
+credential in at least one of the two and running the command again finishes it.
+`MCPDIAL_CREDENTIALS=file` overrides the setting for one run, which is how a CI job
+holds itself to the file whatever the config directory it inherited says; the
+setting cannot be changed while that variable is set, since the change would not
+take effect.
+
+Where there is no keychain - a headless Linux session with no Secret Service, or no
+`secret-tool` installed - `mcpdial config credentials keychain` fails and changes
+nothing. It never falls back to the file quietly: the file is where you just said
+not to put the token. On macOS, the first use of an item by a given binary raises
+the keychain's own permission dialog, and a `cargo install` upgrade puts the binary
+at a new path, so it asks again.
 
 ## Exit codes
 

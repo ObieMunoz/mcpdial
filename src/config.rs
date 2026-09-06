@@ -5,6 +5,7 @@
 //! ```text
 //! servers.json      what you configured: transport, URL or command, headers
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
+//! config.json       how mcpdial itself behaves: where credentials are kept
 //! probes.json       what `ls` last saw: one status per server, with its timestamp
 //! run/NAME.sock     where a server kept alive by `start` listens, see [`crate::daemon`]
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
@@ -12,8 +13,12 @@
 //!
 //! Tokens live in a separate file so `servers.json` can be shared or committed and
 //! the secret-bearing file can stay private: mode 0600 on unix, and on Windows a
-//! discretionary access list naming the owning account alone.
+//! discretionary access list naming the owning account alone. That file is the
+//! default and stays it; [`Store::use_backend`] moves the same credentials into the
+//! OS keychain instead, and every reader below goes through the same four methods
+//! either way, so nothing above this module knows which store answered.
 
+use crate::keychain::{self, Backend};
 use crate::protocol::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -410,6 +415,13 @@ struct CredentialsFile {
     credentials: BTreeMap<String, Credential>,
 }
 
+/// What `config.json` holds: how mcpdial behaves, not what it was told to dial.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConfigFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credentials: Option<String>,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ProbesFile {
     #[serde(default)]
@@ -452,6 +464,9 @@ impl Store {
     }
     pub fn credentials_path(&self) -> PathBuf {
         self.dir.join("credentials.json")
+    }
+    pub fn config_path(&self) -> PathBuf {
+        self.dir.join("config.json")
     }
     /// Where the interactive shell keeps its line history. A saved server gets
     /// its own file, since the tool names recalled there are its own; ad-hoc
@@ -512,33 +527,172 @@ impl Store {
 
     // -- credentials ---------------------------------------------------------
 
+    /// Where credentials are kept: `MCPDIAL_CREDENTIALS` when it is set, else what
+    /// `config.json` records, else the file. The variable comes first so a CI job
+    /// can hold a run to the file whatever config directory it inherited.
+    pub fn backend(&self) -> Result<Backend> {
+        match self.forced_backend() {
+            Some(forced) => forced,
+            None => Ok(self.saved_backend()?.unwrap_or_default()),
+        }
+    }
+
+    /// The backend `MCPDIAL_CREDENTIALS` demands, if it demands one.
+    pub fn forced_backend(&self) -> Option<Result<Backend>> {
+        let set = std::env::var(keychain::ENV_BACKEND)
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        Some(
+            Backend::parse(&set)
+                .map_err(|e| Error::config(format!("{}: {e}", keychain::ENV_BACKEND))),
+        )
+    }
+
+    /// The backend `config.json` records, ignoring the environment, and `None`
+    /// when it records none.
+    pub fn saved_backend(&self) -> Result<Option<Backend>> {
+        match read_json::<ConfigFile>(&self.config_path())?.credentials {
+            Some(saved) => Backend::parse(&saved)
+                .map(Some)
+                .map_err(|e| Error::config(format!("{}: {e}", self.config_path().display()))),
+            None => Ok(None),
+        }
+    }
+
     pub fn credentials(&self) -> Result<BTreeMap<String, Credential>> {
-        Ok(read_json::<CredentialsFile>(&self.credentials_path())?.credentials)
+        match self.backend()? {
+            Backend::File => {
+                Ok(read_json::<CredentialsFile>(&self.credentials_path())?.credentials)
+            }
+            Backend::Keychain => {
+                let mut all = BTreeMap::new();
+                for account in keychain::accounts()? {
+                    if let Some(cred) = keychain_credential(&account)? {
+                        all.insert(account, cred);
+                    }
+                }
+                Ok(all)
+            }
+        }
     }
 
     pub fn credential(&self, name: &str) -> Result<Option<Credential>> {
-        Ok(self.credentials()?.remove(name))
+        match self.backend()? {
+            Backend::File => Ok(read_json::<CredentialsFile>(&self.credentials_path())?
+                .credentials
+                .remove(name)),
+            Backend::Keychain => keychain_credential(name),
+        }
     }
 
     /// Insert or replace one credential, leaving every other entry alone even
     /// if another thread or another mcpdial is saving at the same moment.
     pub fn save_credential(&self, name: &str, cred: Credential) -> Result<()> {
-        let path = self.credentials_path();
-        let _lock = FileLock::acquire(&path)?;
-        let mut file = read_json::<CredentialsFile>(&path)?;
-        file.credentials.insert(name.to_string(), cred);
-        write_json(&path, &file, true)
+        match self.backend()? {
+            Backend::File => {
+                let path = self.credentials_path();
+                let _lock = FileLock::acquire(&path)?;
+                let mut file = read_json::<CredentialsFile>(&path)?;
+                file.credentials.insert(name.to_string(), cred);
+                write_json(&path, &file, true)
+            }
+            // One item per credential, so there is no whole-file rewrite for a
+            // second writer to lose an entry to, and no lock to take.
+            Backend::Keychain => keychain::set(name, &encode_credential(&cred)),
+        }
     }
 
     pub fn remove_credential(&self, name: &str) -> Result<bool> {
+        match self.backend()? {
+            Backend::File => {
+                let path = self.credentials_path();
+                let _lock = FileLock::acquire(&path)?;
+                let mut file = read_json::<CredentialsFile>(&path)?;
+                let removed = file.credentials.remove(name).is_some();
+                if removed {
+                    write_json(&path, &file, true)?;
+                }
+                Ok(removed)
+            }
+            Backend::Keychain => keychain::delete(name),
+        }
+    }
+
+    /// Move every saved credential to `to` and record the choice, and report how
+    /// many moved - or `None` when `to` is already where they are kept.
+    ///
+    /// The order is what makes this safe to interrupt: copy into the new store,
+    /// record the switch, and only then drop what the old one held. A failure
+    /// anywhere leaves a credential in at least one of the two, never in neither,
+    /// and running the command again finishes the job.
+    pub fn use_backend(&self, to: Backend) -> Result<Option<usize>> {
+        if let Some(forced) = self.forced_backend() {
+            let forced = forced?;
+            return Err(Error::usage(format!(
+                "{}={} is set, so the saved setting would not take effect; \
+                 unset it to change where credentials are kept",
+                keychain::ENV_BACKEND,
+                forced.label()
+            )));
+        }
+        if self.saved_backend()?.unwrap_or_default() == to {
+            return Ok(None);
+        }
+        if to == Backend::Keychain {
+            keychain::check()?;
+        }
         let path = self.credentials_path();
         let _lock = FileLock::acquire(&path)?;
-        let mut file = read_json::<CredentialsFile>(&path)?;
-        let removed = file.credentials.remove(name).is_some();
-        if removed {
-            write_json(&path, &file, true)?;
-        }
-        Ok(removed)
+        let moved = match to {
+            Backend::Keychain => {
+                let file = read_json::<CredentialsFile>(&path)?.credentials;
+                for (name, cred) in &file {
+                    keychain::set(name, &encode_credential(cred))?;
+                }
+                self.record_backend(to)?;
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // The tokens are in the keychain and the setting says so, so
+                    // this is not a failed move; it is a plaintext copy left where
+                    // the user just asked for there not to be one, and the only
+                    // thing that can be done about it is to say so.
+                    Err(e) => {
+                        return Err(Error::config(format!(
+                            "credentials moved to the keychain, but {} could not be \
+                             removed: {e}. Delete it yourself; the tokens in it still work",
+                            path.display()
+                        )))
+                    }
+                }
+                file.len()
+            }
+            Backend::File => {
+                let accounts = keychain::accounts()?;
+                let mut file = read_json::<CredentialsFile>(&path)?;
+                let mut moved = 0;
+                for account in &accounts {
+                    if let Some(cred) = keychain_credential(account)? {
+                        file.credentials.insert(account.clone(), cred);
+                        moved += 1;
+                    }
+                }
+                write_json(&path, &file, true)?;
+                self.record_backend(to)?;
+                for account in &accounts {
+                    keychain::delete(account)?;
+                }
+                moved
+            }
+        };
+        Ok(Some(moved))
+    }
+
+    fn record_backend(&self, to: Backend) -> Result<()> {
+        let path = self.config_path();
+        let mut file = read_json::<ConfigFile>(&path)?;
+        file.credentials = Some(to.label().to_string());
+        write_json(&path, &file, false)
     }
 
     // -- remembered probes ---------------------------------------------------
@@ -568,6 +722,25 @@ impl Store {
             write_json(&path, &file, false)?;
         }
         Ok(())
+    }
+}
+
+/// One credential as its keychain item holds it: compact, so it is one line with
+/// no newline of its own for a keychain tool to cut it short at.
+fn encode_credential(cred: &Credential) -> String {
+    serde_json::to_string(cred).expect("a credential is serializable")
+}
+
+/// What the keychain holds for `account`, read back as a credential.
+///
+/// An item that will not parse is named and never quoted: the thing that failed to
+/// parse is a token.
+fn keychain_credential(account: &str) -> Result<Option<Credential>> {
+    match keychain::get(account)? {
+        Some(item) => serde_json::from_str(&item)
+            .map(Some)
+            .map_err(|_| keychain::not_a_credential(account)),
+        None => Ok(None),
     }
 }
 
@@ -1487,5 +1660,144 @@ mod tests {
         cred.client_secret = Some("s".into());
         cred.token_endpoint = None;
         assert!(!cred.can_refresh());
+    }
+
+    /// A credentials file written before mcpdial recorded the issuer, which is the
+    /// shape most existing installs still have on disk.
+    const OLD_SHAPE: &str = r#"{
+  "credentials": {
+    "wiki": { "access_token": "t", "refresh_token": "r" }
+  }
+}
+"#;
+
+    #[test]
+    fn an_existing_credentials_file_is_read_with_no_config_file() {
+        let s = temp_store();
+        fs::create_dir_all(&s.dir).unwrap();
+        fs::write(s.credentials_path(), OLD_SHAPE).unwrap();
+
+        assert_eq!(s.backend().unwrap(), Backend::File);
+        assert!(s.saved_backend().unwrap().is_none());
+        let cred = s.credential("wiki").unwrap().unwrap();
+        assert_eq!(cred.access_token.as_deref(), Some("t"));
+        assert!(cred.issuer.is_none(), "the old shape has no issuer");
+        assert_eq!(s.credentials().unwrap().len(), 1);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_credential_store_names_where_it_was_read() {
+        let s = temp_store();
+        fs::create_dir_all(&s.dir).unwrap();
+        fs::write(s.config_path(), "{ \"credentials\": \"vault\" }\n").unwrap();
+
+        let message = s.backend().unwrap_err().to_string();
+        assert!(message.contains("config.json"), "{message}");
+        assert!(message.contains("vault"), "{message}");
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn the_keychain_holds_what_the_file_held_and_hands_it_back() {
+        let _keychain = crate::keychain::fake::exclusive();
+        let s = temp_store();
+        fs::create_dir_all(&s.dir).unwrap();
+        fs::write(s.credentials_path(), OLD_SHAPE).unwrap();
+        s.save_credential(
+            "work",
+            Credential {
+                access_token: Some("w".into()),
+                issuer: Some("https://as.example".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(s.use_backend(Backend::Keychain).unwrap(), Some(2));
+        assert_eq!(s.backend().unwrap(), Backend::Keychain);
+        assert!(
+            !s.credentials_path().exists(),
+            "the file goes once the keychain has every entry"
+        );
+
+        let moved = s.credentials().unwrap();
+        assert_eq!(moved.len(), 2);
+        assert_eq!(moved["wiki"].refresh_token.as_deref(), Some("r"));
+        assert!(moved["wiki"].issuer.is_none());
+        assert_eq!(moved["work"].issuer.as_deref(), Some("https://as.example"));
+
+        // And back out again, byte for byte the same credentials.
+        assert_eq!(s.use_backend(Backend::File).unwrap(), Some(2));
+        assert_eq!(s.backend().unwrap(), Backend::File);
+        assert!(crate::keychain::accounts().unwrap().is_empty());
+        assert_eq!(s.credentials().unwrap(), moved);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn keychain_mode_writes_no_credentials_file() {
+        let _keychain = crate::keychain::fake::exclusive();
+        let s = temp_store();
+        s.use_backend(Backend::Keychain).unwrap();
+
+        s.add_server("wiki", ServerConfig::http("https://mcp.deepwiki.com/mcp"))
+            .unwrap();
+        s.save_credential(
+            "wiki",
+            Credential {
+                access_token: Some("t".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(!s.credentials_path().exists());
+        assert!(s.credential("wiki").unwrap().unwrap().has_token());
+
+        // The next login stamps the issuer onto a credential that had none.
+        s.save_credential(
+            "wiki",
+            Credential {
+                access_token: Some("t".into()),
+                issuer: Some("https://as.example".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.credential("wiki").unwrap().unwrap().issuer.as_deref(),
+            Some("https://as.example")
+        );
+
+        assert!(s.remove_server("wiki").unwrap());
+        assert!(
+            s.credential("wiki").unwrap().is_none(),
+            "removing a server drops its keychain item too"
+        );
+        assert!(!s.remove_credential("wiki").unwrap());
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn choosing_the_store_already_in_use_moves_nothing() {
+        let _keychain = crate::keychain::fake::exclusive();
+        let s = temp_store();
+        assert_eq!(s.use_backend(Backend::File).unwrap(), None);
+        assert_eq!(s.use_backend(Backend::Keychain).unwrap(), Some(0));
+        assert_eq!(s.use_backend(Backend::Keychain).unwrap(), None);
+        fs::remove_dir_all(&s.dir).unwrap();
+    }
+
+    #[test]
+    fn a_keychain_item_that_is_not_a_credential_is_named_not_printed() {
+        let _keychain = crate::keychain::fake::exclusive();
+        let s = temp_store();
+        s.use_backend(Backend::Keychain).unwrap();
+        crate::keychain::set("wiki", "sk-not-json-and-secret").unwrap();
+
+        let message = s.credential("wiki").unwrap_err().to_string();
+        assert!(message.contains("wiki"), "{message}");
+        assert!(!message.contains("sk-not-json-and-secret"), "{message}");
+        fs::remove_dir_all(&s.dir).unwrap();
     }
 }
