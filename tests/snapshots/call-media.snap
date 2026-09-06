@@ -1,0 +1,6 @@
+$ mcpdial call echo shot
+exit 0
+--- stdout
+done
+[image image/png, 4 KB]
+--- stderr

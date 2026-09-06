@@ -1,0 +1,5 @@
+$ mcpdial add box --catalog box --no-probe
+exit 0
+--- stdout
+--- stderr
+saved box (stdio uvx acme-box==1.0)

@@ -1,0 +1,6 @@
+$ mcpdial resources echo
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32601: Method not found: resources/list
+this server offers no resources; `mcpdial info echo` lists what it does offer.

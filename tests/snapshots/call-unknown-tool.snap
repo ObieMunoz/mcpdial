@@ -1,0 +1,6 @@
+$ mcpdial call web nope
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32602: Tool nope not found
+`mcpdial tools web` lists all 2 tools on this server.

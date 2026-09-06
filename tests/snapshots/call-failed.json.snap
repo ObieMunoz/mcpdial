@@ -1,0 +1,14 @@
+$ mcpdial --json call web fail
+exit 1
+--- stdout
+{
+  "content": [
+    {
+      "text": "it failed",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}
+--- stderr
+{"hint":"`mcpdial tools web` lists all 2 tools on this server."}

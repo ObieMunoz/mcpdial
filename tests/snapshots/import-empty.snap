@@ -1,0 +1,6 @@
+$ mcpdial import HOME/empty-config.json
+exit 0
+--- stdout
+--- stderr
+HOME/empty-config.json: no servers
+imported 0 server(s)

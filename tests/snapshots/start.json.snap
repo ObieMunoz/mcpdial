@@ -1,0 +1,9 @@
+$ mcpdial --json start echo --idle 60
+exit 0
+--- stdout
+{
+  "name": "echo",
+  "pid": PID,
+  "socket": "HOME/run/echo.sock"
+}
+--- stderr

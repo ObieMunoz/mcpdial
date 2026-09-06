@@ -1,0 +1,5 @@
+$ mcpdial --json search zzz
+exit 1
+--- stdout
+[]
+--- stderr

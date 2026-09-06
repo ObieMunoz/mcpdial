@@ -1,0 +1,17 @@
+$ mcpdial --json token show work
+exit 0
+--- stdout
+{
+  "client_id": "conf-client",
+  "expired": false,
+  "expires_at": TIME,
+  "has_access_token": true,
+  "has_client_secret": true,
+  "has_refresh_token": false,
+  "name": "work",
+  "registration": "pre-registered",
+  "scope": "mcp",
+  "source": "client_credentials",
+  "token_endpoint": "http://127.0.0.1:PORT2/token"
+}
+--- stderr

@@ -1,0 +1,7 @@
+$ mcpdial import HOME/host-config.json
+exit 0
+--- stdout
+--- stderr
+  add  imported         http http://127.0.0.1:PORT/mcp  [mcpServers in HOME/host-config.json]
+  add  local            stdio ECHO_SERVER --flag  [mcpServers in HOME/host-config.json]
+imported 2 server(s)

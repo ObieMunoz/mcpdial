@@ -1,0 +1,64 @@
+$ mcpdial --json tools fs --all
+exit 0
+--- stdout
+{
+  "tools": [
+    {
+      "description": "Echo a message back.",
+      "inputSchema": {
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "echo"
+    },
+    {
+      "denied": true,
+      "description": "Always returns a tool error.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "fail"
+    },
+    {
+      "description": "How many times this process has been asked.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "count"
+    },
+    {
+      "denied": true,
+      "description": "Rejects bad arguments in a failed result.",
+      "inputSchema": {
+        "properties": {
+          "pageId": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "pageId"
+        ],
+        "type": "object"
+      },
+      "name": "strict"
+    },
+    {
+      "description": "A text block, then a 4 KB image block.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "shot"
+    }
+  ]
+}
+--- stderr

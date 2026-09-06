@@ -1,0 +1,147 @@
+$ mcpdial --json ls --no-probe
+exit 0
+--- stdout
+[
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "uvx acme-box==1.0",
+    "name": "box",
+    "running": false,
+    "source": {
+      "registry": "io.github.acme/box",
+      "version": "1.0"
+    },
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "cat",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER",
+    "name": "echo",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "npx -y @acme/files@1.2.0 /srv",
+    "name": "files",
+    "running": false,
+    "source": {
+      "registry": "io.github.acme/files",
+      "version": "1.2.0"
+    },
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [
+      "fail",
+      "strict"
+    ],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER",
+    "name": "fs",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {
+      "X-From": "import"
+    },
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "imported",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER --flag",
+    "name": "local",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "slow",
+    "running": false,
+    "source": null,
+    "timeout": 5.0,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "web",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT2/mcp",
+    "name": "work",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  }
+]
+--- stderr

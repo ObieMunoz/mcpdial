@@ -1,0 +1,5 @@
+$ mcpdial --json call web echo {message:hi}
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"the shell removed the double quotes; single quotes keep them:\n  mcpdial call web echo '{\"message\": \"hi\"}'","kind":"usage","message":"arguments must be a JSON object like {\"key\": \"value\"}; \"{message:hi}\" is one with its double quotes missing (did you mean {\"message\": \"hi\"}?)"}}

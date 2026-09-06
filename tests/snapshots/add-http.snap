@@ -1,0 +1,5 @@
+$ mcpdial add web --http http://127.0.0.1:PORT/mcp --no-probe
+exit 0
+--- stdout
+--- stderr
+saved web (http http://127.0.0.1:PORT/mcp)

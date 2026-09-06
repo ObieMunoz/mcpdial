@@ -10,6 +10,13 @@ repository = "https://github.com/ObieMunoz/mcpdial"
 keywords = ["mcp", "model-context-protocol", "json-rpc", "cli", "oauth"]
 categories = ["command-line-utilities", "development-tools"]
 
+[features]
+default = ["rich"]
+# The terminal presentation, and every crate it comes to need. Without it the
+# binary is the agent surface alone: `Rich` is not compiled and output is
+# always `Plain`.
+rich = []
+
 [dependencies]
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }

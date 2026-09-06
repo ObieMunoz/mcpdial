@@ -1,0 +1,5 @@
+$ mcpdial start echo --idle 60
+exit 0
+--- stdout
+--- stderr
+started echo (pid PID)

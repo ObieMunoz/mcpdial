@@ -1,0 +1,12 @@
+$ mcpdial --json call echo echo {"message":"hi"}
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: hi",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

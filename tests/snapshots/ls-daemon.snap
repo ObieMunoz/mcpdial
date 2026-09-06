@@ -1,0 +1,13 @@
+$ mcpdial ls --no-probe
+exit 0
+--- stdout
+NAME      TYPE   AUTH  TIMEOUT  DAEMON   LOCATION
+cat       http   -     -        -        http://127.0.0.1:PORT/mcp
+echo      stdio  -     -        running  ECHO_SERVER
+fs        stdio  -     -        -        ECHO_SERVER
+imported  http   -     -        -        http://127.0.0.1:PORT/mcp
+local     stdio  -     -        -        ECHO_SERVER --flag
+slow      http   -     5s       -        http://127.0.0.1:PORT/mcp
+web       http   -     -        -        http://127.0.0.1:PORT/mcp
+work      http   -     -        -        http://127.0.0.1:PORT2/mcp
+--- stderr

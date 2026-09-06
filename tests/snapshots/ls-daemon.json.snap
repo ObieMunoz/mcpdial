@@ -1,0 +1,115 @@
+$ mcpdial --json ls --no-probe
+exit 0
+--- stdout
+[
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "cat",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER",
+    "name": "echo",
+    "running": true,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [
+      "fail",
+      "strict"
+    ],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER",
+    "name": "fs",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {
+      "X-From": "import"
+    },
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "imported",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "stdio",
+    "location": "ECHO_SERVER --flag",
+    "name": "local",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "slow",
+    "running": false,
+    "source": null,
+    "timeout": 5.0,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT/mcp",
+    "name": "web",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  },
+  {
+    "allow": [],
+    "credential": false,
+    "deny": [],
+    "headers": {},
+    "kind": "http",
+    "location": "http://127.0.0.1:PORT2/mcp",
+    "name": "work",
+    "running": false,
+    "source": null,
+    "timeout": null,
+    "token_env": null
+  }
+]
+--- stderr

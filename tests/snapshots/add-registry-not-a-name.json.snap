@@ -1,0 +1,5 @@
+$ mcpdial --json add bad --registry files
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"a registry name is the entry's own `name`, like io.github.owner/server","kind":"usage","message":"\"files\" is not a registry name"}}

@@ -1,0 +1,5 @@
+$ mcpdial --json token rm work
+exit 0
+--- stdout
+{"removed_credential":"work"}
+--- stderr

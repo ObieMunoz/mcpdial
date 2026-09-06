@@ -1,0 +1,15 @@
+$ mcpdial prompts web --long
+exit 0
+--- stdout
+2 prompt(s):
+
+summarize
+    Summarize a document.
+  arguments:
+    text (required) - What to summarize
+    style - terse or thorough
+
+greet
+    Greet someone.
+
+--- stderr

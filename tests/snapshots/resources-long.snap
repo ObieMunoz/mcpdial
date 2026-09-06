@@ -1,0 +1,22 @@
+$ mcpdial resources web --long
+exit 0
+--- stdout
+2 resource(s):
+
+file:///readme.md
+    The project readme.
+    Second line.
+    type: text/markdown
+
+file:///logo.png
+    A tiny picture.
+    type: image/png
+
+
+1 template(s):
+
+file:///notes/{name}.md
+    One note, by name.
+    type: text/markdown
+
+--- stderr

@@ -1,0 +1,13 @@
+$ mcpdial --json read web file:///readme.md
+exit 0
+--- stdout
+{
+  "contents": [
+    {
+      "mimeType": "text/markdown",
+      "text": "# fake-mcp\nA readme.\n",
+      "uri": "file:///readme.md"
+    }
+  ]
+}
+--- stderr

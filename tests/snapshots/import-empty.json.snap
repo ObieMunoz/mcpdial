@@ -1,0 +1,5 @@
+$ mcpdial --json import HOME/empty-config.json
+exit 0
+--- stdout
+{"imported":[],"skipped":[]}
+--- stderr

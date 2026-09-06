@@ -1,0 +1,5 @@
+$ mcpdial --json token show work
+exit 2
+--- stdout
+--- stderr
+{"error":{"kind":"config","message":"no credential saved for work"}}

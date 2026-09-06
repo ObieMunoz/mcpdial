@@ -1,0 +1,5 @@
+$ mcpdial search zzz
+exit 1
+--- stdout
+--- stderr
+no registry entry matches "zzz"

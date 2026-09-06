@@ -1,0 +1,5 @@
+$ mcpdial add echo --stdio ECHO_SERVER --no-probe
+exit 0
+--- stdout
+--- stderr
+saved echo (stdio ECHO_SERVER)

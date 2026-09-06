@@ -1,0 +1,5 @@
+$ mcpdial --json prompt web summarize {text:memo}
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"the shell removed the double quotes; single quotes keep them:\n  mcpdial prompt web summarize '{\"text\": \"memo\"}'","kind":"usage","message":"arguments must be a JSON object like {\"key\": \"value\"}; \"{text:memo}\" is one with its double quotes missing (did you mean {\"text\": \"memo\"}?)"}}

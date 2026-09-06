@@ -1,0 +1,6 @@
+$ mcpdial add bad --registry files
+exit 2
+--- stdout
+--- stderr
+error: "files" is not a registry name
+a registry name is the entry's own `name`, like io.github.owner/server

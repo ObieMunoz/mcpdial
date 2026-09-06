@@ -1,0 +1,5 @@
+$ mcpdial add web --http http://127.0.0.1:PORT/mcp --no-probe
+exit 2
+--- stdout
+--- stderr
+error: web is already saved (http http://127.0.0.1:PORT/mcp); pass --force to replace it

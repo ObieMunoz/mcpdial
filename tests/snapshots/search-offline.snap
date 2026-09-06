@@ -1,0 +1,7 @@
+$ mcpdial search fake --offline
+exit 0
+--- stdout
+NAME                   TRANSPORTS  SOURCE    DESCRIPTION
+io.github.acme/remote  http, sse   catalog   The fake server, reached over HTTP.
+io.github.acme/legacy  sse         registry  The fake server, listed as SSE only.
+--- stderr

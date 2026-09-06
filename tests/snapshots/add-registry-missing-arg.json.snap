@@ -1,0 +1,5 @@
+$ mcpdial --json add bad --registry io.github.acme/files
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"pass each with --arg VALUE, in this order:\n  directory (required): Directory to serve","kind":"usage","message":"io.github.acme/files needs 1 value(s) this command was not given"}}

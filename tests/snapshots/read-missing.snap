@@ -1,0 +1,5 @@
+$ mcpdial read web file:///nope
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32002: Resource not found: file:///nope

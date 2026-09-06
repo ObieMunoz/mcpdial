@@ -1,0 +1,14 @@
+$ mcpdial token show work
+exit 0
+--- stdout
+work
+  access token:  present
+  expiry:        expires in 1m
+  refresh token: none
+  source:        client_credentials
+  scope:         mcp
+  client id:     conf-client
+  registered:    out of band (--client-id)
+  client secret: present (client_secret_post)
+  token url:     http://127.0.0.1:PORT2/token
+--- stderr

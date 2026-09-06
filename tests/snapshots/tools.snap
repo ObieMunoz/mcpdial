@@ -1,0 +1,8 @@
+$ mcpdial tools web
+exit 0
+--- stdout
+2 tool(s):
+
+  echo                         Echo a message back.
+  add                          Add two numbers.
+--- stderr

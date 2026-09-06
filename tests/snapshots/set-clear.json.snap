@@ -1,0 +1,5 @@
+$ mcpdial --json set fs --clear-allow
+exit 0
+--- stdout
+{"saved":{"allow":[],"deny":["fail","strict"],"kind":"stdio","location":"ECHO_SERVER","name":"fs"}}
+--- stderr

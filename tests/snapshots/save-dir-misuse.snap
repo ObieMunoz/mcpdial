@@ -1,0 +1,5 @@
+$ mcpdial --save-dir HOME/saved ls
+exit 2
+--- stdout
+--- stderr
+error: --save-dir applies to call, prompt, read and shell

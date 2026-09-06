@@ -1,0 +1,17 @@
+$ mcpdial --json token show work
+exit 0
+--- stdout
+{
+  "client_id": null,
+  "expired": false,
+  "expires_at": null,
+  "has_access_token": true,
+  "has_client_secret": false,
+  "has_refresh_token": false,
+  "name": "work",
+  "registration": null,
+  "scope": null,
+  "source": "manual",
+  "token_endpoint": null
+}
+--- stderr

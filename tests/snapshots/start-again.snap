@@ -1,0 +1,5 @@
+$ mcpdial start echo --idle 60
+exit 2
+--- stdout
+--- stderr
+error: echo is already running

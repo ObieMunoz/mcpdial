@@ -1,0 +1,14 @@
+$ mcpdial --json set fs
+exit 0
+--- stdout
+{
+  "allow": [
+    "echo",
+    "co*"
+  ],
+  "deny": [
+    "fail"
+  ],
+  "name": "fs"
+}
+--- stderr

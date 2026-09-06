@@ -27,6 +27,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The agent surface has to be the same bytes with the terminal presentation
+      # compiled out. A test target on its own does not build the examples, and
+      # the contract test spawns one, so they are built first.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo build --no-default-features --examples
+      - run: cargo test --no-default-features --test contract
 
   msrv:
     runs-on: ubuntu-latest

@@ -1,0 +1,5 @@
+$ mcpdial --json raw web nope/method
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32601,"kind":"rpc","message":"MCP error -32601: Method not found: nope/method"}}

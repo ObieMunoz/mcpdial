@@ -1,0 +1,5 @@
+$ mcpdial prompt web nope
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32602: Prompt nope not found

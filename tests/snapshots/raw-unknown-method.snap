@@ -1,0 +1,5 @@
+$ mcpdial raw web nope/method
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32601: Method not found: nope/method

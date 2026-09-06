@@ -1,0 +1,5 @@
+$ mcpdial call web add a=40 b=2
+exit 0
+--- stdout
+The sum of 40 and 2 is 42.
+--- stderr

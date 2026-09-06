@@ -1,0 +1,18 @@
+$ mcpdial tools web --long
+exit 0
+--- stdout
+2 tool(s):
+
+echo
+    Echo a message back.
+    Second line.
+  parameters:
+    message: string (required) - What to echo
+
+add
+    Add two numbers.
+  parameters:
+    a: number (required)
+    b: number (required)
+
+--- stderr

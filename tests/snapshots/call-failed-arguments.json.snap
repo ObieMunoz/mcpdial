@@ -1,0 +1,14 @@
+$ mcpdial --json call echo strict {}
+exit 1
+--- stdout
+{
+  "content": [
+    {
+      "text": "MCP error -32602: Invalid arguments for tool strict: Required at pageId",
+      "type": "text"
+    }
+  ],
+  "isError": true
+}
+--- stderr
+{"hint":"usage: mcpdial call echo strict '{\"pageId\": <number>}'\n   or: mcpdial call echo strict pageId=<number>\n  pageId: number (required)"}

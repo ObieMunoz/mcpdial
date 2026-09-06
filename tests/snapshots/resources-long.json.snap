@@ -1,0 +1,28 @@
+$ mcpdial --json resources web --long
+exit 0
+--- stdout
+{
+  "resourceTemplates": [
+    {
+      "description": "One note, by name.",
+      "mimeType": "text/markdown",
+      "name": "note",
+      "uriTemplate": "file:///notes/{name}.md"
+    }
+  ],
+  "resources": [
+    {
+      "description": "The project readme.\nSecond line.",
+      "mimeType": "text/markdown",
+      "name": "readme",
+      "uri": "file:///readme.md"
+    },
+    {
+      "description": "A tiny picture.",
+      "mimeType": "image/png",
+      "name": "logo",
+      "uri": "file:///logo.png"
+    }
+  ]
+}
+--- stderr

@@ -1,0 +1,7 @@
+$ mcpdial info web
+exit 0
+--- stdout
+fake-mcp 1.0
+protocol 2025-06-18
+capabilities: prompts, resources, tools
+--- stderr

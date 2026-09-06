@@ -1,0 +1,62 @@
+$ mcpdial --json tools echo
+exit 0
+--- stdout
+{
+  "tools": [
+    {
+      "description": "Echo a message back.",
+      "inputSchema": {
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "echo"
+    },
+    {
+      "description": "Always returns a tool error.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "fail"
+    },
+    {
+      "description": "How many times this process has been asked.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "count"
+    },
+    {
+      "description": "Rejects bad arguments in a failed result.",
+      "inputSchema": {
+        "properties": {
+          "pageId": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "pageId"
+        ],
+        "type": "object"
+      },
+      "name": "strict"
+    },
+    {
+      "description": "A text block, then a 4 KB image block.",
+      "inputSchema": {
+        "properties": {},
+        "type": "object"
+      },
+      "name": "shot"
+    }
+  ]
+}
+--- stderr

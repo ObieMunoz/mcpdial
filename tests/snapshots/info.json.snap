@@ -1,0 +1,16 @@
+$ mcpdial --json info web
+exit 0
+--- stdout
+{
+  "capabilities": {
+    "prompts": {},
+    "resources": {},
+    "tools": {}
+  },
+  "protocolVersion": "2025-06-18",
+  "serverInfo": {
+    "name": "fake-mcp",
+    "version": "1.0"
+  }
+}
+--- stderr

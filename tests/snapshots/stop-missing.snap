@@ -1,0 +1,5 @@
+$ mcpdial stop echo
+exit 2
+--- stdout
+--- stderr
+error: echo is not running

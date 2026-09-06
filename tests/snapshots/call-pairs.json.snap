@@ -1,0 +1,15 @@
+$ mcpdial --json call web add a=40 b=2
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "The sum of 40 and 2 is 42.",
+      "type": "text"
+    }
+  ],
+  "structuredContent": {
+    "sum": 42.0
+  }
+}
+--- stderr

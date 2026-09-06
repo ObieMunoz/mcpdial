@@ -1,0 +1,15 @@
+$ mcpdial catalog
+exit 0
+--- stdout
+Docs and search
+  remote  Acme Remote  http   none     The fake server, from the registry
+
+Databases
+  box     Acme Box     stdio  env      A sandbox, as a Python package
+
+Local files
+  files   Acme Files   stdio  env      Serve one directory; the entry leaves the directory to the user
+  fake    Fake         http   none     The fake server, by its URL
+--- stderr
+
+add one with: mcpdial add NAME --catalog ID

@@ -1,0 +1,12 @@
+$ mcpdial --json call echo count
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "count=2",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

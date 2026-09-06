@@ -1,0 +1,15 @@
+$ mcpdial ls --no-probe
+exit 0
+--- stdout
+NAME      TYPE   AUTH  SOURCE                TIMEOUT  LOCATION
+box       stdio  -     io.github.acme/box    -        uvx acme-box==1.0
+cat       http   -     -                     -        http://127.0.0.1:PORT/mcp
+echo      stdio  -     -                     -        ECHO_SERVER
+files     stdio  -     io.github.acme/files  -        npx -y @acme/files@1.2.0 /srv
+fs        stdio  -     -                     -        ECHO_SERVER
+imported  http   -     -                     -        http://127.0.0.1:PORT/mcp
+local     stdio  -     -                     -        ECHO_SERVER --flag
+slow      http   -     -                     5s       http://127.0.0.1:PORT/mcp
+web       http   -     -                     -        http://127.0.0.1:PORT/mcp
+work      http   -     -                     -        http://127.0.0.1:PORT2/mcp
+--- stderr

@@ -1,0 +1,9 @@
+$ mcpdial token show work
+exit 0
+--- stdout
+work
+  access token:  present
+  expiry:        no expiry recorded
+  refresh token: none
+  source:        manual
+--- stderr

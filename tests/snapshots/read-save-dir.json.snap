@@ -1,0 +1,14 @@
+$ mcpdial --json --save-dir HOME/saved-json read web file:///logo.png
+exit 0
+--- stdout
+{
+  "contents": [
+    {
+      "bytes": 8,
+      "mimeType": "image/png",
+      "path": "HOME/saved-json/logo-1.png",
+      "uri": "file:///logo.png"
+    }
+  ]
+}
+--- stderr

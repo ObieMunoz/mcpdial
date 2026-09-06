@@ -1,0 +1,23 @@
+$ mcpdial --json prompt web summarize {"text":"a memo"}
+exit 0
+--- stdout
+{
+  "description": "Summarize a document.",
+  "messages": [
+    {
+      "content": {
+        "text": "Summarize this: a memo",
+        "type": "text"
+      },
+      "role": "user"
+    },
+    {
+      "content": {
+        "text": "Sure.",
+        "type": "text"
+      },
+      "role": "assistant"
+    }
+  ]
+}
+--- stderr

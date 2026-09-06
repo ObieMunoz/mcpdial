@@ -1,0 +1,6 @@
+$ mcpdial read web file:///readme.md
+exit 0
+--- stdout
+# fake-mcp
+A readme.
+--- stderr

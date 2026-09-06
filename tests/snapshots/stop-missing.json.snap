@@ -1,0 +1,5 @@
+$ mcpdial --json stop echo
+exit 2
+--- stdout
+--- stderr
+{"error":{"kind":"usage","message":"echo is not running"}}

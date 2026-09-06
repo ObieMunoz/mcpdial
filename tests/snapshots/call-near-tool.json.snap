@@ -1,0 +1,5 @@
+$ mcpdial --json call web ecoh
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32602,"hint":"did you mean echo? `mcpdial tools web` lists all 2.","kind":"rpc","message":"MCP error -32602: Tool ecoh not found"}}

@@ -1,0 +1,5 @@
+$ mcpdial call web add a=1 {}
+exit 2
+--- stdout
+--- stderr
+error: arguments are one JSON object or a list of key=value pairs, not both at once

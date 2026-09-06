@@ -1,0 +1,5 @@
+$ mcpdial --save-dir HOME/saved read web file:///logo.png
+exit 0
+--- stdout
+[resource saved to HOME/saved/logo-1.png, 8 B]
+--- stderr

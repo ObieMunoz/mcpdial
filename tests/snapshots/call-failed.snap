@@ -1,0 +1,7 @@
+$ mcpdial call web fail
+exit 1
+--- stdout
+it failed
+--- stderr
+(tool reported an error)
+`mcpdial tools web` lists all 2 tools on this server.

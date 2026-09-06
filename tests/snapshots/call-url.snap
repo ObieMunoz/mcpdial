@@ -1,0 +1,5 @@
+$ mcpdial call http://127.0.0.1:PORT/mcp echo {"message":"ad hoc"}
+exit 0
+--- stdout
+Echo: ad hoc
+--- stderr

@@ -162,9 +162,16 @@ Global flags: `--json` for machine output, `-v` to trace every message on stderr
 `--timeout SECS`, `-H` for extra headers, `--token-env VAR` to force a token from the
 environment, `--user-agent` to override the default browser UA, `--protocol-version
 VERSION` to name one MCP revision instead of working out which the server speaks,
-`--no-daemon` to dial a server afresh even while `start` has one running, and
+`--no-daemon` to dial a server afresh even while `start` has one running,
 `--no-retry` to fail on the first transient HTTP failure instead of sending the
-request once more.
+request once more, and `--plain` (or `MCPDIAL_PLAIN=1`) to print at a terminal
+exactly what a pipe would get.
+
+What a pipe gets is frozen. Everything mcpdial prints goes through one of two
+presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
+`MCPDIAL_PLAIN` and for `TERM=dumb`, is the same bytes release after release, and
+`Rich`, chosen only for a person at a terminal, is the one place the output may
+differ. A snapshot test holds `Plain` to its word; see Development below.
 
 `--timeout` bounds every wait: the flag on the command line, else the timeout saved
 with the server, else 60 seconds. `add --timeout SECS` saves one for a server that
@@ -744,7 +751,25 @@ real browser UA.
 cargo test            # unit tests plus end-to-end tests against a fake MCP + OAuth server
 cargo clippy --all-targets
 cargo run --example echo_server   # the smallest real stdio MCP server, used by the tests
+cargo build --no-default-features # the agent-only binary: no terminal presentation at all
 ```
+
+The terminal presentation lives behind the default-on `rich` cargo feature, which is
+where any crate it comes to need belongs; `--no-default-features` builds a binary that
+prints the piped form everywhere.
+
+`tests/contract.rs` runs every command in the list above, under a pipe and under
+`--json`, and compares exit code, stdout and stderr with the files under
+`tests/snapshots/`. A change there fails the test, on purpose: what a program or an
+agent reads from mcpdial is the contract. When a change to it is intended, regenerate
+the files and read the diff before committing it:
+
+```bash
+MCPDIAL_UPDATE_SNAPSHOTS=1 cargo test --test contract
+```
+
+and say in the pull request that the contract changed and why. A pull request about
+how things look at a terminal should never need to.
 
 ### Cutting a release
 
