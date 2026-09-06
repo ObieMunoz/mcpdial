@@ -66,7 +66,11 @@ once and every command carries it.
    it with a `note:` line on stderr and dials. Unix only: on Windows `start` exits 2.
 5. **Add what is missing.** `mcpdial catalog --json` lists a reviewed set of servers,
    each with an `id`, a `category`, a `transport` and an `auth` (`none`, `oauth`,
-   `api-key`, `env`); `mcpdial add NAME --catalog ID` saves one. Beyond the catalog,
+   `api-key`, `env`); `mcpdial add NAME --catalog ID` saves one, recording the id
+   under the row's `source` so that a second name for the same entry is exit 2 without
+   `--force`. `mcpdial browse` is the same list as a checklist for a person at a
+   terminal; under a pipe or `--json` it prints exactly what `catalog --json` prints
+   (`browse --all --json` the registry's own objects), never a picker. Beyond the catalog,
    `mcpdial search QUERY --json` prints the MCP registry's entries matching every
    word of the query, ranked (catalog entries first, then an exact name or title,
    the official `io.github.<vendor>` namespace, title, name and description

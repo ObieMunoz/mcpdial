@@ -12,6 +12,7 @@ exit 0
     "name": "box",
     "running": false,
     "source": {
+      "catalog": "box",
       "registry": "io.github.acme/box",
       "version": "1.0"
     },
@@ -27,7 +28,9 @@ exit 0
     "location": "http://127.0.0.1:PORT/mcp",
     "name": "cat",
     "running": false,
-    "source": null,
+    "source": {
+      "catalog": "fake"
+    },
     "timeout": null,
     "token_env": null
   },

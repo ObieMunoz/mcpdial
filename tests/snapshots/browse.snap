@@ -1,0 +1,44 @@
+$ mcpdial browse
+exit 0
+--- stdout
+[
+  {
+    "id": "remote",
+    "name": "Acme Remote",
+    "category": "Docs and search",
+    "summary": "The fake server, from the registry",
+    "registry": "io.github.acme/remote",
+    "transport": "http",
+    "auth": "none"
+  },
+  {
+    "id": "box",
+    "name": "Acme Box",
+    "category": "Databases",
+    "summary": "A sandbox, as a Python package",
+    "registry": "io.github.acme/box",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "files",
+    "name": "Acme Files",
+    "category": "Local files",
+    "summary": "Serve one directory; the entry leaves the directory to the user",
+    "registry": "io.github.acme/files",
+    "transport": "stdio",
+    "auth": "env"
+  },
+  {
+    "id": "fake",
+    "name": "Fake",
+    "category": "Local files",
+    "summary": "The fake server, by its URL",
+    "config": {
+      "http": "http://127.0.0.1:PORT/mcp"
+    },
+    "transport": "http",
+    "auth": "none"
+  }
+]
+--- stderr

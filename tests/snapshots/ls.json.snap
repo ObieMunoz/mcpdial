@@ -11,7 +11,9 @@ exit 0
     "location": "http://127.0.0.1:PORT/mcp",
     "name": "cat",
     "running": false,
-    "source": null,
+    "source": {
+      "catalog": "fake"
+    },
     "timeout": null,
     "token_env": null
   },

@@ -367,6 +367,9 @@ pub struct Resolved {
     /// Required values the entry leaves to the user that no `--arg` supplied, one
     /// description per entry. Non-empty means the config must not be saved.
     pub missing: Vec<String>,
+    /// Every value the entry leaves to the user, required or not, described, in
+    /// the order `--arg` fills them; `missing` is the subset that still has none.
+    pub slots: Vec<String>,
 }
 
 /// The transports an entry offers, as the search table names them: `http`, `sse`,
@@ -400,6 +403,13 @@ fn list(v: &Value) -> &[Value] {
 /// Build the config an entry describes. `given` holds the `--arg` values, in the
 /// order the entry's user-supplied slots appear.
 pub fn convert(server: &Value, pick: &Pick, given: &[String]) -> Result<Resolved> {
+    let given: Vec<Option<String>> = given.iter().cloned().map(Some).collect();
+    convert_given(server, pick, &given)
+}
+
+/// [`convert`], where a `None` leaves that slot to its default as an absent
+/// `--arg` would, so a prompt can skip an optional value in the middle.
+pub fn convert_given(server: &Value, pick: &Pick, given: &[Option<String>]) -> Result<Resolved> {
     let remotes = list(&server["remotes"]);
     let streamable = remotes.iter().find(|r| r["type"] == "streamable-http");
     let sse = remotes.iter().find(|r| r["type"] == "sse");
@@ -475,6 +485,7 @@ pub fn convert(server: &Value, pick: &Pick, given: &[String]) -> Result<Resolved
         config,
         notes,
         missing: slots.missing,
+        slots: slots.seen,
     })
 }
 
@@ -500,7 +511,7 @@ fn provenance(server: &Value) -> Option<Source> {
 /// The values an entry leaves to the user: an argument without a `value`, or a
 /// `{variable}` inside one. `--arg` values fill them in the order they are met.
 struct Slots<'a> {
-    given: std::slice::Iter<'a, String>,
+    given: std::slice::Iter<'a, Option<String>>,
     /// Every slot met, described, in order.
     seen: Vec<String>,
     /// The required ones that got no value.
@@ -508,7 +519,7 @@ struct Slots<'a> {
 }
 
 impl<'a> Slots<'a> {
-    fn new(given: &'a [String]) -> Self {
+    fn new(given: &'a [Option<String>]) -> Self {
         Self {
             given: given.iter(),
             seen: Vec::new(),
@@ -526,6 +537,7 @@ impl<'a> Slots<'a> {
             .given
             .next()
             .cloned()
+            .flatten()
             .or_else(|| input["default"].as_str().map(String::from));
         let Some(value) = value else {
             if required {
@@ -1283,6 +1295,16 @@ mod tests {
         assert_eq!(
             argv(&r.config),
             ["npx", "-y", "pkg", "--port", "8080", "/data"]
+        );
+        assert_eq!(
+            r.slots,
+            ["--port (optional): Port to listen on", "root (optional)"]
+        );
+        let r = convert_given(&entry, &Pick::Any, &[None, Some("/data".into())]).unwrap();
+        assert_eq!(
+            argv(&r.config),
+            ["npx", "-y", "pkg", "/data"],
+            "a None skips the optional slot before the one given"
         );
 
         assert_eq!(encode("io.github.owner/server"), "io.github.owner%2Fserver");
