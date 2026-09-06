@@ -14,6 +14,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 /// Backstop for a server that mints a fresh cursor forever, which the
 /// repeated-cursor check below cannot catch.
@@ -469,6 +470,45 @@ impl<T: Transport> Session<T> {
             Some(json!({ "name": name, "arguments": arguments })),
             watch,
         )
+    }
+
+    /// The same call, run by the server in the background: the result is a task
+    /// object carrying an id, not the tool's own result, and
+    /// [`Self::task_result`] fetches that once the task is terminal.
+    ///
+    /// `ttl` is how long the server is asked to keep the task after it ends;
+    /// what it agreed to is in the `ttl` of the object it answers with.
+    pub fn call_tool_as_task(
+        &mut self,
+        name: &str,
+        arguments: Value,
+        ttl: Duration,
+    ) -> Result<Value> {
+        let ttl = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+        self.request(
+            "tools/call",
+            Some(json!({ "name": name, "arguments": arguments, "task": { "ttl": ttl } })),
+        )
+    }
+
+    /// One task's status, without waiting for it to change.
+    pub fn get_task(&mut self, id: &str) -> Result<Value> {
+        self.request("tasks/get", Some(json!({ "taskId": id })))
+    }
+
+    /// The result of the operation the task was started for, once it is
+    /// terminal. The server holds this request open until then, which is why it
+    /// takes a watcher: whatever it reports while we wait is worth showing.
+    pub fn task_result(&mut self, id: &str, watch: &mut dyn Watcher) -> Result<Value> {
+        self.request_watching("tasks/result", Some(json!({ "taskId": id })), watch)
+    }
+
+    pub fn list_tasks(&mut self) -> Result<Vec<Value>> {
+        self.list_paginated("tasks/list", "tasks")
+    }
+
+    pub fn cancel_task(&mut self, id: &str) -> Result<Value> {
+        self.request("tasks/cancel", Some(json!({ "taskId": id })))
     }
 
     pub fn list_resources(&mut self) -> Result<Vec<Value>> {

@@ -523,6 +523,26 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
             "call-plain-flag",
             &["--plain", "call", "web", "echo", r#"{"message":"plain"}"#],
         ),
+        // Background tasks. The saved `echo` server speaks 2025-11-25 and
+        // declares the utility only when it is told to, so the same target
+        // covers both a server that has tasks and one that does not.
+        Case::both(
+            "call-task",
+            &["call", "echo", "echo", r#"{"message":"as a task"}"#, "--task"],
+        )
+        .env("ECHO_SERVER_TASKS", "1"),
+        Case::both(
+            "call-task-required",
+            &["call", "echo", "slow", r#"{"message":"eventually"}"#],
+        )
+        .env("ECHO_SERVER_TASKS", "1"),
+        Case::both("call-detach-stdio", &["call", "echo", "echo", "{}", "--detach"])
+            .env("ECHO_SERVER_TASKS", "1"),
+        Case::both("tasks-none", &["tasks", "echo"]).env("ECHO_SERVER_TASKS", "1"),
+        Case::both("tasks-unknown", &["tasks", "echo", "get", "t-9"])
+            .env("ECHO_SERVER_TASKS", "1"),
+        Case::both("tasks-not-offered", &["tasks", "echo"]).env("ECHO_SERVER_TASKS", "none"),
+        Case::both("tasks-older-revision", &["tasks", "web"]),
         Case::both("raw", &["raw", "web", "tools/list"]),
         Case::both("raw-unknown-method", &["raw", "web", "nope/method"]),
         Case::both("read", &["read", "web", "file:///readme.md"]),

@@ -1,0 +1,5 @@
+$ mcpdial --json tasks web
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"`mcpdial info web` shows the agreed revision.","kind":"usage","message":"tasks arrived in 2025-11-25 and web is running on 2025-06-18"}}

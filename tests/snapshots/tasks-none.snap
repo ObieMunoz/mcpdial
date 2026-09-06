@@ -1,0 +1,5 @@
+$ mcpdial tasks echo
+exit 0
+--- stdout
+--- stderr
+no tasks running on echo

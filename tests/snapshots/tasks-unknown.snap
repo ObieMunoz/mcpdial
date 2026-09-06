@@ -1,0 +1,6 @@
+$ mcpdial tasks echo get t-9
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32602: Task t-9 not found
+t-9 is not a task echo is holding. `mcpdial tasks echo` lists the ones it is.

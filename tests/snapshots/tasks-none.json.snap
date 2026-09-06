@@ -1,0 +1,9 @@
+$ mcpdial --json tasks echo
+exit 0
+--- stdout
+{
+  "forgotten": [],
+  "server": "echo",
+  "tasks": []
+}
+--- stderr

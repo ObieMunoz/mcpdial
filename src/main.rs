@@ -42,6 +42,7 @@ mod pick;
 mod present;
 mod prompt;
 mod snapshot;
+mod tasks;
 
 const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
 const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
@@ -400,6 +401,15 @@ enum Cmd {
         /// With --check: hold TOOL to the object the snapshot holds
         #[arg(long, requires = "check")]
         strict: bool,
+        /// Have the server run TOOL in the background, and poll until it finishes
+        #[arg(long, conflicts_with = "detach")]
+        task: bool,
+        /// Start TOOL in the background, print the task id, and exit
+        #[arg(long)]
+        detach: bool,
+        /// Seconds the server is asked to keep a --task or --detach task for (default 3600)
+        #[arg(long, value_name = "SECS")]
+        ttl: Option<u64>,
     },
     /// Show one tool's name, description, and input and output schemas
     Schema {
@@ -446,6 +456,8 @@ enum Cmd {
         #[arg(long)]
         no_browser: bool,
     },
+    /// List the background tasks a server is running, or get, wait for, or cancel one
+    Tasks(tasks::Flags),
     /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
     Raw {
         #[arg(help = TARGET_HELP)]
@@ -735,6 +747,26 @@ fn print_tool_result(
         ui.err_line("(tool reported an error)");
     }
     Ok(failed)
+}
+
+/// A `tools/call` result on stdout, however it was fetched: the one the call
+/// waited for, and the one a finished task was holding. Returns whether the
+/// tool reported an error.
+fn printed_result(
+    ui: &dyn Presenter,
+    out: &Output,
+    result: &mut Value,
+    json: bool,
+    save_dir: Option<&Path>,
+    stem: &str,
+) -> Result<(bool, String), Failure> {
+    let files = MediaFiles {
+        dir: save_dir,
+        stem: file_stem(stem),
+    };
+    let text = rendered(ui, result, json, &files, render_content)?;
+    let failed = ui.paged(|| print_tool_result(ui, out, result, &text, json, false))?;
+    Ok((failed, text))
 }
 
 /// A result goes out as a document under `--json` and as the server's own text
@@ -2014,10 +2046,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
     if let Some(dir) = &cli.save_dir {
         let renders_media = matches!(
             cli.cmd,
-            Cmd::Call { .. } | Cmd::Prompt { .. } | Cmd::Read { .. } | Cmd::Shell { .. }
+            Cmd::Call { .. }
+                | Cmd::Prompt { .. }
+                | Cmd::Read { .. }
+                | Cmd::Shell { .. }
+                | Cmd::Tasks { .. }
         );
         if !renders_media {
-            return Err(Error::usage("--save-dir applies to call, prompt, read and shell").into());
+            return Err(
+                Error::usage("--save-dir applies to call, prompt, read, shell and tasks").into(),
+            );
         }
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::usage(format!("--save-dir {}: {e}", dir.display())))?;
@@ -3378,6 +3416,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             no_browser,
             check,
             strict,
+            task,
+            detach,
+            ttl,
         } => {
             let promised = check.as_deref().map(snapshot::read).transpose()?;
             opts.elicit = elicitation(ui, elicit.as_deref(), no_browser, cli.json, false)?;
@@ -3444,31 +3485,42 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 })?,
             };
             prompt::fill(ui, &schema, &mut arguments, &format!("{prefix} {tool}"))?;
-            let outcome = conn
-                .session
-                .call_tool_watching(&tool, arguments, &mut notices);
-            notices.finish();
+            let outcome = tasks::call(
+                ui,
+                &store,
+                &mut conn,
+                tasks::Wanted {
+                    tool: &tool,
+                    arguments,
+                    known: &tools,
+                },
+                tasks::planned(task, detach, ttl),
+                &mut notices,
+            );
             let mut result = match outcome {
-                Ok(result) => result,
+                Ok(tasks::Outcome::Result(result)) => result,
+                // Nothing ran to completion here: the id is the whole answer,
+                // and `mcpdial tasks TARGET` is what turns it back into one.
+                Ok(tasks::Outcome::Detached(started)) => {
+                    tasks::print_detached(ui, &started, cli.json);
+                    return Ok(0);
+                }
                 // The server said no; say what it wanted instead.
-                Err(e) => {
-                    let hint = server_refused(&e)
-                        .then(|| hint(&mut conn, is_argument_error(&e)))
-                        .flatten();
+                Err(f) => {
+                    let hint = f.hint.or_else(|| {
+                        server_refused(&f.error)
+                            .then(|| hint(&mut conn, is_argument_error(&f.error)))
+                            .flatten()
+                    });
                     return Err(Failure {
-                        error: e,
+                        error: f.error,
                         hint,
-                        tool: None,
+                        tool: f.tool,
                     });
                 }
             };
-            let files = MediaFiles {
-                dir: save_dir,
-                stem: file_stem(&tool),
-            };
-            let text = rendered(ui, &mut result, cli.json, &files, render_content)?;
-            let is_error =
-                ui.paged(|| print_tool_result(ui, &out, &result, &text, cli.json, false))?;
+            let (is_error, text) =
+                printed_result(ui, &out, &mut result, cli.json, save_dir, &tool)?;
             // A failed result that is really a schema complaint, or a server's way
             // of saying it has no such tool, gets the same answer as the JSON-RPC
             // error other servers would have sent.
@@ -3479,6 +3531,19 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             }
             Ok(if is_error { EXIT_ERROR } else { 0 })
         }
+
+        Cmd::Tasks(flags) => tasks::run(
+            ui,
+            &store,
+            &opts,
+            tasks::Printing {
+                out: &out,
+                save_dir,
+                json: cli.json,
+            },
+            &mut notices,
+            flags,
+        ),
 
         Cmd::Raw {
             target,
