@@ -201,6 +201,13 @@ pub trait Presenter {
             self.err_line(hint);
         }
     }
+
+    /// Stdout from here to `page_end` is one piece of output that may run past
+    /// the screen: a tool's result, a schema. A program gets every line as it
+    /// comes; a person gets a pager when it is taller than the terminal.
+    fn page_start(&self) {}
+
+    fn page_end(&self) {}
 }
 
 impl dyn Presenter {
@@ -211,8 +218,19 @@ impl dyn Presenter {
         if wants_plain(cli) {
             Box::new(Plain)
         } else {
-            rich()
+            rich(cli)
         }
+    }
+}
+
+impl dyn Presenter + '_ {
+    /// Runs `body` as one piece of output that may run past the screen; see
+    /// [`Presenter::page_start`]. The section ends however `body` returns.
+    pub fn paged<T>(&self, body: impl FnOnce() -> T) -> T {
+        self.page_start();
+        let result = body();
+        self.page_end();
+        result
     }
 }
 
@@ -224,13 +242,16 @@ fn wants_plain(cli: &Cli) -> bool {
 }
 
 #[cfg(feature = "rich")]
-fn rich() -> Box<dyn Presenter> {
-    Box::new(Rich::default())
+fn rich(cli: &Cli) -> Box<dyn Presenter> {
+    Box::new(Rich {
+        no_pager: cli.no_pager,
+        ..Rich::default()
+    })
 }
 
 /// Without the feature there is nothing but `Plain` to choose.
 #[cfg(not(feature = "rich"))]
-fn rich() -> Box<dyn Presenter> {
+fn rich(_cli: &Cli) -> Box<dyn Presenter> {
     Box::new(Plain)
 }
 
@@ -272,16 +293,27 @@ impl Presenter for Plain {
 #[derive(Default)]
 pub struct Rich {
     progressing: std::cell::Cell<bool>,
+    /// `--no-pager`.
+    no_pager: bool,
+    /// What the section since `page_start` has printed, until `page_end`
+    /// decides where it goes.
+    page: std::cell::RefCell<Option<Vec<u8>>>,
 }
 
 #[cfg(feature = "rich")]
 impl Presenter for Rich {
     fn out(&self, text: &str) {
-        Plain.out(text);
+        if !self.held(text.as_bytes()) {
+            Plain.out(text);
+        }
     }
 
     fn line(&self, line: &str) {
-        Plain.line(line);
+        if self.held(line.as_bytes()) {
+            self.held(b"\n");
+        } else {
+            Plain.line(line);
+        }
     }
 
     fn err(&self, text: &str) {
@@ -293,7 +325,32 @@ impl Presenter for Rich {
     }
 
     fn bytes(&self, bytes: &[u8]) -> Result<(), Error> {
-        Plain.bytes(bytes)
+        if self.held(bytes) {
+            Ok(())
+        } else {
+            Plain.bytes(bytes)
+        }
+    }
+
+    fn page_start(&self) {
+        self.page.borrow_mut().get_or_insert_with(Vec::new);
+    }
+
+    /// The section's output goes to the pager when there is one for it, and
+    /// straight out when there is not, or when the pager cannot be started.
+    fn page_end(&self) {
+        let Some(page) = self.page.borrow_mut().take() else {
+            return;
+        };
+        let screen = terminal_size();
+        let rows = rows_on(&String::from_utf8_lossy(&page), screen.map(|s| s.0));
+        let pager = pager_for(rows, screen.map(|s| s.1), self.no_pager, |name| {
+            std::env::var(name).ok()
+        });
+        if pager.is_some_and(|pager| run_pager(&pager, &page)) {
+            return;
+        }
+        Plain.bytes(&page).ok();
     }
 
     /// A pretty-printed document gets its keys, strings, numbers, booleans and
@@ -367,6 +424,201 @@ fn visible(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(feature = "rich")]
+impl Rich {
+    /// Keeps `bytes` for the page being collected; false when none is, and
+    /// they are to go straight out.
+    fn held(&self, bytes: &[u8]) -> bool {
+        match self.page.borrow_mut().as_mut() {
+            Some(page) => {
+                page.extend_from_slice(bytes);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The pager for output `rows` tall, in git's order: none under `--no-pager`,
+/// none where the screen's height is unknown (a pipe, or a console that will
+/// not say), none when the output fits above the prompt that follows it; else
+/// `MCPDIAL_PAGER`, else `PAGER`, else `less -RFX`. Either variable set but
+/// empty, or set to `cat`, means none too.
+#[cfg(feature = "rich")]
+fn pager_for(
+    rows: usize,
+    screen_rows: Option<usize>,
+    no_pager: bool,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    const DEFAULT_PAGER: &str = "less -RFX";
+    if no_pager || screen_rows.is_none_or(|screen| rows < screen) {
+        return None;
+    }
+    let pager = env("MCPDIAL_PAGER")
+        .or_else(|| env("PAGER"))
+        .unwrap_or_else(|| DEFAULT_PAGER.to_string());
+    let pager = pager.trim().to_string();
+    (!pager.is_empty() && pager != "cat").then_some(pager)
+}
+
+/// The rows `text` takes on a screen `cols` wide, counting the wrapping of
+/// long lines and not the SGR sequences that colour them. Without a width,
+/// one row per line.
+#[cfg(feature = "rich")]
+fn rows_on(text: &str, cols: Option<usize>) -> usize {
+    text.lines()
+        .map(|line| match cols {
+            Some(cols) if cols > 0 => visible_width(line).max(1).div_ceil(cols),
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Characters a line puts on the screen: every one but those inside an
+/// `ESC [ ... m` sequence.
+#[cfg(feature = "rich")]
+fn visible_width(line: &str) -> usize {
+    let mut width = 0;
+    let mut in_sgr = false;
+    for c in line.chars() {
+        match (in_sgr, c) {
+            (false, '\x1b') => in_sgr = true,
+            (false, _) => width += 1,
+            (true, 'm') => in_sgr = false,
+            (true, _) => {}
+        }
+    }
+    width
+}
+
+/// Runs `pager` on `page` and waits for it to exit, so that a prompt after it
+/// comes after it. False when it could not be started, in which case nothing
+/// has been printed. A command with no shell syntax in it is started directly,
+/// so that one that is not installed is found out here and not by a shell
+/// that would say so on stderr; anything else goes through the shell, as git
+/// does.
+#[cfg(feature = "rich")]
+fn run_pager(pager: &str, page: &[u8]) -> bool {
+    use std::process::{Command, Stdio};
+    let mut command = match shell_command(pager) {
+        Some(command) => command,
+        None => {
+            let mut words = pager.split_whitespace();
+            let Some(program) = words.next() else {
+                return false;
+            };
+            let mut command = Command::new(program);
+            command.args(words);
+            command
+        }
+    };
+    command.stdin(Stdio::piped());
+    // git sets the same, so that a bare `PAGER=less` keeps colour and stays
+    // on screen after it quits.
+    if std::env::var_os("LESS").is_none() {
+        command.env("LESS", "FRX");
+    }
+    std::io::stdout().flush().ok();
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        // A pager quit before the end closes its side; that is the reader
+        // done, not a failure.
+        stdin.write_all(page).ok();
+    }
+    child.wait().ok();
+    true
+}
+
+/// `pager` under the shell, when it has syntax that needs one: git's own test.
+#[cfg(feature = "rich")]
+fn shell_command(pager: &str) -> Option<std::process::Command> {
+    const SHELL_SYNTAX: &[char] = &[
+        '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', '*', '?', '[', '#', '~', '=',
+        '%',
+    ];
+    if !pager.contains(SHELL_SYNTAX) {
+        return None;
+    }
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let mut command = std::process::Command::new(shell);
+    command.arg(flag).arg(pager);
+    Some(command)
+}
+
+/// The terminal on stdout as (columns, rows), when it can be asked. The
+/// `ioctl` is declared here rather than through a crate: std links libc
+/// already, and this is the one call needed.
+#[cfg(all(feature = "rich", unix))]
+fn terminal_size() -> Option<(usize, usize)> {
+    use std::os::raw::{c_int, c_ulong};
+    #[repr(C)]
+    struct WinSize {
+        rows: u16,
+        cols: u16,
+        x_pixels: u16,
+        y_pixels: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    }
+    let mut size = WinSize {
+        rows: 0,
+        cols: 0,
+        x_pixels: 0,
+        y_pixels: 0,
+    };
+    // SAFETY: TIOCGWINSZ fills one `struct winsize`, which `WinSize` lays out
+    // as C does, and touches nothing else.
+    let rc = unsafe { ioctl(1, TIOCGWINSZ, &mut size as *mut WinSize) };
+    (rc == 0 && size.rows > 0).then_some((size.cols as usize, size.rows as usize))
+}
+
+/// Linux numbers its ioctls; the BSDs, and Darwin with them, encode the size
+/// of the struct in the request.
+#[cfg(all(
+    feature = "rich",
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+))]
+const TIOCGWINSZ: std::os::raw::c_ulong = 0x5413;
+#[cfg(all(feature = "rich", any(target_os = "solaris", target_os = "illumos")))]
+const TIOCGWINSZ: std::os::raw::c_ulong = 0x5468;
+#[cfg(all(
+    feature = "rich",
+    unix,
+    not(any(target_os = "solaris", target_os = "illumos")),
+    any(
+        not(any(target_os = "linux", target_os = "android")),
+        target_arch = "mips",
+        target_arch = "mips64",
+        target_arch = "powerpc",
+        target_arch = "powerpc64",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    )
+))]
+const TIOCGWINSZ: std::os::raw::c_ulong = 0x4008_7468;
+
+/// A console's height is not asked for, so nothing is paged on Windows.
+#[cfg(all(feature = "rich", not(unix)))]
+fn terminal_size() -> Option<(usize, usize)> {
+    None
 }
 
 pub fn truncate_at(s: &str, n: usize) -> String {
@@ -482,5 +734,118 @@ mod tests {
         assert!(Rich::default()
             .resource(&[ResourceBody::Text("ok".into())], "mcpdial read x y")
             .is_ok());
+    }
+
+    #[cfg(feature = "rich")]
+    fn env_of<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn output_is_paged_only_when_it_and_the_prompt_after_it_overflow_the_screen() {
+        let none = env_of(&[]);
+        assert_eq!(pager_for(10, Some(40), false, &none), None);
+        assert_eq!(pager_for(39, Some(40), false, &none), None);
+        assert_eq!(
+            pager_for(40, Some(40), false, &none).as_deref(),
+            Some("less -RFX")
+        );
+        assert_eq!(
+            pager_for(500, Some(40), false, &none).as_deref(),
+            Some("less -RFX")
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_pipe_and_no_pager_never_page() {
+        let none = env_of(&[]);
+        assert_eq!(pager_for(500, None, false, &none), None);
+        assert_eq!(pager_for(500, Some(40), true, &none), None);
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn the_pager_variables_are_read_in_gits_order_and_an_empty_one_disables() {
+        assert_eq!(
+            pager_for(500, Some(40), false, env_of(&[("PAGER", "more")])).as_deref(),
+            Some("more")
+        );
+        assert_eq!(
+            pager_for(
+                500,
+                Some(40),
+                false,
+                env_of(&[("MCPDIAL_PAGER", "bat -p"), ("PAGER", "more")])
+            )
+            .as_deref(),
+            Some("bat -p")
+        );
+        assert_eq!(
+            pager_for(
+                500,
+                Some(40),
+                false,
+                env_of(&[("MCPDIAL_PAGER", ""), ("PAGER", "more")])
+            ),
+            None
+        );
+        assert_eq!(
+            pager_for(500, Some(40), false, env_of(&[("PAGER", "")])),
+            None
+        );
+        assert_eq!(
+            pager_for(500, Some(40), false, env_of(&[("PAGER", "cat")])),
+            None
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn rows_count_wrapped_lines_and_not_colour() {
+        assert_eq!(rows_on("", Some(80)), 0);
+        assert_eq!(rows_on("one\ntwo\n", Some(80)), 2);
+        assert_eq!(rows_on("one\ntwo", Some(80)), 2);
+        assert_eq!(rows_on("one\n\nthree\n", Some(80)), 3);
+        assert_eq!(rows_on(&"x".repeat(81), Some(80)), 2);
+        assert_eq!(rows_on(&"x".repeat(160), Some(80)), 2);
+        assert_eq!(rows_on(&"x".repeat(161), Some(80)), 3);
+        assert_eq!(rows_on(&"x".repeat(1000), None), 1);
+        assert_eq!(
+            rows_on(&format!("\x1b[1m{}\x1b[0m", "x".repeat(80)), Some(80)),
+            1
+        );
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_pager_with_shell_syntax_gets_a_shell_and_a_plain_one_does_not() {
+        assert!(shell_command("less -RFX").is_none());
+        assert!(shell_command("bat -p").is_none());
+        assert!(shell_command("sed s/a/b/ | less").is_some());
+        assert!(shell_command("less --pattern='x'").is_some());
+    }
+
+    #[cfg(feature = "rich")]
+    #[test]
+    fn a_page_holds_stdout_until_it_ends_and_nothing_outside_it() {
+        let rich = Rich::default();
+        assert!(!rich.held(b"outside"));
+        rich.page_start();
+        rich.line("one");
+        rich.out("two ");
+        rich.text("three\r");
+        rich.bytes(b"four").unwrap();
+        // Taken here rather than through `page_end`, which would print it.
+        assert_eq!(
+            rich.page.borrow_mut().take().as_deref(),
+            Some(b"one\ntwo three\\r\nfour".as_slice())
+        );
+        assert!(!rich.held(b"outside"));
     }
 }

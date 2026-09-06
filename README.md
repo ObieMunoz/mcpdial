@@ -165,8 +165,9 @@ default browser UA (or `MCPDIAL_USER_AGENT`), `--protocol-version VERSION` to na
 MCP revision instead of working out which the server speaks,
 `--no-daemon` to dial a server afresh even while `start` has one running,
 `--no-retry` to fail on the first transient HTTP failure instead of sending the
-request once more, and `--plain` (or `MCPDIAL_PLAIN=1`) to print at a terminal
-exactly what a pipe would get.
+request once more, `--plain` (or `MCPDIAL_PLAIN=1`) to print at a terminal
+exactly what a pipe would get, and `--no-pager` to print long output straight to
+the terminal.
 
 What a pipe gets is frozen. Everything mcpdial prints goes through one of two
 presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
@@ -175,6 +176,13 @@ presenters: `Plain`, chosen for a pipe, for `--json`, for `--plain`, for
 differ: JSON (`schema`, `info`, `raw`, a tool's `structuredContent`) comes with its
 keys, strings, numbers, booleans and null in colour, which `NO_COLOR` turns off. A
 snapshot test holds `Plain` to its word; see Development below.
+
+At a terminal, the output of `call`, `read`, `prompt`, `raw`, `schema`, `tools
+--long` and `info` goes through a pager when it is taller than the screen, as
+`git log` does: `$MCPDIAL_PAGER`, else `$PAGER`, else `less -RFX`. The same holds
+for each command typed in `shell`, whose prompt returns when the pager exits.
+`--no-pager`, or `MCPDIAL_PAGER=` set empty, prints it straight; a pipe never
+pages, and a pager that cannot be started is skipped without a word.
 
 `--timeout` bounds every wait: the flag on the command line, else `MCPDIAL_TIMEOUT`,
 else the timeout saved with the server, else 60 seconds. `add --timeout SECS` saves one
