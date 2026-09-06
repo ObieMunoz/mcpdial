@@ -26,6 +26,10 @@
 //! errors are left out for the same reason, and `serve` because it is a
 //! server: it runs until it is killed, and what it prints comes from the
 //! library rather than the presenter.
+//!
+//! `call --help` is held as tightly as the rest, though. It is what a person
+//! reads before their first call, so a flag or a heading that moves it has to
+//! be a deliberate act too.
 
 mod common;
 
@@ -580,6 +584,7 @@ fn cases(contract: &Contract, url: &str, auth_url: &str) -> Vec<Case> {
         Case::both("login-stdio", &["login", "echo"]),
         Case::both("guide", &["guide"]),
         Case::both("completions", &["completions", "bash"]),
+        Case::both("call-help", &["call", "--help"]).only_piped(),
         // From the registry: saved without being run, and never probed.
         Case::each(
             "add-registry",

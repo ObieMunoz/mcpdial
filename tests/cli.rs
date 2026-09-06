@@ -1668,9 +1668,16 @@ fn completion_scripts_for_every_shell() {
     assert_eq!(o.code, 2);
     assert!(o.stdout.is_empty());
 
+    // Kept out of the command list, but named once among the examples, so
+    // that `--help` alone is enough to find it.
     let o = run(mcpdial(&home).args(["--help"]));
     assert_eq!(o.code, 0);
-    assert!(!o.stdout.contains("completions"), "{}", o.stdout);
+    let (before_examples, examples) = o.stdout.split_once("examples:").unwrap();
+    assert!(
+        !before_examples.contains("completions"),
+        "{before_examples}"
+    );
+    assert!(examples.contains("mcpdial completions SHELL"), "{examples}");
 }
 
 #[test]
