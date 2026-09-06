@@ -17,6 +17,9 @@
 //! `shot` tool answers with a 4 KB image block, the way a screenshot tool does.
 //! Set `ECHO_SERVER_PROMPTS=1` to add a `poster` prompt that does the same; without
 //! it the server implements no prompts, which other tests count on.
+//! Set `ECHO_SERVER_UNKNOWN_TOOL_RESULT=1` to answer a tool name it does not have
+//! with a failed *result*, `Unknown tool: NAME` under `isError`, the way DeepWiki
+//! does, instead of the `-32602` error the rest of the world sends.
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
@@ -34,6 +37,7 @@ fn main() {
     let hang = std::env::var_os("ECHO_SERVER_HANG").is_some();
     let ping = std::env::var_os("ECHO_SERVER_PING").is_some();
     let prompts = std::env::var_os("ECHO_SERVER_PROMPTS").is_some();
+    let unknown_tool_is_a_result = std::env::var_os("ECHO_SERVER_UNKNOWN_TOOL_RESULT").is_some();
     let tag = std::env::var("ECHO_SERVER_TAG").ok();
     let mut count = 0u32;
     let stdout = io::stdout();
@@ -171,6 +175,11 @@ fn main() {
                         json!({"content": [{"type": "text", "text": format!("count={count}")}]}),
                     )
                 }
+                other if unknown_tool_is_a_result => ok(
+                    id,
+                    json!({"isError": true, "content": [{"type": "text",
+                        "text": format!("Unknown tool: {other}")}]}),
+                ),
                 other => err(id, -32602, &format!("Tool {other} not found")),
             },
             other => err(id, -32601, &format!("Method not found: {other}")),

@@ -135,8 +135,8 @@ per parameter, so a retry needs no extra `schema` call:
 ```
 
 If the tool name itself is unknown, `hint` names the nearest one instead. Some servers
-report a schema violation as a *result* with `isError` and the `-32602` text in its
-content rather than as a JSON-RPC error; that case prints the same usage block on
+report a schema violation, or an unknown tool name, as a *result* with `isError` rather
+than as a JSON-RPC error; that case prints the same usage block or suggestion on
 **stderr**, as `{"hint":"usage: ..."}` with `--json`, leaving the result object on stdout
 untouched.
 
