@@ -436,8 +436,26 @@ pub fn shell_join(argv: &[String]) -> String {
 /// keys, basic and literal strings, arrays, inline tables, booleans, numbers and
 /// `#` comments. Multi-line strings, arrays of tables and dates are refused with
 /// a message rather than misread; a server entry has no use for them.
-mod toml {
+pub(crate) mod toml {
     use serde_json::{Map, Value};
+
+    /// The key of a `[table.header]` line, so `export --merge` can tell which
+    /// lines belong to a server's table; `None` for any other line.
+    pub fn table_header(line: &str) -> Option<Vec<String>> {
+        let mut p = Parser { s: line, i: 0 };
+        p.skip_ws();
+        if !p.eat('[') || p.peek() == Some('[') {
+            return None;
+        }
+        let path = p.key().ok()?;
+        p.skip_ws();
+        if !p.eat(']') {
+            return None;
+        }
+        p.skip_ws();
+        p.skip_comment();
+        (p.done() || p.eat_newline() && p.done()).then_some(path)
+    }
 
     pub fn parse(text: &str) -> Result<Value, String> {
         let mut p = Parser { s: text, i: 0 };

@@ -198,6 +198,17 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Print saved servers in a host's shape (Claude Code, Cursor, VS Code, Codex), for a redirect
+    Export {
+        /// Servers to export; none means every saved server
+        names: Vec<String>,
+        /// mcpservers (Claude Code, Claude Desktop, Cursor, Windsurf), vscode or codex
+        #[arg(long, value_name = "FORMAT", default_value = "mcpservers")]
+        format: mcpdial::export_config::Format,
+        /// A host's existing file: its entries are replaced or added and the rest is kept
+        #[arg(long, value_name = "FILE")]
+        merge: Option<std::path::PathBuf>,
+    },
     /// List the curated catalog of servers, grouped by category
     Catalog {
         /// Use the copy built into the binary instead of refreshing it
@@ -1835,6 +1846,34 @@ fn run(cli: Cli) -> Result<u8, Failure> {
                 println!("{receipt}");
             } else {
                 eprintln!("imported {} server(s)", imported.len());
+            }
+            Ok(0)
+        }
+
+        Cmd::Export {
+            names,
+            format,
+            merge,
+        } => {
+            use mcpdial::export_config::{self, Document};
+            let servers = store.servers()?;
+            let creds = store.credentials()?;
+            let existing = merge
+                .map(|path| {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| Error::config(format!("{}: {e}", path.display())))
+                })
+                .transpose()?;
+            let chosen = export_config::select(&servers, &names)?;
+            let has_saved_token =
+                |name: &str| creds.get(name).is_some_and(mcpdial::Credential::has_token);
+            let out = export_config::export(&chosen, has_saved_token, format, existing.as_deref())?;
+            match &out.document {
+                Document::Json(doc) => print_json(doc),
+                Document::Toml(text) => print_text(text),
+            }
+            for (name, note) in &out.notes {
+                print_hint(&format!("{name}: {note}"), cli.json);
             }
             Ok(0)
         }

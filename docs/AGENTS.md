@@ -58,6 +58,14 @@
    variables are saved as `${VAR}` placeholders and named on stderr, or under
    `saved.notes` with `--json`; they must be set before the server is dialed. Every
    command that changes what is saved prints a receipt with `--json`; see below.
+6. **Hand a working set to a host.** `mcpdial export [NAME...] [--format
+   mcpservers|vscode|codex] [--merge FILE]` prints the saved servers on stdout in the
+   host's own shape: the `mcpServers` object (Claude Code, Claude Desktop, Cursor,
+   Windsurf), VS Code's `servers`, or Codex's `[mcp_servers.NAME]` TOML. `--merge FILE`
+   splices them into the host's existing file and prints the whole; nothing is written
+   to disk, so redirect. Saved tokens are never exported; a server left without its
+   token, and any field the host has no place for, is named on stderr as a
+   `{"hint": "..."}` line under `--json`. A name that is not saved is exit 2.
 
 ## Passing arguments
 

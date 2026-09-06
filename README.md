@@ -125,6 +125,7 @@ mcpdial add NAME ... [--allow GLOB]... [--deny GLOB]...   offer some of a server
 mcpdial set NAME [--allow GLOB]... [--deny GLOB]... [--clear-allow] [--clear-deny]   change those lists; no flags shows them
 mcpdial search QUERY [--limit N] [--refresh] [--offline]   the MCP registry, ranked, from a local copy
 mcpdial import [FILE] [--from HOST] [--force]  pull servers from Claude, Cursor, Windsurf, VS Code, Codex, OpenCode configs
+mcpdial export [NAME...] [--format mcpservers|vscode|codex] [--merge FILE]   print them in a host's shape
 mcpdial rm NAME
 mcpdial catalog [--offline]      the reviewed list of servers, grouped by category
 
@@ -348,6 +349,46 @@ Codex's `config.toml` is read by a small reader of its own rather than a full TO
 parser: tables, dotted keys, strings, arrays, inline tables, booleans, numbers and
 comments, which is everything a server entry uses. A multi-line string, an array of
 tables or a date in the file is refused with its line number rather than misread.
+
+### Exporting to a host
+
+`mcpdial export` is the other direction: once `ls` shows which servers connect, it
+prints them in a host's shape on stdout, and you redirect. The default is the
+`mcpServers` object Claude Code, Claude Desktop, Cursor and Windsurf read; `--format
+vscode` writes VS Code's `servers` object with a `type` on each entry, and `--format
+codex` writes `[mcp_servers.NAME]` TOML tables. A stdio command line is split back
+into `command` and `args` by the same rules `--stdio` is split, so a quoted argument
+comes out as one element. With no names every saved server is exported; a name that
+is not saved is exit 2.
+
+```
+mcpdial export fs wiki > .mcp.json
+mcpdial export --format vscode --merge .vscode/mcp.json > mcp.json && mv mcp.json .vscode/mcp.json
+mcpdial export --format codex --merge ~/.codex/config.toml
+```
+
+`--merge FILE` takes the host's existing file, replaces or adds the exported entries
+under the right key, keeps everything else (VS Code's `inputs`, Codex's other tables,
+their comments) and prints the result; the file itself is never written, so the diff
+stays yours to review. A JSON file is re-printed by the JSON printer, which sorts its
+keys.
+
+Nothing secret is written. A saved token stays in `credentials.json`: the server is
+exported without it and a line on stderr says so (`wiki: exported without its saved
+token; the host will need its own login`), since the host will run its own login. A
+`token_env` is what a host can hold: Codex gets `bearer_token_env_var`, VS Code gets
+`"Authorization": "Bearer ${env:VAR}"`, and the `mcpServers` shape gets `"Bearer
+${VAR}"` with a note, because Claude Code expands that and Claude Desktop, Cursor and
+Windsurf do not. `${VAR}` placeholders in a command line, `env` or headers are written
+as they are.
+
+What a shape has a field for is kept, and what it has not is dropped and named on
+stderr: a `timeout` becomes `timeout` in the `mcpServers` shape and Codex's
+`startup_timeout_sec` and `tool_timeout_sec`, and is dropped for VS Code; `allow` and
+`deny` lists become Codex's `enabled_tools` and `disabled_tools` when they are plain
+tool names, and are dropped otherwise; a saved `protocol_version` is dropped for every
+host, which offers its own; `source` is provenance, not config, and is not exported.
+Under `--json` each note is a `{"hint": "..."}` line on stderr, and stdout is unchanged.
 
 ### Adding from the catalog
 
