@@ -1,0 +1,5 @@
+$ mcpdial login echo
+exit 2
+--- stdout
+--- stderr
+error: login only applies to HTTP servers; stdio servers need no token

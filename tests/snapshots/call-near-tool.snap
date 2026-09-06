@@ -1,0 +1,6 @@
+$ mcpdial call web ecoh
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32602: Tool ecoh not found
+did you mean echo? `mcpdial tools web` lists all 2.

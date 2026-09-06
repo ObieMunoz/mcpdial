@@ -1,0 +1,5 @@
+$ mcpdial --json call web nope
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32602,"hint":"`mcpdial tools web` lists all 2 tools on this server.","kind":"rpc","message":"MCP error -32602: Tool nope not found"}}

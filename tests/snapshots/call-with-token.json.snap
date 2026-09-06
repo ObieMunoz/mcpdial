@@ -1,0 +1,12 @@
+$ mcpdial --json call work echo {"message":"authorized"}
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: authorized",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

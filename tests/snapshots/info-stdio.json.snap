@@ -1,0 +1,14 @@
+$ mcpdial --json info echo
+exit 0
+--- stdout
+{
+  "capabilities": {
+    "tools": {}
+  },
+  "protocolVersion": "2025-06-18",
+  "serverInfo": {
+    "name": "echo-server",
+    "version": "0.0.1"
+  }
+}
+--- stderr

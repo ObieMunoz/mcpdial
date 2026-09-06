@@ -1,0 +1,7 @@
+$ mcpdial set fs
+exit 0
+--- stdout
+fs
+  allow: echo, co*
+  deny:  fail
+--- stderr

@@ -13,6 +13,10 @@
   share it.
 - The tool never prompts, except `token set` with no stdin and a TTY. `login` opens a
   browser and waits for a human; do not run it unattended without `--no-browser`.
+- What a pipe reads is frozen, byte for byte, and a snapshot test holds it there. Only
+  a terminal may be shown something different, and `--json` never is; if a program
+  drives mcpdial through a pseudo-terminal, `--plain` or `MCPDIAL_PLAIN=1` gives it the
+  piped form anyway.
 
 ## Workflow
 

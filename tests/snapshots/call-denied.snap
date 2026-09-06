@@ -1,0 +1,5 @@
+$ mcpdial call fs fail
+exit 2
+--- stdout
+--- stderr
+error: fail is denied for fs by its deny list; edit with mcpdial set fs

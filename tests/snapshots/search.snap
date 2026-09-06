@@ -1,0 +1,9 @@
+$ mcpdial search acme
+exit 0
+--- stdout
+NAME                   TRANSPORTS                 SOURCE    DESCRIPTION
+io.github.acme/files   stdio (npm)                catalog   Serve one directory over MCP. A long enough description t...
+io.github.acme/remote  http, sse                  catalog   The fake server, reached over HTTP.
+io.github.acme/box     stdio (pypi), stdio (oci)  catalog   A sandbox, as a Python package or a container.
+io.github.acme/legacy  sse                        registry  The fake server, listed as SSE only.
+--- stderr

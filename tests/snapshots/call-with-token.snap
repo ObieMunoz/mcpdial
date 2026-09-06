@@ -1,0 +1,5 @@
+$ mcpdial call work echo {"message":"authorized"}
+exit 0
+--- stdout
+Echo: authorized
+--- stderr

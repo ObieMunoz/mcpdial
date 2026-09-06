@@ -1,0 +1,6 @@
+$ mcpdial set fs --clear-allow
+exit 0
+--- stdout
+--- stderr
+saved fs (stdio ECHO_SERVER)
+  deny: fail, strict

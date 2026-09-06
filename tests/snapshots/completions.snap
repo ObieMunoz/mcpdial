@@ -1,0 +1,5 @@
+$ mcpdial completions bash
+exit 0
+--- stdout
+(the bash completion script)
+--- stderr

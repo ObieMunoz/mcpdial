@@ -1,0 +1,5 @@
+$ mcpdial --json add files --registry io.github.acme/files --arg /srv --force
+exit 0
+--- stdout
+{"saved":{"kind":"stdio","location":"npx -y @acme/files@1.2.0 /srv","name":"files","notes":["environment variables this server reads:\n  ACME_TOKEN (required, secret): API token\n  ACME_LOG: Log level\nthe required ones are saved as ${VAR} placeholders; set them before dialing. The others reach the server when exported in your shell, or with --env KEY=VALUE.","values this entry leaves to you, in --arg order:\n  directory (required): Directory to serve"]}}
+--- stderr

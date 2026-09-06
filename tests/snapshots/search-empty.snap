@@ -1,0 +1,6 @@
+$ mcpdial search
+exit 2
+--- stdout
+--- stderr
+error: search needs a query
+words that must all appear, like: mcpdial search browser automation

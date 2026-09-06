@@ -1,0 +1,6 @@
+$ mcpdial prompts echo
+exit 1
+--- stdout
+--- stderr
+error: MCP error -32601: Method not found: prompts/list
+this server offers no prompts; `mcpdial info echo` lists what it does offer.

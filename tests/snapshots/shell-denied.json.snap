@@ -1,0 +1,6 @@
+$ mcpdial --json shell fs
+exit 1
+--- stdout
+{"error":{"kind":"config","message":"fail is denied for fs by its deny list; edit with mcpdial set fs","tool":"fail"}}
+{"content":[{"text":"Echo: ok","type":"text"}]}
+--- stderr

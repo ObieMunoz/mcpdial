@@ -1,0 +1,7 @@
+$ mcpdial add fs --stdio ECHO_SERVER --allow echo --allow co* --deny fail --no-probe
+exit 0
+--- stdout
+--- stderr
+saved fs (stdio ECHO_SERVER)
+  allow: echo, co*
+  deny: fail

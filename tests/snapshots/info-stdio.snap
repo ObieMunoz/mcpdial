@@ -1,0 +1,7 @@
+$ mcpdial info echo
+exit 0
+--- stdout
+echo-server 0.0.1
+protocol 2025-06-18
+capabilities: tools
+--- stderr

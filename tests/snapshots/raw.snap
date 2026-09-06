@@ -1,0 +1,25 @@
+$ mcpdial raw web tools/list
+exit 0
+--- stdout
+{
+  "nextCursor": "page-2",
+  "tools": [
+    {
+      "description": "Echo a message back.\nSecond line.",
+      "inputSchema": {
+        "properties": {
+          "message": {
+            "description": "What to echo",
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "name": "echo"
+    }
+  ]
+}
+--- stderr

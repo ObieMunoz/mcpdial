@@ -1,0 +1,5 @@
+$ mcpdial token set work --env TOKEN
+exit 0
+--- stdout
+--- stderr
+saved token for work

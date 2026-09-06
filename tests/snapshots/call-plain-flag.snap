@@ -1,0 +1,5 @@
+$ mcpdial --plain call web echo {"message":"plain"}
+exit 0
+--- stdout
+Echo: plain
+--- stderr

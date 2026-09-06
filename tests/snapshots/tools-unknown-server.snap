@@ -1,0 +1,5 @@
+$ mcpdial tools nobody
+exit 2
+--- stdout
+--- stderr
+error: unknown server "nobody". Add it with `mcpdial add nobody --http URL` (or --stdio CMD), or pass a URL or stdio:<command> directly.

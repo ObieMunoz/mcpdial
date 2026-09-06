@@ -1,0 +1,5 @@
+$ mcpdial --json add fs --stdio ECHO_SERVER --allow echo --allow co* --deny fail --no-probe --force
+exit 0
+--- stdout
+{"saved":{"allow":["echo","co*"],"deny":["fail"],"kind":"stdio","location":"ECHO_SERVER","name":"fs"}}
+--- stderr

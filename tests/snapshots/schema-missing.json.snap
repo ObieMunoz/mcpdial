@@ -1,0 +1,5 @@
+$ mcpdial --json schema web nah
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32602,"kind":"rpc","message":"MCP error -32602: Tool nah not found; available: echo, add"}}

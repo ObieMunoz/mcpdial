@@ -1,0 +1,5 @@
+$ mcpdial --json read web file:///nope
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32002,"kind":"rpc","message":"MCP error -32002: Resource not found: file:///nope"}}

@@ -1,0 +1,5 @@
+$ mcpdial --json add echo --stdio ECHO_SERVER --no-probe --force
+exit 0
+--- stdout
+{"saved":{"kind":"stdio","location":"ECHO_SERVER","name":"echo"}}
+--- stderr

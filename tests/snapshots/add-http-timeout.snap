@@ -1,0 +1,5 @@
+$ mcpdial add slow --http http://127.0.0.1:PORT/mcp --timeout 5 --no-probe
+exit 0
+--- stdout
+--- stderr
+saved slow (http http://127.0.0.1:PORT/mcp)

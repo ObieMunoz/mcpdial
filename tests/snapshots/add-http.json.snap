@@ -1,0 +1,5 @@
+$ mcpdial --json add web --http http://127.0.0.1:PORT/mcp --no-probe --force
+exit 0
+--- stdout
+{"saved":{"kind":"http","location":"http://127.0.0.1:PORT/mcp","name":"web"}}
+--- stderr

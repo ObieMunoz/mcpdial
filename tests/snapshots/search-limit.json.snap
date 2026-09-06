@@ -1,0 +1,59 @@
+$ mcpdial --json search acme --limit 1
+exit 0
+--- stdout
+[
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "Serve one directory over MCP. A long enough description that the search table has to cut it short somewhere.",
+      "name": "io.github.acme/files",
+      "packages": [
+        {
+          "environmentVariables": [
+            {
+              "description": "API token",
+              "isRequired": true,
+              "isSecret": true,
+              "name": "ACME_TOKEN"
+            },
+            {
+              "description": "Log level",
+              "name": "ACME_LOG"
+            }
+          ],
+          "identifier": "@acme/files",
+          "packageArguments": [
+            {
+              "description": "Directory to serve",
+              "format": "filepath",
+              "isRequired": true,
+              "type": "positional",
+              "valueHint": "directory"
+            }
+          ],
+          "registryType": "npm",
+          "runtimeArguments": [
+            {
+              "type": "positional",
+              "value": "-y"
+            }
+          ],
+          "runtimeHint": "npx",
+          "transport": {
+            "type": "stdio"
+          },
+          "version": "1.2.0"
+        }
+      ],
+      "version": "1.2.0"
+    }
+  }
+]
+--- stderr

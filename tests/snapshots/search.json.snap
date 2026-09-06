@@ -1,0 +1,143 @@
+$ mcpdial --json search acme
+exit 0
+--- stdout
+[
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "Serve one directory over MCP. A long enough description that the search table has to cut it short somewhere.",
+      "name": "io.github.acme/files",
+      "packages": [
+        {
+          "environmentVariables": [
+            {
+              "description": "API token",
+              "isRequired": true,
+              "isSecret": true,
+              "name": "ACME_TOKEN"
+            },
+            {
+              "description": "Log level",
+              "name": "ACME_LOG"
+            }
+          ],
+          "identifier": "@acme/files",
+          "packageArguments": [
+            {
+              "description": "Directory to serve",
+              "format": "filepath",
+              "isRequired": true,
+              "type": "positional",
+              "valueHint": "directory"
+            }
+          ],
+          "registryType": "npm",
+          "runtimeArguments": [
+            {
+              "type": "positional",
+              "value": "-y"
+            }
+          ],
+          "runtimeHint": "npx",
+          "transport": {
+            "type": "stdio"
+          },
+          "version": "1.2.0"
+        }
+      ],
+      "version": "1.2.0"
+    }
+  },
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "The fake server, reached over HTTP.",
+      "name": "io.github.acme/remote",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "http://127.0.0.1:PORT/mcp"
+        },
+        {
+          "type": "sse",
+          "url": "http://127.0.0.1:PORT/mcp"
+        }
+      ],
+      "version": "2.0.0"
+    }
+  },
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "A sandbox, as a Python package or a container.",
+      "name": "io.github.acme/box",
+      "packages": [
+        {
+          "identifier": "acme-box",
+          "registryType": "pypi",
+          "transport": {
+            "type": "stdio"
+          },
+          "version": "1.0"
+        },
+        {
+          "environmentVariables": [
+            {
+              "isRequired": true,
+              "name": "BOX_KEY"
+            }
+          ],
+          "identifier": "ghcr.io/acme/box:1.0",
+          "registryType": "oci",
+          "transport": {
+            "type": "stdio"
+          }
+        }
+      ],
+      "version": "1.0"
+    }
+  },
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "The fake server, listed as SSE only.",
+      "name": "io.github.acme/legacy",
+      "remotes": [
+        {
+          "type": "sse",
+          "url": "http://127.0.0.1:PORT/mcp"
+        }
+      ],
+      "version": "0.9.0"
+    }
+  }
+]
+--- stderr

@@ -1,0 +1,5 @@
+$ mcpdial --json add bad --catalog nope --no-probe
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"`mcpdial catalog` lists every entry with its id.","kind":"usage","message":"no catalog entry named \"nope\""}}

@@ -1,0 +1,6 @@
+$ mcpdial --save-dir HOME/saved call echo shot
+exit 0
+--- stdout
+done
+[image saved to HOME/saved/shot-1.png, 4 KB]
+--- stderr

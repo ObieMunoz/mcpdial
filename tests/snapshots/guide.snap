@@ -1,0 +1,5 @@
+$ mcpdial guide
+exit 0
+--- stdout
+(docs/AGENTS.md, byte for byte)
+--- stderr

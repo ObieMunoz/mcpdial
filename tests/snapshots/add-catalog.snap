@@ -1,0 +1,5 @@
+$ mcpdial add cat --catalog fake --no-probe
+exit 0
+--- stdout
+--- stderr
+saved cat (http http://127.0.0.1:PORT/mcp)

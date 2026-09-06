@@ -1,0 +1,8 @@
+$ mcpdial prompts web
+exit 0
+--- stdout
+2 prompt(s):
+
+  summarize                    Summarize a document.
+  greet                        Greet someone.
+--- stderr

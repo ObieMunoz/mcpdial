@@ -1,0 +1,12 @@
+$ mcpdial --json --plain call web echo {"message":"plain"}
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: plain",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

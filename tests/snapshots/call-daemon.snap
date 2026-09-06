@@ -1,0 +1,5 @@
+$ mcpdial call echo count
+exit 0
+--- stdout
+count=1
+--- stderr

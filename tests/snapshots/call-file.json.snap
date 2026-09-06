@@ -1,0 +1,12 @@
+$ mcpdial --json call echo echo @HOME/args.json
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: from a file",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

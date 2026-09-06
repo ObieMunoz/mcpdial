@@ -1,0 +1,5 @@
+$ mcpdial --json rm box
+exit 0
+--- stdout
+{"removed":"box"}
+--- stderr

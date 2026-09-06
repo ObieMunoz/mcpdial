@@ -1,0 +1,38 @@
+$ mcpdial tools
+exit 0
+--- stdout
+## cat  fake-mcp 1.0  (2 tools)
+  echo                         Echo a message back.
+  add                          Add two numbers.
+
+## echo  echo-server 0.0.1  (5 tools)
+  echo                         Echo a message back.
+  fail                         Always returns a tool error.
+  count                        How many times this process has been asked.
+  strict                       Rejects bad arguments in a failed result.
+  shot                         A text block, then a 4 KB image block.
+
+## fs  echo-server 0.0.1  (3 tools)
+  echo                         Echo a message back.
+  count                        How many times this process has been asked.
+  shot                         A text block, then a 4 KB image block.
+
+## imported  fake-mcp 1.0  (2 tools)
+  echo                         Echo a message back.
+  add                          Add two numbers.
+
+## local  echo-server 0.0.1  (5 tools)
+  echo                         Echo a message back.
+  fail                         Always returns a tool error.
+  count                        How many times this process has been asked.
+  strict                       Rejects bad arguments in a failed result.
+  shot                         A text block, then a 4 KB image block.
+
+## slow  fake-mcp 1.0  (2 tools)
+  echo                         Echo a message back.
+  add                          Add two numbers.
+
+## web  fake-mcp 1.0  (2 tools)
+  echo                         Echo a message back.
+  add                          Add two numbers.
+--- stderr

@@ -1,0 +1,38 @@
+$ mcpdial --json schema web add
+exit 0
+--- stdout
+{
+  "annotations": {
+    "idempotentHint": true
+  },
+  "description": "Add two numbers.",
+  "inputSchema": {
+    "properties": {
+      "a": {
+        "type": "number"
+      },
+      "b": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "a",
+      "b"
+    ],
+    "type": "object"
+  },
+  "name": "add",
+  "outputSchema": {
+    "properties": {
+      "sum": {
+        "type": "number"
+      }
+    },
+    "required": [
+      "sum"
+    ],
+    "type": "object"
+  }
+}
+--- stderr
+this tool declares an outputSchema: results carry structuredContent

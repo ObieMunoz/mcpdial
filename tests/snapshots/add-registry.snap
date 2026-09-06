@@ -1,0 +1,11 @@
+$ mcpdial add files --registry io.github.acme/files --arg /srv
+exit 0
+--- stdout
+--- stderr
+saved files (stdio npx -y @acme/files@1.2.0 /srv)
+note: environment variables this server reads:
+        ACME_TOKEN (required, secret): API token
+        ACME_LOG: Log level
+      the required ones are saved as ${VAR} placeholders; set them before dialing. The others reach the server when exported in your shell, or with --env KEY=VALUE.
+note: values this entry leaves to you, in --arg order:
+        directory (required): Directory to serve

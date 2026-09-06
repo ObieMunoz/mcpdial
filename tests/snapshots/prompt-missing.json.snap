@@ -1,0 +1,5 @@
+$ mcpdial --json prompt web nope
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32602,"kind":"rpc","message":"MCP error -32602: Prompt nope not found"}}

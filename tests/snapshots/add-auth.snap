@@ -1,0 +1,5 @@
+$ mcpdial add work --http http://127.0.0.1:PORT2/mcp --no-probe
+exit 0
+--- stdout
+--- stderr
+saved work (http http://127.0.0.1:PORT2/mcp)

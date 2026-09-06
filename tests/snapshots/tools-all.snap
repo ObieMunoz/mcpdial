@@ -1,0 +1,11 @@
+$ mcpdial tools fs --all
+exit 0
+--- stdout
+5 tool(s):
+
+  echo                         Echo a message back.
+  fail (denied)                Always returns a tool error.
+  count                        How many times this process has been asked.
+  strict (denied)              Rejects bad arguments in a failed result.
+  shot                         A text block, then a 4 KB image block.
+--- stderr

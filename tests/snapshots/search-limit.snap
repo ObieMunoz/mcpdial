@@ -1,0 +1,7 @@
+$ mcpdial search acme --limit 1
+exit 0
+--- stdout
+NAME                  TRANSPORTS   SOURCE   DESCRIPTION
+io.github.acme/files  stdio (npm)  catalog  Serve one directory over MCP. A long enough description t...
+--- stderr
+1 of 4 matches; --limit N shows more

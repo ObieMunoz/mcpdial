@@ -1,0 +1,5 @@
+$ mcpdial --json token set work --env TOKEN
+exit 0
+--- stdout
+{"saved_credential":"work"}
+--- stderr

@@ -1,0 +1,52 @@
+$ mcpdial --json search fake --offline
+exit 0
+--- stdout
+[
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "The fake server, reached over HTTP.",
+      "name": "io.github.acme/remote",
+      "remotes": [
+        {
+          "type": "streamable-http",
+          "url": "http://127.0.0.1:PORT/mcp"
+        },
+        {
+          "type": "sse",
+          "url": "http://127.0.0.1:PORT/mcp"
+        }
+      ],
+      "version": "2.0.0"
+    }
+  },
+  {
+    "_meta": {
+      "io.modelcontextprotocol.registry/official": {
+        "isLatest": true,
+        "publishedAt": "2026-09-01T00:00:00Z",
+        "status": "active",
+        "updatedAt": "2026-09-01T00:00:00Z"
+      }
+    },
+    "server": {
+      "description": "The fake server, listed as SSE only.",
+      "name": "io.github.acme/legacy",
+      "remotes": [
+        {
+          "type": "sse",
+          "url": "http://127.0.0.1:PORT/mcp"
+        }
+      ],
+      "version": "0.9.0"
+    }
+  }
+]
+--- stderr

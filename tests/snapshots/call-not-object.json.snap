@@ -1,0 +1,5 @@
+$ mcpdial --json call web echo [1]
+exit 2
+--- stdout
+--- stderr
+{"error":{"hint":"`mcpdial schema web echo` shows what echo takes","kind":"usage","message":"arguments must be a JSON object like {\"key\": \"value\"}, not an array"}}

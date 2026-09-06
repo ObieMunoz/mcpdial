@@ -1,0 +1,5 @@
+$ mcpdial --json set nobody
+exit 2
+--- stdout
+--- stderr
+{"error":{"kind":"usage","message":"no server named \"nobody\""}}

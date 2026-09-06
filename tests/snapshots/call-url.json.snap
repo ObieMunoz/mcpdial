@@ -1,0 +1,12 @@
+$ mcpdial --json call http://127.0.0.1:PORT/mcp echo {"message":"ad hoc"}
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: ad hoc",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

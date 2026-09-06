@@ -1,0 +1,7 @@
+$ mcpdial add bad --registry io.github.acme/files
+exit 2
+--- stdout
+--- stderr
+error: io.github.acme/files needs 1 value(s) this command was not given
+pass each with --arg VALUE, in this order:
+  directory (required): Directory to serve

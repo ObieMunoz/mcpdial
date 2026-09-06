@@ -1,0 +1,5 @@
+$ mcpdial rm files
+exit 0
+--- stdout
+--- stderr
+removed files

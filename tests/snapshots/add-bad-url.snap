@@ -1,0 +1,5 @@
+$ mcpdial add bad --http notaurl --no-probe
+exit 2
+--- stdout
+--- stderr
+error: --http needs an http:// or https:// URL, got "notaurl"

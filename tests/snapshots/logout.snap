@@ -1,0 +1,5 @@
+$ mcpdial logout work
+exit 0
+--- stdout
+--- stderr
+removed credential for work

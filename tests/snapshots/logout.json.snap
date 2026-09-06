@@ -1,0 +1,5 @@
+$ mcpdial --json logout work
+exit 0
+--- stdout
+{"removed_credential":null}
+--- stderr

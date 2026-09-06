@@ -1,0 +1,5 @@
+$ mcpdial --json add box --catalog box --no-probe --force
+exit 0
+--- stdout
+{"saved":{"kind":"stdio","location":"uvx acme-box==1.0","name":"box"}}
+--- stderr

@@ -1,0 +1,5 @@
+$ mcpdial --json prompts echo
+exit 1
+--- stdout
+--- stderr
+{"error":{"code":-32601,"hint":"this server offers no prompts; `mcpdial info echo` lists what it does offer.","kind":"rpc","message":"MCP error -32601: Method not found: prompts/list"}}

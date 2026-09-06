@@ -1,0 +1,5 @@
+$ mcpdial stop echo
+exit 0
+--- stdout
+--- stderr
+stopped echo

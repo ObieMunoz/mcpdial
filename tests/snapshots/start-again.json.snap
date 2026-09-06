@@ -1,0 +1,5 @@
+$ mcpdial --json start echo --idle 60
+exit 2
+--- stdout
+--- stderr
+{"error":{"kind":"usage","message":"echo is already running"}}

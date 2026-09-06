@@ -1,0 +1,27 @@
+$ mcpdial --json prompts web
+exit 0
+--- stdout
+{
+  "prompts": [
+    {
+      "arguments": [
+        {
+          "description": "What to summarize",
+          "name": "text",
+          "required": true
+        },
+        {
+          "description": "terse or thorough",
+          "name": "style"
+        }
+      ],
+      "description": "Summarize a document.",
+      "name": "summarize"
+    },
+    {
+      "description": "Greet someone.",
+      "name": "greet"
+    }
+  ]
+}
+--- stderr

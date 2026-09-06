@@ -1,0 +1,12 @@
+$ mcpdial --json call echo echo -
+exit 0
+--- stdout
+{
+  "content": [
+    {
+      "text": "Echo: from stdin",
+      "type": "text"
+    }
+  ]
+}
+--- stderr

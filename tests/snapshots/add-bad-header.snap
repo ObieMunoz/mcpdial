@@ -1,0 +1,5 @@
+$ mcpdial add bad --http http://127.0.0.1:PORT/mcp -H nocolon --no-probe
+exit 2
+--- stdout
+--- stderr
+error: --header must look like 'Name: value', got "nocolon"

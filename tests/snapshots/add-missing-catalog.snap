@@ -1,0 +1,6 @@
+$ mcpdial add bad --catalog nope --no-probe
+exit 2
+--- stdout
+--- stderr
+error: no catalog entry named "nope"
+`mcpdial catalog` lists every entry with its id.
