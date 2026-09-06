@@ -667,7 +667,8 @@ call navigate_page {"url":"https://example.com/about"}
 ```
 
 - `show N` prints result N again, exactly as it printed the first time. `_` names the
-  last result and `$3` the third, and a bare `show` means `_`.
+  last result and `$3` the third, and a bare `show` means `_`; `_` and `$3` on their
+  own name a result too, which is what a filter follows.
 - `save N FILE` writes it: text as text, a binary block as its bytes, a resource as the
   bodies it arrived as, and the whole result object under `--json`. `save N` with no
   file names one after the tool and the media type - `take_screenshot.png`,
@@ -686,6 +687,46 @@ too: a script that counted its own calls can `show 2` or `save 2 out.txt` just t
 same. A session holds its last 50 results, or 8 MiB of them, whichever runs out first,
 and drops the oldest past that; the newest is always kept. Nothing is written to disk
 and nothing outlives the process.
+
+### Filtering a result
+
+A shell line can end with `| PATH`, and what it prints is that part of the result
+rather than all of it:
+
+```
+chrome> call list_pages | .pages[].url
+https://example.com/
+https://example.com/about
+chrome> _ | .pages[0].id
+1
+```
+
+The grammar is four forms and their combinations - `.key`, `.key.sub`, `.[0]`, `.[]` -
+read over the result's `structuredContent` where the server sent one, over its text
+where that text is JSON, and over the result object itself otherwise. Selected values
+print one per line, strings without their quotes; under `--json` each line is a JSON
+document, so a string keeps them. A key nothing has, an index past the end of an array,
+and any step at all asked of a scalar each select nothing: the line prints nothing and
+says on stderr which expression matched nothing, which is a note rather than a failure.
+An expression outside the grammar is refused, naming the forms, before the command in
+front of it runs, so a filter with a typo in it costs no call.
+
+`| jq ARGS` is everything else. The words after `jq` are that program's arguments and
+the result goes in on its stdin, so nothing a server sent is ever part of a command
+line and no shell is involved; a `jq` that is not on `PATH` says so, and one that fails
+is reported in its own words. A `|` inside a JSON argument is part of that argument,
+and only the first bar on a line is one, so a `jq` filter keeps the pipes of its own:
+
+```
+chrome> call list_pages | jq -r '.pages | map(.url) | join(", ")'
+https://example.com/, https://example.com/about
+```
+
+A filter follows `call`, `read`, `prompt`, `raw`, `show N`, and `_` or `$N` on their
+own. `retry ... | PATH` and `edit N | PATH` take one too: the filter goes on the end of
+the `call` line they hand back, which is the line they print, so it can be pasted back
+into the terminal as it stands. Every other command prints something mcpdial composed
+rather than a result, and says so rather than filtering it.
 
 ### When the server has a question
 

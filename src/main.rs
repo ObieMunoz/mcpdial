@@ -21,6 +21,7 @@ use mcpdial::{
 };
 use notices::Notices;
 use output::{As, Output, Payload};
+use path::{Filter, Filtered};
 use present::style::ColorMode;
 use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
@@ -42,6 +43,7 @@ mod grep;
 mod history;
 mod notices;
 mod output;
+mod path;
 mod pick;
 mod present;
 mod prompt;
@@ -745,6 +747,16 @@ fn print_json(ui: &dyn Presenter, v: &impl serde::Serialize) {
 
 fn print_value(ui: &dyn Presenter, v: &Value, compact: bool) {
     ui.json(&output::document(v, compact));
+}
+
+/// A note on stderr: prose for a human, `{"note": ...}` under `--json`, where
+/// every line on either stream has to be an object.
+fn print_note(ui: &dyn Presenter, note: &str, json: bool) {
+    if json {
+        ui.err_line(&json!({ "note": note }).to_string());
+    } else {
+        ui.note(note);
+    }
 }
 
 /// A hint on stderr: prose for a human, `{"hint": ...}` under `--json`, where
@@ -1746,8 +1758,121 @@ fn split_word(rest: &str) -> (&str, &str) {
         .map_or((rest, ""), |(word, more)| (word, more.trim()))
 }
 
+/// The commands a `| ...` can follow, for the answer to one that prints no
+/// result to filter.
+const FILTER_APPLIES_TO: &str =
+    "a filter follows a command that prints a result: call, read, prompt, raw, retry, edit, \
+     show N, _ and $N";
+
+/// A shell line, and the `| ...` it may end with. The bar is looked for outside
+/// any JSON string, so a `|` inside an argument stays part of that argument;
+/// only the first one is a bar, and everything after it is the filter, which is
+/// how a `jq` filter keeps the pipes of its own.
+fn split_filter(line: &str) -> (&str, Option<&str>) {
+    let mut in_string = false;
+    let mut escaped = false;
+    for (at, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if in_string {
+            match c {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => in_string = true,
+                '|' => return (line[..at].trim_end(), Some(line[at + 1..].trim())),
+                _ => {}
+            }
+        }
+    }
+    (line, None)
+}
+
+/// A line that is nothing but the name of a result already printed: `_` for the
+/// last, `$3` for the third. Neither can be a tool name, so neither is a command
+/// anybody was going to type by accident.
+fn names_a_result(word: &str) -> bool {
+    word == "_" || word.starts_with('$')
+}
+
+/// Whether a `| ...` can follow this command: the ones that print a result, and
+/// the ways of naming one already printed.
+fn takes_a_filter(word: &str) -> bool {
+    matches!(
+        word,
+        "call" | "read" | "prompt" | "raw" | "retry" | "edit" | "show"
+    ) || names_a_result(word)
+}
+
+/// A line a `retry` or an `edit` is handing back to the loop, with the `| ...`
+/// its own line ended with put back on the end of it: the loop reads that line
+/// exactly as it reads a typed one, so the filter has to be part of it.
+fn with_filter(line: String, expression: Option<&str>) -> String {
+    match expression {
+        Some(filter) => format!("{line} | {filter}"),
+        None => line,
+    }
+}
+
+/// A result through the `| ...` its line ended with, on stdout. The selected
+/// lines leave the way a result's text does, so `--max-chars` and `--output`
+/// keep their say over them, and a filter that selected nothing prints nothing
+/// at all rather than a blank line.
+fn shell_filter(
+    ui: &dyn Presenter,
+    out: &Output,
+    filter: &Filter,
+    result: &Value,
+    json: bool,
+) -> Result<(), Failure> {
+    let Filtered { text, note } = filter.apply(result, json)?;
+    if let Some(text) = text {
+        let sent = out.deliver(Payload::Text(&text), result["isError"] == true)?;
+        output::show(ui, sent, As::Text, json, || ui.text(&text));
+    }
+    if !note.is_empty() {
+        print_note(ui, &note, json);
+    }
+    Ok(())
+}
+
+/// One numbered result on stdout: through the `| ...` the line ended with, or
+/// exactly as it printed the first time.
+fn shell_named(
+    ui: &dyn Presenter,
+    out: &Output,
+    results: &History,
+    named: &str,
+    filter: Option<&Filter>,
+    json: bool,
+    target: &str,
+) -> Result<(), Failure> {
+    let rec = results
+        .find(named)
+        .map_err(|e| Failure::hinted(e, SHOW_USAGE))?;
+    // The number it already had: naming a result again does not make a new one.
+    ui.numbered(rec.number);
+    match filter {
+        Some(filter) => ui.paged(|| shell_filter(ui, out, filter, &rec.result, json)),
+        None => ui.paged(|| shell_show(ui, out, rec, json, target)),
+    }
+}
+
+/// A shell line that did not work, said the way that session says them.
+fn shell_failed(ui: &dyn Presenter, failure: &Failure, json: bool) {
+    if json {
+        print_value(ui, &failure.to_json(), true);
+    } else {
+        failure.report(ui);
+    }
+}
+
 /// The parts of a `shell` session one line changes: the connection, what the
-/// session has learned about the server, and what it has printed.
+/// session has learned about the server, and what it has printed - with the
+/// `| ...` that line ended with, which decides how its result prints.
 struct Live<'a, 'b> {
     conn: &'a mut client::Connection,
     notices: &'a mut Notices<'b>,
@@ -1759,6 +1884,7 @@ struct Live<'a, 'b> {
     /// a followed resource arriving during this call is put aside for the
     /// prompt rather than drawn into the middle of the result.
     subs: &'a mut Subscriptions,
+    filter: Option<&'a Filter>,
 }
 
 /// One `call` at the shell, from the arguments it settled on to the result filed
@@ -1798,17 +1924,23 @@ fn shell_call(
     };
     let text = rendered(ui, &mut result, json, &files, render_content)?;
     ui.numbered(live.results.next_number());
-    let outcome = match ui.paged(|| print_tool_result(ui, out, &result, &text, json, true)) {
-        Err(f) => Err(f),
-        Ok(failed) => {
-            if failed {
-                let argument_error = reads_as_argument_error(&text);
-                if let Some(hint) = shell_call_hint(live.tools, live.conn, tool, argument_error) {
-                    print_hint(ui, &hint, json);
+    // A line that asked for one field of the result is answered with that field
+    // and nothing else, hint included: it named what it wanted.
+    let outcome = match live.filter {
+        Some(filter) => ui.paged(|| shell_filter(ui, out, filter, &result, json)),
+        None => match ui.paged(|| print_tool_result(ui, out, &result, &text, json, true)) {
+            Err(f) => Err(f),
+            Ok(failed) => {
+                if failed {
+                    let argument_error = reads_as_argument_error(&text);
+                    if let Some(hint) = shell_call_hint(live.tools, live.conn, tool, argument_error)
+                    {
+                        print_hint(ui, &hint, json);
+                    }
                 }
+                Ok(())
             }
-            Ok(())
-        }
+        },
     };
     live.results.record(
         Origin::Call {
@@ -2877,9 +3009,33 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 if text.is_empty() || text.starts_with('#') {
                     continue;
                 }
+                // A `| ...` at the end of the line filters what that line
+                // prints. It is read before the command in front of it runs, so
+                // an expression nobody can read costs no request.
+                let (text, expression) = split_filter(text);
                 let (word, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
                 let rest = rest.trim();
                 let long = rest == "--long" || rest == "-l";
+                let filter = match expression.map(Filter::parse).transpose() {
+                    Ok(filter) => filter,
+                    Err(e) => {
+                        failures += 1;
+                        shell_failed(ui, &Failure::hinted(e, path::USAGE), cli.json);
+                        continue;
+                    }
+                };
+                if filter.is_some() && !takes_a_filter(word) {
+                    failures += 1;
+                    let refused = Failure::hinted(
+                        Error::usage(match word.is_empty() {
+                            true => "a filter needs a command in front of it".to_string(),
+                            false => format!("{word} prints no result to filter"),
+                        }),
+                        FILTER_APPLIES_TO,
+                    );
+                    shell_failed(ui, &refused, cli.json);
+                    continue;
+                }
                 let outcome: Result<(), Failure> = match word {
                     "quit" | "exit" => break,
                     "help" if rest.is_empty() => {
@@ -2972,17 +3128,22 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                 stem: resource_stem(rest),
                             };
                             ui.numbered(results.next_number());
-                            let shown = ui.paged(|| {
-                                emit_resource(
-                                    ui,
-                                    &out,
-                                    &mut result,
-                                    cli.json,
-                                    true,
-                                    &files,
-                                    &redirect,
-                                )
-                            });
+                            let shown = match &filter {
+                                Some(f) => {
+                                    ui.paged(|| shell_filter(ui, &out, f, &result, cli.json))
+                                }
+                                None => ui.paged(|| {
+                                    emit_resource(
+                                        ui,
+                                        &out,
+                                        &mut result,
+                                        cli.json,
+                                        true,
+                                        &files,
+                                        &redirect,
+                                    )
+                                }),
+                            };
                             // Recorded however it printed: a presenter that
                             // refuses bytes at a terminal leaves `save` as the
                             // way to have them.
@@ -3043,9 +3204,13 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         render_messages,
                                     )?;
                                     ui.numbered(results.next_number());
-                                    let shown = ui.paged(|| {
-                                        emit_rendered(ui, &out, &result, &text, cli.json, true)
-                                    });
+                                    let shown = match &filter {
+                                        Some(f) => ui
+                                            .paged(|| shell_filter(ui, &out, f, &result, cli.json)),
+                                        None => ui.paged(|| {
+                                            emit_rendered(ui, &out, &result, &text, cli.json, true)
+                                        }),
+                                    };
                                     results.record(
                                         Origin::Prompt {
                                             name: name.to_string(),
@@ -3089,6 +3254,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         tools: &mut lists.tools,
                                         results: &mut results,
                                         subs: &mut subs,
+                                        filter: filter.as_ref(),
                                     };
                                     shell_call(ui, &out, &mut live, tool, a, cli.json, save_dir)
                                 }
@@ -3098,18 +3264,32 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     // The numbered results of this session. A pipe never sees
                     // the numbers, but a script that counted its own calls can
                     // name them just the same.
-                    "show" => {
-                        let named = if rest.is_empty() { "_" } else { rest };
-                        match results.find(named) {
-                            Err(e) => Err(Failure::hinted(e, SHOW_USAGE)),
-                            Ok(rec) => {
-                                // The number it already had: showing a result
-                                // again does not make a new one.
-                                ui.numbered(rec.number);
-                                ui.paged(|| shell_show(ui, &out, rec, cli.json, &target))
-                            }
-                        }
-                    }
+                    "show" => shell_named(
+                        ui,
+                        &out,
+                        &results,
+                        if rest.is_empty() { "_" } else { rest },
+                        filter.as_ref(),
+                        cli.json,
+                        &target,
+                    ),
+                    // `_` and `$3` name a result on their own, so that a filter
+                    // can follow one without anything being run again.
+                    reference if names_a_result(reference) => match rest.is_empty() {
+                        true => shell_named(
+                            ui,
+                            &out,
+                            &results,
+                            reference,
+                            filter.as_ref(),
+                            cli.json,
+                            &target,
+                        ),
+                        false => Err(Failure::hinted(
+                            Error::usage(format!("{reference} names a result on its own")),
+                            SHOW_USAGE,
+                        )),
+                    },
                     "save" => {
                         let (named, file) = split_word(rest);
                         let named = if named.is_empty() { "_" } else { named };
@@ -3149,9 +3329,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         tool: None,
                                     }),
                                     Ok(changes) => {
-                                        let line = format!(
-                                            "call {tool} {}",
-                                            history::merged(&base, &changes)
+                                        let line = with_filter(
+                                            format!(
+                                                "call {tool} {}",
+                                                history::merged(&base, &changes)
+                                            ),
+                                            expression,
                                         );
                                         print_rerun(ui, &line, cli.json);
                                         pending = Some(line);
@@ -3166,7 +3349,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     }) {
                         Err(e) => Err(Failure::hinted(e, EDIT_USAGE)),
                         Ok((tool, edited)) => {
-                            let line = format!("call {tool} {edited}");
+                            let line = with_filter(format!("call {tool} {edited}"), expression);
                             print_rerun(ui, &line, cli.json);
                             pending = Some(line);
                             Ok(())
@@ -3329,9 +3512,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                             parse_object(params, "params")
                                 .and_then(|p| conn.session.request(method, Some(p)))
                                 .map_err(Failure::from)
-                                .map(|result| {
+                                .and_then(|result| {
                                     ui.numbered(results.next_number());
-                                    ui.paged(|| print_value(ui, &result, cli.json));
+                                    let shown = match &filter {
+                                        Some(f) => ui
+                                            .paged(|| shell_filter(ui, &out, f, &result, cli.json)),
+                                        None => {
+                                            ui.paged(|| print_value(ui, &result, cli.json));
+                                            Ok(())
+                                        }
+                                    };
                                     results.record(
                                         Origin::Raw {
                                             method: method.to_string(),
@@ -3339,6 +3529,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                                         result,
                                         String::new(),
                                     );
+                                    shown
                                 })
                         }
                     }
@@ -3378,11 +3569,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 };
                 if let Err(f) = outcome {
                     failures += 1;
-                    if cli.json {
-                        print_value(ui, &f.to_json(), true);
-                    } else {
-                        f.report(ui);
-                    }
+                    shell_failed(ui, &f, cli.json);
                 }
                 // Between two commands, where a line of ours cannot land in the
                 // middle of a line of the server's.
