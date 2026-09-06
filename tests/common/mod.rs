@@ -83,6 +83,13 @@ pub enum Mode {
     /// The first `tools/call` gets a 503; everything else is served, with or
     /// without a session.
     CallUnavailableOnce { stateful: bool },
+    /// Advertises the `completions` capability and suggests values for the one
+    /// prompt argument and the one template variable it knows, filtered by what
+    /// has been typed and cut to [`COMPLETIONS_SERVED`] so that `hasMore` means
+    /// something. `answers: false` advertises the same capability and then holds
+    /// every `completion/complete` open for ever, serving everything else: the
+    /// server that must not be allowed to wedge a line editor.
+    Completing { answers: bool },
     /// Advertises the `logging` capability, answers `logging/setLevel`, and
     /// streams a `tools/call` reply: progress under whatever `progressToken`
     /// the request carried plus one under a token nobody asked for, a log
@@ -205,7 +212,7 @@ pub fn start(mode: Mode) -> FakeServer {
                     body,
                 };
                 requests.lock().unwrap().push(rec.clone());
-                if matches!(mode, Mode::BlackHole) {
+                if matches!(mode, Mode::BlackHole) || swallowed(&mode, &rec) {
                     held.push(req);
                     continue;
                 }
@@ -222,6 +229,14 @@ pub fn start(mode: Mode) -> FakeServer {
         stop,
         handle: Some(handle),
     }
+}
+
+/// Whether this is the request [`Mode::Completing`] was told to leave hanging:
+/// held open with the connection alive, as a server that has gone away
+/// mid-completion leaves one, while everything else goes on being served.
+fn swallowed(mode: &Mode, rec: &Recorded) -> bool {
+    matches!(mode, Mode::Completing { answers: false })
+        && rec.json()["method"] == "completion/complete"
 }
 
 /// A port in front of `upstream` that hangs up on the first connection after
@@ -739,6 +754,9 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
     if matches!(mode, Mode::Logging) {
         capabilities["logging"] = json!({});
     }
+    if matches!(mode, Mode::Completing { .. }) {
+        capabilities["completions"] = json!({});
+    }
     let reply = match method {
         "initialize" => json!({"jsonrpc":"2.0","id":id,"result":{
             "protocolVersion":agreed_version,
@@ -944,6 +962,7 @@ fn answer(mode: &Mode, id: &Value, method: &str, params: &Value, state: &Mutex<S
                 "description":"One note, by name.","mimeType":"text/markdown"}]}}),
         "resources/read" => resources_read(mode, &id, params["uri"].as_str().unwrap_or("")),
         "prompts/list" => prompts_list(&id, params["cursor"].as_str()),
+        "completion/complete" if matches!(mode, Mode::Completing { .. }) => completion(&id, params),
         "prompts/get" => prompts_get(&id, params),
         "tools/call" => match params["name"].as_str().unwrap_or("") {
             "echo" => json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text",
@@ -1053,6 +1072,39 @@ fn resources_read(mode: &Mode, id: &Value, uri: &str) -> Value {
         }
     };
     json!({"jsonrpc":"2.0","id":id,"result":{"contents":contents}})
+}
+
+/// The most values one `completion/complete` result carries, low enough that
+/// the server has something to hold back and say so.
+const COMPLETIONS_SERVED: usize = 2;
+
+/// `completion/complete` for the one prompt argument and the one template
+/// variable this server has anything to say about, narrowed by what has been
+/// typed and by whatever the request said was already settled.
+fn completion(id: &Value, params: &Value) -> Value {
+    let typed = params["argument"]["value"].as_str().unwrap_or("");
+    let known: &[&str] = match (
+        params["ref"]["type"].as_str().unwrap_or(""),
+        params["argument"]["name"].as_str().unwrap_or(""),
+    ) {
+        ("ref/prompt", "style") => &["terse", "thorough"],
+        // A note the request has already named an author for is one of theirs.
+        ("ref/resource", "name") => match params["context"]["arguments"]["author"].as_str() {
+            Some("ada") => &["ada-notes"],
+            _ => &["weekly", "daily", "standup"],
+        },
+        _ => &[],
+    };
+    let matching: Vec<&str> = known
+        .iter()
+        .copied()
+        .filter(|v| v.starts_with(typed))
+        .collect();
+    let served = &matching[..matching.len().min(COMPLETIONS_SERVED)];
+    json!({"jsonrpc":"2.0","id":id,"result":{"completion":{
+        "values": served,
+        "total": matching.len(),
+        "hasMore": served.len() < matching.len()}}})
 }
 
 /// One prompt per page, paginated exactly as `tools/list` is.

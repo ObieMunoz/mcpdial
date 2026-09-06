@@ -20,6 +20,11 @@ use std::time::Duration;
 /// repeated-cursor check below cannot catch.
 const MAX_PAGES: usize = 1000;
 
+/// The most suggestions one `completion/complete` result is read for, which is
+/// the cap the spec puts on a server. Anything past it is dropped rather than
+/// handed to a line editor, and the result says there was more.
+const MOST_COMPLETIONS: usize = 100;
+
 /// How many times one request may go again carrying more input before mcpdial
 /// stops sending it.
 ///
@@ -533,6 +538,53 @@ impl<T: Transport> Session<T> {
         self.list_paginated("prompts/list", "prompts")
     }
 
+    /// `completion/complete`: what this server suggests for `argument` of
+    /// `reference`, given whatever has been settled already.
+    ///
+    /// `reference` is `{"type": "ref/prompt", "name": NAME}` or
+    /// `{"type": "ref/resource", "uri": TEMPLATE}`, and `argument` is
+    /// `{"name": NAME, "value": what has been typed so far}`. `context` carries
+    /// `{"arguments": {...}}`, the arguments already given, which a server may
+    /// narrow its answer by; the field is 2025-11-25's and older servers ignore
+    /// it.
+    ///
+    /// Only a server that declares `completions` has this method. Which era
+    /// [`Self::open`] settled on makes no difference to that - both put the
+    /// capability in `server_info["capabilities"]` - so ask there before asking
+    /// here.
+    pub fn complete(
+        &mut self,
+        reference: Value,
+        argument: Value,
+        context: Option<Value>,
+    ) -> Result<Completion> {
+        let mut params = json!({ "ref": reference, "argument": argument });
+        if let Some(context) = context {
+            params["context"] = context;
+        }
+        let result = self.request("completion/complete", Some(params))?;
+        Ok(Completion::read(&result))
+    }
+
+    /// [`Self::complete`], abandoned once `within` is up, with the transport's
+    /// own timeout put back however it ends.
+    ///
+    /// This is the form Tab uses. A completion is one keystroke's worth of
+    /// help, and a server that is slow, wedged or gone must cost the person
+    /// typing that much and no more.
+    pub fn complete_within(
+        &mut self,
+        within: Duration,
+        reference: Value,
+        argument: Value,
+        context: Option<Value>,
+    ) -> Result<Completion> {
+        let restore = self.transport.wait_at_most(Some(within));
+        let found = self.complete(reference, argument, context);
+        self.transport.wait_at_most(restore);
+        found
+    }
+
     pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value> {
         self.get_prompt_watching(name, arguments, &mut Unwatched)
     }
@@ -612,6 +664,38 @@ pub type MediaSink<'a> = dyn FnMut(&Media) -> Result<Option<PathBuf>> + 'a;
 /// A tool that declares an `outputSchema` may answer with `structuredContent` and no
 /// content blocks at all (2025-06-18). Without the fallback such a result prints as
 /// the empty string, indistinguishable from a tool that legitimately returned nothing.
+/// What a server suggests for one half-typed value: the values themselves,
+/// ranked by the server, and what it says about the ones it did not send.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Completion {
+    pub values: Vec<String>,
+    /// How many there are in all, when the server says.
+    pub total: Option<u64>,
+    pub has_more: bool,
+}
+
+impl Completion {
+    /// The `completion` object of a result. Anything missing is nothing rather
+    /// than a guess, and a server that sends past [`MOST_COMPLETIONS`] has the
+    /// rest dropped and `has_more` set, whatever it claimed.
+    fn read(result: &Value) -> Self {
+        let completion = &result["completion"];
+        let served = completion["values"].as_array().map_or(0, Vec::len);
+        let values = completion["values"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(String::from))
+            .take(MOST_COMPLETIONS)
+            .collect();
+        Self {
+            values,
+            total: completion["total"].as_u64(),
+            has_more: completion["hasMore"].as_bool().unwrap_or(false) || served > MOST_COMPLETIONS,
+        }
+    }
+}
+
 pub fn render_content(result: &Value, sink: &mut MediaSink) -> Result<String> {
     let blocks = match result.get("content").and_then(Value::as_array) {
         Some(blocks) => render_blocks(blocks, sink)?,
@@ -1788,5 +1872,90 @@ mod tests {
             .unwrap();
         assert_eq!(result["resultType"], "input_required");
         assert_eq!(s.transport.sent.len(), 1);
+    }
+    /// A transport that never answers and remembers every bound it was put
+    /// under, for the one request that carries one of its own.
+    #[derive(Default)]
+    struct Timed {
+        under: Vec<Option<Duration>>,
+        wait: Option<Duration>,
+    }
+
+    impl Transport for Timed {
+        fn send(&mut self, _payload: &Value) -> Result<Option<Value>> {
+            Err(Error::transport("no reply in time"))
+        }
+        fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+            self.under.push(within);
+            std::mem::replace(&mut self.wait, within)
+        }
+    }
+
+    #[test]
+    fn a_completion_asks_in_the_shape_the_spec_names_and_reads_the_answer() {
+        let mut s = legacy(vec![Some(json!({"jsonrpc":"2.0","id":1,"result":{
+            "completion":{"values":["terse","thorough"],"total":7,"hasMore":true}}}))]);
+        let found = s
+            .complete(
+                json!({"type":"ref/prompt","name":"summarize"}),
+                json!({"name":"style","value":"t"}),
+                Some(json!({"arguments":{"document":"a.md"}})),
+            )
+            .unwrap();
+        assert_eq!(
+            found,
+            Completion {
+                values: vec!["terse".to_string(), "thorough".to_string()],
+                total: Some(7),
+                has_more: true,
+            }
+        );
+        assert_eq!(s.transport.sent[0]["method"], "completion/complete");
+        assert_eq!(
+            s.transport.sent[0]["params"],
+            json!({
+                "ref": {"type":"ref/prompt","name":"summarize"},
+                "argument": {"name":"style","value":"t"},
+                "context": {"arguments":{"document":"a.md"}},
+            })
+        );
+    }
+
+    #[test]
+    fn a_completion_with_nothing_settled_carries_no_context_at_all() {
+        let mut s = legacy(vec![Some(json!({"jsonrpc":"2.0","id":1,"result":{}}))]);
+        let found = s
+            .complete(
+                json!({"type":"ref/resource","uri":"file:///notes/{name}.md"}),
+                json!({"name":"name","value":""}),
+                None,
+            )
+            .unwrap();
+        // A result with no completion in it is no values, not an error.
+        assert_eq!(found, Completion::default());
+        assert_eq!(s.transport.sent[0]["params"].get("context"), None);
+    }
+
+    #[test]
+    fn a_server_that_sends_more_than_the_spec_allows_has_the_rest_dropped() {
+        let flood: Vec<String> = (0..MOST_COMPLETIONS + 1).map(|n| n.to_string()).collect();
+        let mut s = legacy(vec![Some(json!({"jsonrpc":"2.0","id":1,"result":{
+            "completion":{"values":flood,"hasMore":false}}}))]);
+        let found = s.complete(json!({}), json!({}), None).unwrap();
+        assert_eq!(found.values.len(), MOST_COMPLETIONS);
+        assert!(found.has_more, "what was dropped is still more");
+    }
+
+    #[test]
+    fn a_bounded_completion_puts_the_transport_back_however_it_ends() {
+        let bound = Duration::from_secs(2);
+        let mut s = Session::new(Timed::default()).offering(KnownVersion::LATEST_LEGACY);
+        let refused = s.complete_within(bound, json!({}), json!({}), None);
+        assert!(refused.is_err(), "the transport answered nothing");
+        assert_eq!(
+            s.transport.under,
+            [Some(bound), None],
+            "the bound goes on for the request and comes off after it"
+        );
     }
 }

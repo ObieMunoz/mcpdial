@@ -154,6 +154,8 @@ mcpdial --max-chars N ...        show at most N characters of a result; say so o
 mcpdial -o FILE ...              write the whole result to FILE; print one line saying so
 mcpdial prompts TARGET [--long]  every prompt a server offers
 mcpdial prompt TARGET NAME ['{"json":"args"}' | @file.json | - | key=value ...] [--elicit JSON|@file]
+mcpdial complete TARGET prompt NAME ARG [VALUE] [--context JSON]     what the server suggests goes here
+mcpdial complete TARGET resource TEMPLATE VAR [VALUE] [--context JSON]   the same for a uriTemplate variable
 mcpdial raw TARGET METHOD ['{"json":"params"}' | @file.json | -]
 mcpdial shell TARGET [--no-browser]  one session, many commands; state persists between calls
 mcpdial start NAME [--idle SECS] keep a stdio server running; later commands share its session
@@ -623,6 +625,23 @@ chrome> call new_page {"url":                     # the one match completes itse
 chrome> call navigate_page {"url": "x", "<TAB>
 "pageId":     "timeout":                          # url is written, so it is not offered
 ```
+
+A `prompt`'s arguments complete the same way, from the names the prompt declares. Where
+only the server knows what a value may be - a prompt argument, or one variable of a
+`uriTemplate` - Tab asks it, if it declared the `completions` capability:
+
+```
+docs> prompt summarize {"style": "th<TAB>
+docs> prompt summarize {"style": "thorough"       # completion/complete answered
+
+docs> read file:///notes/we<TAB>
+file:///notes/weekly.md                           # the template's variable, filled in
+```
+
+That request is a network round trip inside a keystroke, so it is given two seconds and
+no more: a server that is slow, wedged or gone costs one Tab that much, leaves the line
+exactly as it was, and prints nothing into the middle of it. `-v` traces it like any
+other message. `mcpdial complete` asks the same question from outside the shell.
 
 History is kept per saved server in `~/.config/mcpdial/history-NAME`. Piped input is
 read plainly, exactly as before, with no editing, no history and no completion, so

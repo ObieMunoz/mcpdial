@@ -225,6 +225,10 @@ mod unix {
             true
         }
 
+        fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+            self.framed.wait_at_most(within)
+        }
+
         fn close(&mut self) {
             self.framed.close_writer();
             let _ = self.stream.shutdown(std::net::Shutdown::Both);

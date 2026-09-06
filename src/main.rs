@@ -1,6 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use complete::ShellHelper;
+use complete::{ShellHelper, Suggests};
 use history::{History, Keep, Origin, Recorded};
 use mcpdial::catalog;
 use mcpdial::client::{self, describe_params, Listing, Options, Status};
@@ -22,11 +22,13 @@ use output::{As, Output, Payload};
 use present::style::ColorMode;
 use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::rc::Rc;
 use std::time::Duration;
 
 mod args;
@@ -433,6 +435,13 @@ enum Cmd {
         /// A resource URI from `mcpdial resources TARGET`, or a template expanded yourself
         uri: String,
     },
+    /// Suggest values for a prompt argument or a resource template variable
+    Complete {
+        #[arg(help = TARGET_HELP)]
+        target: String,
+        #[command(subcommand)]
+        of: Completing,
+    },
     /// Show the prompts a server offers
     Prompts {
         #[arg(help = TARGET_HELP)]
@@ -564,6 +573,38 @@ enum Cmd {
     /// Show or change how mcpdial itself behaves
     #[command(subcommand)]
     Config(ConfigCmd),
+}
+
+/// What `complete` is asking about: the two things a server may be asked to
+/// suggest values for, and nothing else - the spec names no third reference.
+#[derive(Subcommand)]
+enum Completing {
+    /// One argument of a prompt
+    Prompt {
+        /// A prompt name from `mcpdial prompts TARGET`
+        name: String,
+        /// The argument to suggest values for
+        argument: String,
+        /// What has been typed of it so far; empty asks for everything
+        #[arg(default_value = "")]
+        value: String,
+        /// The arguments already settled, which the server may narrow by: a JSON object or @file
+        #[arg(long, value_name = "JSON")]
+        context: Option<String>,
+    },
+    /// One variable of a resource template
+    Resource {
+        /// A uriTemplate from `mcpdial resources TARGET`
+        template: String,
+        /// The variable to suggest values for
+        variable: String,
+        /// What has been typed of it so far; empty asks for everything
+        #[arg(default_value = "")]
+        value: String,
+        /// The variables already settled, which the server may narrow by: a JSON object or @file
+        #[arg(long, value_name = "JSON")]
+        context: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1889,6 +1930,60 @@ fn read_arguments(path: &Path) -> Result<Value, Error> {
     parse_object(&text, "arguments")
 }
 
+/// How long Tab waits for a server's suggestions before offering what it can
+/// answer on its own.
+///
+/// `completion/complete` is a network round trip inside a keystroke. Two
+/// seconds is already longer than help-while-typing is worth, and long enough
+/// for a server that was ever going to answer; past it the line editor goes on
+/// without the server, and a server that never answers at all costs one Tab two
+/// seconds rather than the session.
+const COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The open session, lent to Tab completion for as long as the line editor is
+/// reading one line.
+///
+/// rustyline hands a completer a `&self` and nothing else, so the session that
+/// a `completion/complete` needs cannot be borrowed into it. The shell moves the
+/// session in before each read and takes it back the moment the read returns;
+/// nothing runs between those two points but the editor, and what the editor
+/// calls only ever borrows what it finds here.
+#[derive(Default, Clone)]
+struct Lent(Rc<RefCell<Option<client::Connection>>>);
+
+impl Lent {
+    /// One read of the line editor, with the session on loan for its length.
+    fn reading<R>(
+        &self,
+        conn: client::Connection,
+        read: impl FnOnce() -> R,
+    ) -> (client::Connection, R) {
+        *self.0.borrow_mut() = Some(conn);
+        let outcome = read();
+        let handed_back = self.0.borrow_mut().take();
+        let conn = handed_back.expect("what is lent is borrowed, never taken");
+        (conn, outcome)
+    }
+}
+
+impl Suggests for Lent {
+    /// The server's own suggestions, bounded by [`COMPLETION_TIMEOUT`] and
+    /// answered with nothing at all when none come back. A failure here is
+    /// silence on purpose: the alternative is an error printed into the middle
+    /// of the line being typed. `-v` traces this request and its failure like
+    /// every other.
+    fn values(&self, reference: Value, argument: Value, context: Option<Value>) -> Vec<String> {
+        let mut lent = self.0.borrow_mut();
+        let Some(conn) = lent.as_mut() else {
+            return Vec::new();
+        };
+        conn.session
+            .complete_within(COMPLETION_TIMEOUT, reference, argument, context)
+            .map(|found| found.values)
+            .unwrap_or_default()
+    }
+}
+
 /// Where shell input comes from. A terminal gets line editing, history and
 /// completion; anything else is read a line at a time exactly as before, which
 /// is what scripts and pipes depend on.
@@ -1986,12 +2081,30 @@ impl Input {
     }
 
     /// Offer what the session has learned to Tab completion.
-    fn set_completions(&mut self, tools: &[Value], resources: &[Value], prompts: &[Value]) {
+    fn set_completions(
+        &mut self,
+        tools: &[Value],
+        resources: &[Value],
+        templates: &[Value],
+        prompts: &[Value],
+    ) {
         if let Input::Tty { editor, .. } = self {
             if let Some(helper) = editor.helper_mut() {
                 helper.tools = tools.to_vec();
                 helper.resources = field_values(resources, "uri");
-                helper.prompts = field_values(prompts, "name");
+                helper.templates = field_values(templates, "uriTemplate");
+                helper.prompts = prompts.to_vec();
+            }
+        }
+    }
+
+    /// Where Tab's server-side suggestions come from, for a server that declares
+    /// it has any. Installed once: what it holds is the session itself, which
+    /// outlives every listing.
+    fn suggestions_from(&mut self, suggests: Rc<dyn Suggests>) {
+        if let Input::Tty { editor, .. } = self {
+            if let Some(helper) = editor.helper_mut() {
+                helper.suggests = Some(suggests);
             }
         }
     }
@@ -2484,13 +2597,17 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             // the shape the server actually wants.
             let mut cache: Option<Vec<Value>> = None;
             let mut resources: Option<Vec<Value>> = None;
+            let mut templates: Option<Vec<Value>> = None;
             let mut prompts: Option<Vec<Value>> = None;
+            // The session, for the length of a Tab and no longer; see [`Lent`].
+            let lent = Lent::default();
             if matches!(input, Input::Tty { .. }) {
                 // One eager fetch: it gives Tab something to complete and warms
                 // the same cache the hints read.
                 let tools = shell_tools(&mut cache, &mut conn).to_vec();
                 if advertises(&conn.server_info, "resources") {
                     resources = conn.session.list_resources().ok();
+                    templates = conn.session.list_resource_templates().ok();
                 }
                 if advertises(&conn.server_info, "prompts") {
                     prompts = conn.session.list_prompts().ok();
@@ -2498,8 +2615,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 input.set_completions(
                     &tools,
                     resources.as_deref().unwrap_or_default(),
+                    templates.as_deref().unwrap_or_default(),
                     prompts.as_deref().unwrap_or_default(),
                 );
+                if advertises(&conn.server_info, "completions") {
+                    input.suggestions_from(Rc::new(lent.clone()));
+                }
             }
             let info_cmd = "`info`";
             // Every result this session prints, numbered, so a later line can
@@ -2511,10 +2632,16 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             loop {
                 let raw = match pending.take() {
                     Some(line) => line,
-                    None => match input.next(ui)? {
-                        Some(line) => line,
-                        None => break,
-                    },
+                    None => {
+                        // The session goes on loan to Tab for the length of the
+                        // read and comes straight back; see [`Lent`].
+                        let (returned, read) = lent.reading(conn, || input.next(ui));
+                        conn = returned;
+                        match read? {
+                            Some(line) => line,
+                            None => break,
+                        }
+                    }
                 };
                 let text = raw.trim();
                 if text.is_empty() || text.starts_with('#') {
@@ -2577,25 +2704,26 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                     "resources" => match conn.session.list_resources() {
                         Err(e) => Err(missing_capability(e, "resources", info_cmd)),
                         Ok(found) => {
-                            let templates =
+                            let listed =
                                 conn.session.list_resource_templates().unwrap_or_default();
                             if cli.json {
                                 ui.line(&format!(
                                     "{}",
                                     json!({
                                         "resources": brief::resources(&found, long),
-                                        "resourceTemplates": brief::resources(&templates, long),
+                                        "resourceTemplates": brief::resources(&listed, long),
                                     })
                                 ));
                             } else {
                                 ui.line(&format!("{} resource(s):", found.len()));
                                 ui.resources(&found, long);
-                                if !templates.is_empty() {
-                                    ui.line(&format!("\n{} template(s):", templates.len()));
-                                    ui.resources(&templates, long);
+                                if !listed.is_empty() {
+                                    ui.line(&format!("\n{} template(s):", listed.len()));
+                                    ui.resources(&listed, long);
                                 }
                             }
                             resources = Some(found);
+                            templates = Some(listed);
                             Ok(())
                         }
                     },
@@ -2889,6 +3017,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
                 input.set_completions(
                     cache.as_deref().unwrap_or_default(),
                     resources.as_deref().unwrap_or_default(),
+                    templates.as_deref().unwrap_or_default(),
                     prompts.as_deref().unwrap_or_default(),
                 );
                 if let Err(f) = outcome {
@@ -3038,6 +3167,59 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             } else {
                 ui.line(&format!("{} prompt(s):\n", prompts.len()));
                 print_prompts(ui, &prompts, long);
+            }
+            Ok(0)
+        }
+
+        Cmd::Complete { target, of } => {
+            let (reference, name, value, context) = match of {
+                Completing::Prompt {
+                    name,
+                    argument,
+                    value,
+                    context,
+                } => (
+                    json!({ "type": "ref/prompt", "name": name }),
+                    argument,
+                    value,
+                    context,
+                ),
+                Completing::Resource {
+                    template,
+                    variable,
+                    value,
+                    context,
+                } => (
+                    json!({ "type": "ref/resource", "uri": template }),
+                    variable,
+                    value,
+                    context,
+                ),
+            };
+            let context = context
+                .map(|text| read_json_arg(&text, "context"))
+                .transpose()?
+                .map(|arguments| json!({ "arguments": arguments }));
+            let mut conn = dial(&store, &opts, &target)?;
+            let found = conn
+                .session
+                .complete(reference, json!({ "name": name, "value": value }), context)
+                .map_err(|e| missing_capability(e, "completions", &info_hint(&target)))?;
+            if cli.json {
+                print_json(
+                    ui,
+                    &json!({ "values": found.values, "hasMore": found.has_more }),
+                );
+            } else {
+                for value in &found.values {
+                    ui.line(value);
+                }
+            }
+            if found.has_more {
+                ui.err_line(&format!(
+                    "{} value(s); the server says it has more",
+                    found.values.len()
+                ));
             }
             Ok(0)
         }
