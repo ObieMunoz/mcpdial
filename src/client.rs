@@ -2,12 +2,16 @@
 //! selection and refresh, and the parallel status probe behind `mcpdial ls` -
 //! whose answers are remembered for [`STATUS_TTL`], so the next listing dials
 //! nothing.
+//!
+//! Which era of the protocol a saved server speaks is remembered beside those
+//! answers for [`ERA_TTL`], so a server from before 2026-07-28 is not asked for
+//! a `server/discover` it has never heard of on every connection.
 
-use crate::config::{now, Credential, ProbeRecord, ServerConfig, Store};
+use crate::config::{now, Credential, EraNote, ProbeRecord, ServerConfig, Store};
 use crate::elicit::{self, Answers, Elicit};
 use crate::notify::Level;
 use crate::oauth;
-use crate::protocol::{Error, KnownVersion, Result};
+use crate::protocol::{Era, Error, KnownVersion, Result};
 use crate::schema;
 use crate::session::Session;
 use crate::transport::http::{is_legacy_sse_error, HttpTransport, USER_AGENT};
@@ -329,6 +333,72 @@ fn http_transport(
     b.build()
 }
 
+/// Which revision to open a session with before the server has said anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opening {
+    /// Nothing is known about this server: work the era out from how it answers.
+    Detect,
+    /// The caller named a revision, so that is what is sent and a server that
+    /// will not speak it may say so.
+    Pinned(KnownVersion),
+    /// The era this server spoke last time, to be worked out after all if it
+    /// turns out to have moved on since.
+    Remembered(Era),
+}
+
+/// How to open `r`: what the caller named beats what was remembered, and what
+/// was remembered beats spending a request finding out.
+fn opening_for(store: &Store, r: &Resolved, opts: &Options) -> Result<Opening> {
+    if let Some(version) = pinned_version(r, opts)? {
+        return Ok(Opening::Pinned(version));
+    }
+    Ok(match remembered_era(store, r) {
+        Some(era) => Opening::Remembered(era),
+        None => Opening::Detect,
+    })
+}
+
+/// The era noted for a saved server, when the note still describes the server it
+/// was taken of and is younger than [`ERA_TTL`].
+///
+/// Only a saved server has a note: an ad-hoc URL is not a name [`Store`] keeps
+/// anything under, and [`Store::save_probes`] would drop one anyway.
+fn remembered_era(store: &Store, r: &Resolved) -> Option<Era> {
+    if !r.saved {
+        return None;
+    }
+    let remembered = store.probes().ok()?;
+    let note = remembered.get(&r.name)?.era?;
+    let describes_this_server = note.key == era_key(&r.config);
+    let still_worth_believing = now().saturating_sub(note.checked_at) < ERA_TTL.as_secs();
+    (describes_this_server && still_worth_believing).then_some(note.era)
+}
+
+/// Note the era the server turned out to speak, when that is news: a server
+/// nothing was remembered about, one whose note has aged out, or one that has
+/// moved to the other era since it was last dialed - which is how a wrong note
+/// corrects itself.
+///
+/// Best effort, and silent about failing. A note that cannot be written is one
+/// extra round trip next time, not a command that did not run.
+fn note_era(store: &Store, r: &Resolved, opening: Opening, opened: &Connection) {
+    let settled = Era::of(opened.session.version());
+    let worth_writing = r.saved
+        && !matches!(opening, Opening::Pinned(_))
+        && opening != Opening::Remembered(settled);
+    if !worth_writing {
+        return;
+    }
+    let _ = store.remember_era(
+        &r.name,
+        EraNote {
+            era: settled,
+            key: era_key(&r.config),
+            checked_at: now(),
+        },
+    );
+}
+
 /// The revision the caller named: the flag, else the one saved with the server,
 /// else `None` to let the session work out which era the server speaks. A saved
 /// value this build does not know is a config error, since the file was edited to
@@ -363,7 +433,7 @@ fn handshake(
     r: &Resolved,
     transport: impl Transport + 'static,
     auth: AuthUsed,
-    pinned: Option<KnownVersion>,
+    opening: Opening,
     opts: &Options,
 ) -> Result<Connection> {
     let mut transport = Box::new(transport) as Box<dyn Transport>;
@@ -376,9 +446,11 @@ fn handshake(
             false => json!({}),
         })
         .answering(can_answer, elicit::responder(&opts.elicit, elicit.clone()));
-    if let Some(version) = pinned {
-        session = session.offering(version);
-    }
+    session = match opening {
+        Opening::Detect => session,
+        Opening::Pinned(version) => session.offering(version),
+        Opening::Remembered(era) => session.expecting(era),
+    };
     let server_info = session.open()?.clone();
     if let Some(level) = opts.log_level {
         set_log_level(&mut session, &server_info, level);
@@ -452,19 +524,29 @@ pub fn open_stdio(r: &Resolved, opts: &Options) -> Result<Session<StdioTransport
 /// servers with a saved OAuth credential, a 401 triggers one refresh and retry
 /// before giving up, so an expired token that the clock did not predict still
 /// works without a visible hiccup.
+///
+/// The era the connection settles on is noted for a saved server, so the next
+/// one need not spend a request working out the same answer. `r` is read for the
+/// note rather than the expanded copy that is dialed: a note is about what
+/// `servers.json` says, not about what a `${VAR}` happened to hold.
 pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection> {
     let dialed = r.dialed()?;
-    let r = &dialed;
-    let pinned = pinned_version(r, opts)?;
+    let opening = opening_for(store, r, opts)?;
+    let opened = dial(store, &dialed, opts, opening)?;
+    note_era(store, r, opening, &opened);
+    Ok(opened)
+}
+
+fn dial(store: &Store, r: &Resolved, opts: &Options, opening: Opening) -> Result<Connection> {
     let timeout = opts.timeout_for(r)?;
     if r.config.stdio.is_some() {
         #[cfg(unix)]
         if r.saved && !opts.no_daemon {
             if let Some(t) = crate::daemon::attach(store, &r.name, timeout, opts.logger(&r.name))? {
-                return handshake(r, t, AuthUsed::None, pinned, opts);
+                return handshake(r, t, AuthUsed::None, opening, opts);
             }
         }
-        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, pinned, opts);
+        return handshake(r, spawn_stdio(r, opts)?, AuthUsed::None, opening, opts);
     }
 
     let (token, auth) = select_token(store, r, opts, timeout)?;
@@ -472,7 +554,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
         r,
         http_transport(r, token, opts, timeout),
         auth,
-        pinned,
+        opening,
         opts,
     ) {
         Err(e) if e.is_auth_challenge() && auth == AuthUsed::Saved => {
@@ -485,7 +567,7 @@ pub fn connect(store: &Store, r: &Resolved, opts: &Options) -> Result<Connection
                 r,
                 http_transport(r, cred.access_token, opts, timeout),
                 auth,
-                pinned,
+                opening,
                 opts,
             )
         }
@@ -673,6 +755,16 @@ pub fn probe_all(store: &Store, opts: &Options, with_tools: bool) -> Result<Vec<
 /// answer still describes this sitting at the terminal rather than the last one.
 pub const STATUS_TTL: Duration = Duration::from_secs(5 * 60);
 
+/// How long a remembered era stands in for working one out again.
+///
+/// Far longer than [`STATUS_TTL`], because an era is a fact about the software
+/// deployed behind an address rather than about its health this minute, and a
+/// note that has gone wrong corrects itself on the first request anyway. What
+/// the bound is for is the one case that corrects nothing: a server upgraded to
+/// 2026-07-28 that still humours a handshake, which nobody would otherwise ever
+/// find out about.
+pub const ERA_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 /// Whether [`listing`] may answer from the remembered probes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
@@ -742,6 +834,9 @@ impl Listing {
         })
     }
 
+    /// What this row remembers. The era is left out: a probe never worked one
+    /// out, the connection behind it did, and [`Store::save_probes`] keeps
+    /// whatever that noted.
     fn record(&self, key: u64) -> ProbeRecord {
         ProbeRecord {
             checked_at: self.checked_at,
@@ -750,12 +845,28 @@ impl Listing {
             auth: serde_json::to_value(self.auth).expect("an auth is serializable"),
             server: self.server.clone(),
             tools: self.tools,
+            era: None,
         }
     }
 }
 
 fn token_env_of(servers: &BTreeMap<String, ServerConfig>, name: &str) -> Option<String> {
     servers.get(name).and_then(|cfg| cfg.token_env.clone())
+}
+
+/// What a remembered era is an era *of*. Edit the address or the command and the
+/// note no longer describes what it names.
+///
+/// Deliberately narrower than [`probe_keys`], which folds in whether a
+/// credential is saved as well: a status turns on that and an era does not, and
+/// reading it here would mean asking a keychain for a token on every connection
+/// that has no use for one.
+fn era_key(cfg: &ServerConfig) -> u64 {
+    let mut h = DefaultHasher::new();
+    serde_json::to_string(cfg)
+        .expect("a server config is serializable")
+        .hash(&mut h);
+    h.finish()
 }
 
 /// What each server's status is a status *of*. Edit the server, or save or drop
@@ -766,9 +877,7 @@ fn probe_keys(store: &Store, servers: &BTreeMap<String, ServerConfig>) -> BTreeM
         .iter()
         .map(|(name, cfg)| {
             let mut h = DefaultHasher::new();
-            serde_json::to_string(cfg)
-                .expect("a server config is serializable")
-                .hash(&mut h);
+            era_key(cfg).hash(&mut h);
             credentials
                 .get(name)
                 .is_some_and(Credential::has_token)

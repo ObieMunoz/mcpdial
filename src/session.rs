@@ -4,9 +4,9 @@
 use crate::notify::{self, Notice};
 use crate::protocol::{
     check, classify, input_required, is_modern_error, negotiate, notification, request, rpc_error,
-    with_client_meta, with_input_responses, with_progress_token, Error, Incoming, InputRequired,
-    KnownVersion, Responder, Result, CLIENT_NAME, CLIENT_VERSION, META_SERVER_INFO, PING,
-    UNSUPPORTED_PROTOCOL_VERSION,
+    with_client_meta, with_input_responses, with_progress_token, Era, Error, Incoming,
+    InputRequired, KnownVersion, Responder, Result, CLIENT_NAME, CLIENT_VERSION, META_SERVER_INFO,
+    METHOD_NOT_FOUND, PING, UNSUPPORTED_PROTOCOL_VERSION,
 };
 use crate::transport::Transport;
 use base64::engine::general_purpose::STANDARD;
@@ -90,6 +90,11 @@ pub struct Session<T: Transport> {
     /// Set by [`Session::offering`]: the caller named a revision, so the era is
     /// not worked out from how the server answers and not changed behind them.
     pinned: bool,
+    /// Set by [`Session::expecting`]: this server spoke that era last time, so
+    /// opening starts there instead of working it out. Cleared the moment the
+    /// server says otherwise, which is what makes it a memory rather than a
+    /// second kind of pin.
+    expected: Option<Era>,
     /// What `initialize` declares this client can do. Empty until something is
     /// installed that can actually serve a request the server makes back.
     capabilities: Value,
@@ -115,6 +120,7 @@ impl<T: Transport> Session<T> {
             server_info: Value::Null,
             version: KnownVersion::LATEST,
             pinned: false,
+            expected: None,
             capabilities: json!({}),
             answering: None,
         }
@@ -156,6 +162,19 @@ impl<T: Transport> Session<T> {
     pub fn offering(mut self, version: KnownVersion) -> Self {
         self.version = version;
         self.pinned = true;
+        self
+    }
+
+    /// Open at the era this server spoke the last time it was dialed, rather
+    /// than spending a request working the same answer out again.
+    ///
+    /// Unlike [`Self::offering`] this is a memory and not an instruction. A
+    /// server upgraded past the era it was noted at refuses what it no longer
+    /// has, and [`Self::open`] works the era out after all - so a note that has
+    /// gone stale costs the round trip it was saving, and never the command.
+    pub fn expecting(mut self, era: Era) -> Self {
+        self.version = era.opens_at();
+        self.expected = Some(era);
         self
     }
 
@@ -399,21 +418,55 @@ impl<T: Transport> Session<T> {
     /// era a server speaks cannot be asked in the abstract, so it is read off how
     /// it answers the newer request - which is also the request a server that
     /// speaks the newer revision wanted first anyway.
+    ///
+    /// [`Self::expecting`] skips that reading for a server already known to be
+    /// from before it. The whole safety of remembering an era is here: a server
+    /// upgraded since the note was taken refuses the handshake, and the era is
+    /// worked out from scratch rather than the command failing over a stale
+    /// note. What that costs is the one round trip the note was there to save.
     pub fn open(&mut self) -> Result<&Value> {
+        if let Err(refused) = self.bring_up() {
+            if !self.expectation_was_wrong(&refused) {
+                return Err(refused);
+            }
+            self.expected = None;
+            self.version = KnownVersion::LATEST;
+            self.bring_up()?;
+        }
+        Ok(&self.server_info)
+    }
+
+    /// One attempt at opening, on the era [`Self::version`] currently names.
+    fn bring_up(&mut self) -> Result<()> {
         if !self.version.is_modern() {
-            return self.initialize();
+            self.initialize()?;
+            return Ok(());
         }
         let refused = match self.discover() {
-            Ok(()) => return Ok(&self.server_info),
+            Ok(()) => return Ok(()),
             Err(e) => e,
         };
         match self.instead_of_discovering(&refused)? {
             Some(version) => {
                 self.version = version;
-                self.initialize()
+                self.initialize()?;
+                Ok(())
             }
             None => Err(refused),
         }
+    }
+
+    /// Whether a failed open is explained by the era that was expected of the
+    /// server rather than by the server being unwell.
+    ///
+    /// Only [`Era::Handshake`] can be wrong in a way worth another attempt: it
+    /// is the only expectation that skips a request, and what it skips is
+    /// exactly the request that would have found the server out. Expecting
+    /// [`Era::Discovery`] asks `server/discover` first and falls back on a
+    /// refusal all the same, so going round again would only send what has just
+    /// been sent.
+    fn expectation_was_wrong(&self, refused: &Error) -> bool {
+        self.expected == Some(Era::Handshake) && moved_past_the_handshake(refused)
     }
 
     /// Which revision to try `initialize` with after `server/discover` was
@@ -689,6 +742,28 @@ impl<T: Transport> Drop for Session<T> {
     fn drop(&mut self) {
         self.transport.close();
     }
+}
+
+/// Whether a refusal of `initialize` reads as "there is no such method here any
+/// more", which is what a server upgraded past the era it was last noted at
+/// answers a handshake with.
+///
+/// Three ways it can arrive: the method is gone (`-32601`, over a JSON-RPC error
+/// or the `400` a strict endpoint wraps one in), the complaint is one of the
+/// three only a 2026-07-28 server makes, or the endpoint had no route for the
+/// request at all. A refused credential, an unreachable host or a server that is
+/// simply unwell is none of these, and there is nothing to be gained by asking
+/// such a server the same thing twice.
+fn moved_past_the_handshake(refused: &Error) -> bool {
+    let code = rpc_error(refused).and_then(|e| e["code"].as_i64());
+    code.is_some_and(|c| c == METHOD_NOT_FOUND || is_modern_error(c))
+        || matches!(
+            refused,
+            Error::Http {
+                status: 400 | 404 | 405,
+                ..
+            }
+        )
 }
 
 /// The newest revision mcpdial speaks out of the ones an `UnsupportedProtocolVersion`
@@ -1264,6 +1339,75 @@ mod tests {
         .offering(KnownVersion::V2026_07_28);
         assert!(new.open().is_err());
         assert_eq!(new.transport.sent.len(), 1, "no handshake behind the pin");
+    }
+
+    #[test]
+    fn a_remembered_handshake_era_skips_the_discovery_it_would_only_refuse() {
+        let mut s = fake(vec![Some(
+            json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","serverInfo":{"name":"old"}}}),
+        )])
+        .expecting(Era::Handshake);
+
+        let info = s.open().unwrap().clone();
+        assert_eq!(info["serverInfo"]["name"], "old");
+        assert_eq!(s.version(), KnownVersion::V2025_11_25);
+        let sent = &s.transport.sent;
+        assert_eq!(sent[0]["method"], "initialize", "the round trip we saved");
+        assert_eq!(sent[1]["method"], "notifications/initialized");
+        assert_eq!(sent.len(), 2);
+    }
+
+    /// The note that decides whether any of this is safe: a server upgraded
+    /// since it was last dialed answers the handshake with nothing, and the era
+    /// is worked out after all rather than the command failing.
+    #[test]
+    fn a_remembered_era_the_server_has_outgrown_is_worked_out_again() {
+        for gone in [
+            Some(refused(METHOD_NOT_FOUND, "Method not found", Value::Null)),
+            Some(refused(HEADER_MISMATCH, "Mcp-Method missing", Value::Null)),
+        ] {
+            let mut s = fake(vec![
+                gone,
+                Some(discovered(
+                    json!({"capabilities": {}, "_meta": {META_SERVER_INFO: {"name": "upgraded"}}}),
+                )),
+            ])
+            .expecting(Era::Handshake);
+
+            let info = s.open().unwrap().clone();
+            assert_eq!(info["serverInfo"]["name"], "upgraded");
+            assert_eq!(s.version(), KnownVersion::V2026_07_28);
+            let sent = &s.transport.sent;
+            assert_eq!(sent[0]["method"], "initialize", "what the note asked for");
+            assert_eq!(sent[1]["method"], "server/discover", "what it really is");
+            assert_eq!(sent.len(), 2, "and no handshake behind that");
+        }
+    }
+
+    #[test]
+    fn a_server_that_is_merely_unwell_is_not_dialed_twice_over_a_note() {
+        let mut s = fake(vec![Some(refused(-32603, "Internal error", Value::Null))])
+            .expecting(Era::Handshake);
+        let e = s.open().unwrap_err();
+        assert!(matches!(e, Error::Rpc { code: -32603, .. }), "{e:?}");
+        assert_eq!(s.transport.sent.len(), 1, "the error is the server's own");
+    }
+
+    #[test]
+    fn remembering_the_newer_era_leaves_detection_exactly_as_it_was() {
+        let mut s = fake(vec![
+            Some(refused(METHOD_NOT_FOUND, "Method not found", Value::Null)),
+            Some(json!({"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25"}})),
+        ])
+        .expecting(Era::Discovery);
+
+        s.open().unwrap();
+        assert_eq!(s.version(), KnownVersion::V2025_11_25);
+        let sent = &s.transport.sent;
+        assert_eq!(sent[0]["method"], "server/discover");
+        assert_eq!(sent[1]["method"], "initialize", "the fallback, once");
+        assert_eq!(sent[2]["method"], "notifications/initialized");
+        assert_eq!(sent.len(), 3);
     }
 
     #[test]

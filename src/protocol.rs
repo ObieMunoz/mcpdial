@@ -6,6 +6,7 @@
 //! 2. Transport is HTTP POST to one endpoint, or newline-delimited JSON over stdio.
 //! 3. The methods you actually need are `initialize`, `tools/list` and `tools/call`.
 
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::fmt;
 use std::str::FromStr;
@@ -142,6 +143,43 @@ impl FromStr for KnownVersion {
                 KnownVersion::listed()
             )
         })
+    }
+}
+
+/// Which of the protocol's two shapes a server speaks, and the one thing about
+/// a server worth remembering between connections: it takes a request to find
+/// out, and it is the only thing a request has to be spent on before there is
+/// anything to say.
+///
+/// The revision within an era is deliberately not part of it. A server that
+/// negotiates `initialize` down to 2025-06-18 is still reached next time by
+/// offering the newest revision that has a handshake, so which revision a
+/// session runs on stays the server's to choose every time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Era {
+    /// `server/discover` and per-request metadata, with no handshake to open:
+    /// 2026-07-28 and after.
+    Discovery,
+    /// The `initialize` handshake: every revision before it.
+    Handshake,
+}
+
+impl Era {
+    /// Which era a session running on `version` is in.
+    pub fn of(version: KnownVersion) -> Era {
+        match version.is_modern() {
+            true => Era::Discovery,
+            false => Era::Handshake,
+        }
+    }
+
+    /// The revision to open a session with for a server of this era.
+    pub fn opens_at(self) -> KnownVersion {
+        match self {
+            Era::Discovery => KnownVersion::LATEST,
+            Era::Handshake => KnownVersion::LATEST_LEGACY,
+        }
     }
 }
 

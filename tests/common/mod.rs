@@ -69,6 +69,10 @@ pub enum Mode {
     /// A 2026-07-28 server that will not speak that revision with us: `server/discover`
     /// is refused with the versions it does speak, and it serves the handshake for them.
     DualEra,
+    /// Stateless until [`FakeServer::upgrade`] is called, and a [`Mode::Modern`]
+    /// server from then on: the deployment an operator replaces between two runs
+    /// of a client that has already made a note of what it found there.
+    Upgradable,
     /// Accepts every request and answers none of them, until the server is dropped.
     BlackHole,
     /// Revision 2026-07-28 in every respect but one: a `subscriptions/listen`
@@ -151,14 +155,32 @@ struct State {
     issued: u32,
     stuck_cursor_pages_served: u32,
     refused_once: bool,
+    /// Thrown by [`FakeServer::upgrade`], and read by [`Mode::Upgradable`].
+    upgraded: bool,
 }
 
 pub struct FakeServer {
     pub base: String,
     pub url: String,
     pub requests: Arc<Mutex<Vec<Recorded>>>,
+    state: Arc<Mutex<State>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+impl FakeServer {
+    /// Put a 2026-07-28 server behind this address, which a [`Mode::Upgradable`]
+    /// one becomes: the handshake it was answering a moment ago is now a method
+    /// it does not have.
+    pub fn upgrade(&self) {
+        self.state.lock().unwrap().upgraded = true;
+    }
+
+    /// Forget what has been sent so far, so that the next run's requests are the
+    /// only ones a test reads.
+    pub fn forget_requests(&self) {
+        self.requests.lock().unwrap().clear();
+    }
 }
 
 impl Drop for FakeServer {
@@ -196,6 +218,7 @@ pub fn start(mode: Mode) -> FakeServer {
         let requests = requests.clone();
         let stop = stop.clone();
         let base = base.clone();
+        let state = state.clone();
         thread::spawn(move || {
             // What a black hole swallows: kept unanswered until the thread ends.
             let mut held = Vec::new();
@@ -232,6 +255,7 @@ pub fn start(mode: Mode) -> FakeServer {
         base,
         url,
         requests,
+        state,
         stop,
         handle: Some(handle),
     }
@@ -691,6 +715,11 @@ fn mcp(mode: &Mode, base: &str, rec: &Recorded, state: &Mutex<State>) -> Resp {
         Mode::Modern | Mode::ModernInput { .. } | Mode::SilentSubscription
     ) {
         return modern(mode, rec, state);
+    }
+
+    let upgraded = matches!(mode, Mode::Upgradable) && state.lock().unwrap().upgraded;
+    if upgraded {
+        return modern(&Mode::Modern, rec, state);
     }
 
     let stateful = matches!(

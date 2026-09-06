@@ -297,6 +297,13 @@ mirrors its method and subject into the `Mcp-Method` and `Mcp-Name` headers.
 serves both eras to the handshake, `2025-06-18` suits one that misbehaves when offered
 anything newer - and `add --protocol-version` saves the choice.
 
+Which era a saved server turned out to speak is remembered in `probes.json` for a
+week, so an older server is asked for the `server/discover` it has never heard of once
+rather than on every connection. Editing the server drops the note, and so does a week
+passing. A server upgraded under one answers the handshake with nothing, and the era
+is worked out from scratch and the note corrected: a note that has gone stale costs
+the round trip it was saving, and never the command.
+
 That revision also renumbered the answer to a resource that is not there, from the
 `-32002` every revision before it used to a plain `-32602`. mcpdial reads both, and a
 `read` or a `prompt` that finds nothing carries a hint naming the listing that would
@@ -1230,6 +1237,7 @@ host config, and `add --registry` writes them for what an entry marks as require
 ~/.config/mcpdial/config.json        how mcpdial behaves: where credentials are kept
 ~/.config/mcpdial/catalog.json       the catalog as last refreshed (a cache)
 ~/.config/mcpdial/registry/          a copy of the registry's list, for `search`
+~/.config/mcpdial/probes.json        what `ls` last saw, and each server's protocol era
 ~/.config/mcpdial/tasks.json         background task ids started here (a note, not the truth)
 ~/.config/mcpdial/run/NAME.sock      where a server kept running by `start` listens
 ```

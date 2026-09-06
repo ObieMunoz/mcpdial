@@ -6,7 +6,8 @@
 //! servers.json      what you configured: transport, URL or command, headers
 //! credentials.json  what was acquired: tokens, refresh tokens, OAuth client ids
 //! config.json       how mcpdial itself behaves: where credentials are kept
-//! probes.json       what `ls` last saw: one status per server, with its timestamp
+//! probes.json       what `ls` last saw: one status per server, with its
+//!                   timestamp, and which protocol era the server turned out to speak
 //! tasks.json        which background tasks were started here, see [`crate::tasks`]
 //! run/NAME.sock     where a server kept alive by `start` listens, see [`crate::daemon`]
 //! *.json.lock       empty; held while a file is rewritten, see [`FileLock`]
@@ -20,7 +21,7 @@
 //! either way, so nothing above this module knows which store answered.
 
 use crate::keychain::{self, Backend};
-use crate::protocol::{Error, Result};
+use crate::protocol::{Era, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -396,6 +397,40 @@ pub struct ProbeRecord {
     pub server: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<usize>,
+    /// Which era of the protocol the server turned out to speak, so the next
+    /// connection need not spend a request finding out. Absent from every file
+    /// written before eras were remembered, and read there as "find out".
+    #[serde(
+        default,
+        deserialize_with = "readable_era",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub era: Option<EraNote>,
+}
+
+/// One remembered era, so a connection to a server from before 2026-07-28 need
+/// not open with the `server/discover` that server has never heard of.
+///
+/// Keyed and timestamped in its own right rather than off the record around it:
+/// that record is rewritten by every `ls`, and an era whose age was refreshed by
+/// a status probe that re-checked nothing would never expire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct EraNote {
+    pub era: Era,
+    /// What the era was worked out about; see `client::era_key`.
+    pub key: u64,
+    /// Unix seconds when a connection last worked the era out.
+    pub checked_at: u64,
+}
+
+/// A note this build cannot read is a cache miss and one extra round trip, not a
+/// file it refuses to open - the same rule `status` and `auth` are kept as raw
+/// JSON for.
+fn readable_era<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<EraNote>, D::Error> {
+    let written = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(written.and_then(|note| serde_json::from_value(note).ok()))
 }
 
 pub fn now() -> u64 {
@@ -715,13 +750,32 @@ impl Store {
 
     /// Record the probes just taken, keeping what other servers last reported
     /// and dropping whatever is left over from a server that no longer exists.
+    ///
+    /// A probe has nothing to say about the protocol era - the connection it
+    /// opened worked that out and noted it itself - so a record carrying none
+    /// keeps the era already noted rather than erasing it.
     pub fn save_probes(&self, taken: BTreeMap<String, ProbeRecord>) -> Result<()> {
         let saved = self.servers()?;
         let path = self.probes_path();
         let _lock = FileLock::acquire(&path)?;
         let mut file = read_json::<ProbesFile>(&path)?;
-        file.probes.extend(taken);
+        for (name, mut record) in taken {
+            record.era = record
+                .era
+                .or_else(|| file.probes.get(&name).and_then(|noted| noted.era));
+            file.probes.insert(name, record);
+        }
         file.probes.retain(|name, _| saved.contains_key(name));
+        write_json(&path, &file, false)
+    }
+
+    /// Note which era of the protocol a saved server turned out to speak,
+    /// leaving whatever else was remembered about it alone.
+    pub fn remember_era(&self, name: &str, note: EraNote) -> Result<()> {
+        let path = self.probes_path();
+        let _lock = FileLock::acquire(&path)?;
+        let mut file = read_json::<ProbesFile>(&path)?;
+        file.probes.entry(name.to_string()).or_default().era = Some(note);
         write_json(&path, &file, false)
     }
 
