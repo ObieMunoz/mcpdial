@@ -282,6 +282,8 @@ mcpdial resources TARGET --json   {"resources":[...],"resourceTemplates":[...]}
 mcpdial read TARGET URI --json    the resources/read result
 mcpdial prompts TARGET --json     {"prompts":[...]}
 mcpdial prompt TARGET NAME '{"json":"args"}' --json   the prompts/get result
+mcpdial complete TARGET prompt NAME ARG [VALUE] [--context '{"other":"arg"}']
+mcpdial complete TARGET resource TEMPLATE VAR [VALUE] [--context '{"other":"var"}']
 ```
 
 Both listings are short, as `tools` is: a `uri` or `uriTemplate`, a `name`, and the
@@ -297,6 +299,14 @@ one `role: text` line per message and puts the prompt's description on stderr.
 
 A prompt's `arguments` are names and descriptions with no schema behind them: every value
 is a string. `mcpdial prompts TARGET --long` is where they are.
+
+A server that declares `completions` can say what one of those values, or one variable of
+a `uriTemplate`, is allowed to be: `complete` prints one suggestion per line, and
+`{"values":[...],"hasMore":bool}` under `--json`. `VALUE` is what has been typed so far
+and narrows the answer; `--context` carries the arguments already settled, which a server
+may narrow by as well. At most a hundred values come back, ranked by the server, and
+`hasMore` says whether it held any more of them. A server without the capability answers
+`-32601` with the usual `hint`, and exit 1.
 
 A server that never implemented one of these answers `-32601`. That error carries a `hint`
 naming the missing capability, so a bare method-not-found never has to be decoded.

@@ -40,6 +40,9 @@ pub struct HttpTransport {
     agent: ureq::Agent,
     log: Logger,
     retry: Retry,
+    /// A shorter wait, in place of the agent's own, for whoever set one; see
+    /// [`Transport::wait_at_most`].
+    wait: Option<Duration>,
     /// Tools the server has listed with `idempotentHint`, so far as listings have
     /// passed through here: the only `tools/call`s that are safe to send twice.
     idempotent_tools: HashSet<String>,
@@ -206,6 +209,7 @@ impl HttpTransportBuilder {
             extra_headers: self.extra_headers,
             agent: ureq::Agent::new_with_config(config),
             log: self.log.unwrap_or_else(silent),
+            wait: None,
             retry: Retry {
                 enabled: self.retry,
                 timeout: self.timeout,
@@ -367,13 +371,16 @@ impl HttpTransport {
             });
         };
 
-        let mut req = self.identify(
-            self.agent
-                .post(&self.url)
-                .header("Content-Type", "application/json")
-                // Advertise both: the server picks the framing.
-                .header("Accept", "application/json, text/event-stream"),
-        );
+        let posting = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            // Advertise both: the server picks the framing.
+            .header("Accept", "application/json, text/event-stream");
+        let mut req = self.identify(match self.wait {
+            Some(within) => posting.config().timeout_global(Some(within)).build(),
+            None => posting,
+        });
         for (name, value) in mirrored_headers(payload) {
             req = req.header(name, &value);
         }
@@ -557,9 +564,16 @@ impl Transport for HttpTransport {
             Ok(reply) => return Ok(reply),
             Err(failed) => failed,
         };
+        // A bounded exchange is one keystroke's worth of patience; spending it
+        // twice over, with a wait in between, is not the bound it was given.
         let Some(delay) = self
-            .retry
-            .delay(idempotent, self.session_id.is_some(), &first.failure)
+            .wait
+            .is_none()
+            .then(|| {
+                self.retry
+                    .delay(idempotent, self.session_id.is_some(), &first.failure)
+            })
+            .flatten()
         else {
             return Err(first.error);
         };
@@ -570,6 +584,10 @@ impl Transport for HttpTransport {
         std::thread::sleep(delay);
         self.attempt(payload, &body, watch)
             .map_err(|second| second.error)
+    }
+
+    fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+        std::mem::replace(&mut self.wait, within)
     }
 
     fn negotiated(&mut self, version: KnownVersion) {

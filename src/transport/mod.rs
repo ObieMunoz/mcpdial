@@ -7,6 +7,7 @@ pub mod trace;
 
 use crate::protocol::{KnownVersion, Responder, Result};
 use serde_json::Value;
+use std::time::Duration;
 pub(crate) use trace::silent;
 pub use trace::{Logger, TraceEvent};
 
@@ -30,6 +31,19 @@ pub trait Transport {
     ) -> Result<Option<Value>> {
         let _ = watch;
         self.send(payload)
+    }
+
+    /// Wait no longer than `within` for each exchange from here on, in place of
+    /// the timeout this transport was built with, and hand back the wait that
+    /// was in force so a caller can put it back. `None` clears it.
+    ///
+    /// What this exists for is a request sent inside a keystroke: Tab
+    /// completion cannot spend the sixty seconds a tool call may. A transport
+    /// that keeps no clock of its own ignores it, which is what the default
+    /// does.
+    fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+        let _ = within;
+        None
     }
 
     /// Told once, after `initialize`, which version the session settled on. HTTP
@@ -58,6 +72,9 @@ impl Transport for Box<dyn Transport> {
         watch: &mut dyn FnMut(&Value),
     ) -> Result<Option<Value>> {
         (**self).send_watching(payload, watch)
+    }
+    fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+        (**self).wait_at_most(within)
     }
     fn negotiated(&mut self, version: KnownVersion) {
         (**self).negotiated(version)

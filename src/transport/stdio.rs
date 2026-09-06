@@ -28,6 +28,9 @@ pub(crate) struct Framed {
     writer: Option<Box<dyn Write + Send>>,
     lines: Receiver<String>,
     timeout: Duration,
+    /// A shorter wait, in place of `timeout`, for whoever set one; see
+    /// [`Transport::wait_at_most`](super::Transport::wait_at_most).
+    wait: Option<Duration>,
     log: Logger,
     wire: Wire<'static>,
     /// Serves what the peer asks of us beyond `ping`, when a capability for it
@@ -58,6 +61,7 @@ impl Framed {
             writer: Some(Box::new(writer)),
             lines: rx,
             timeout,
+            wait: None,
             log,
             wire,
             responder: None,
@@ -70,6 +74,16 @@ impl Framed {
 
     pub(crate) fn answer_requests(&mut self, responder: Responder) {
         self.responder = Some(responder);
+    }
+
+    pub(crate) fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+        std::mem::replace(&mut self.wait, within)
+    }
+
+    /// How long one exchange may take: what somebody asked for inside a
+    /// keystroke, else the timeout this connection was built with.
+    fn patience(&self) -> Duration {
+        self.wait.unwrap_or(self.timeout)
     }
 
     fn write_line(&mut self, body: &str) -> io::Result<()> {
@@ -119,7 +133,8 @@ impl Framed {
             _ => return Ok(None),
         };
 
-        let deadline = Instant::now() + self.timeout;
+        let patience = self.patience();
+        let deadline = Instant::now() + patience;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let line = match self.lines.recv_timeout(left) {
@@ -127,7 +142,7 @@ impl Framed {
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(Error::transport(format!(
                         "no reply after {}s",
-                        self.timeout.as_secs_f64()
+                        patience.as_secs_f64()
                     )))
                 }
                 Err(RecvTimeoutError::Disconnected) => return Err(gone()),
@@ -356,6 +371,10 @@ impl Transport for StdioTransport {
         self.exchange(payload, &mut |_| None)
     }
 
+    fn wait_at_most(&mut self, within: Option<Duration>) -> Option<Duration> {
+        self.framed.wait_at_most(within)
+    }
+
     fn send_watching(
         &mut self,
         payload: &Value,
@@ -468,7 +487,49 @@ pub fn split_command(s: &str) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_command;
+    use super::{silent, split_command, Error, Framed, Wire};
+    use serde_json::json;
+    use std::io;
+    use std::io::Read;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    /// A peer that holds its end of the connection open and says nothing.
+    struct Mute;
+
+    impl Read for Mute {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            thread::sleep(Duration::from_secs(5));
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_shorter_wait_bounds_one_exchange_and_comes_off_after_it() {
+        let patience = Duration::from_millis(50);
+        let mut framed = Framed::new(
+            io::sink(),
+            Mute,
+            Wire::Stdio,
+            Duration::from_secs(60),
+            silent(),
+        );
+        assert_eq!(framed.wait_at_most(Some(patience)), None);
+
+        let started = Instant::now();
+        let refused = framed.exchange(
+            &json!({"jsonrpc":"2.0","id":1,"method":"completion/complete"}),
+            &mut || Error::transport("gone"),
+            &mut |_| None,
+        );
+        assert!(refused.is_err(), "a peer that says nothing answers nothing");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the exchange waited the transport's own timeout, not the bound"
+        );
+        // And the transport is left as it was found.
+        assert_eq!(framed.wait_at_most(None), Some(patience));
+    }
 
     #[test]
     fn splits_like_a_shell() {
