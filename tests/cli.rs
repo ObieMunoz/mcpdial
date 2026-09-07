@@ -1,8 +1,8 @@
 mod common;
 
 use common::{
-    echo_command, echo_server, mcpdial, run, start, temp_home, Iss, Mode, Out, CONFIDENTIAL_ID,
-    CONFIDENTIAL_SECRET as SECRET,
+    echo_command, echo_server, mcpdial, run, start, temp_home, timed, Iss, Mode, Out,
+    CONFIDENTIAL_ID, CONFIDENTIAL_SECRET as SECRET,
 };
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -3106,11 +3106,10 @@ fn a_2024_11_05_server_is_named_rather_than_reported_as_a_bare_status() {
 
     // No --timeout: a probe that read the stream to its end would sit here for the
     // default 60s instead, and the server never ends it.
-    let started = std::time::Instant::now();
-    let o = run(mcpdial(&home).args(["info", "old"]));
+    let (took, o) = timed(mcpdial(&home).args(["info", "old"]));
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(10),
-        "the probe waited out a stream that never ends"
+        took < std::time::Duration::from_secs(10),
+        "the probe waited out a stream that never ends, {took:?}"
     );
     assert_ne!(o.code, 0);
     assert!(o.stderr.contains("HTTP+SSE"), "{}", o.stderr);
@@ -3346,8 +3345,8 @@ fn an_elicitation_with_nobody_to_ask_is_declined_rather_than_refused() {
     // Nothing here is a terminal, so there is no one to put the question to.
     // The old answer was -32601, which fails the call; a decline is an answer
     // the server can degrade around, and it has to arrive at once.
-    let started = std::time::Instant::now();
-    let o = run(elicits(&home, "form").args(["--timeout", "30", "call", &target, "echo", "{}"]));
+    let (took, o) =
+        timed(elicits(&home, "form").args(["--timeout", "30", "call", &target, "echo", "{}"]));
     assert_eq!(o.code, 0, "{}", o.stderr);
     assert_eq!(o.stdout.trim(), r#"elicited {"action":"decline"}"#);
     assert!(
@@ -3357,8 +3356,8 @@ fn an_elicitation_with_nobody_to_ask_is_declined_rather_than_refused() {
         o.stderr
     );
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(20),
-        "the call must not sit on the timeout waiting for a person"
+        took < std::time::Duration::from_secs(20),
+        "the call must not sit on the timeout waiting for a person, {took:?}"
     );
 
     // And with nothing that can fill in a form, none is offered at initialize.

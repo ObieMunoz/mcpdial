@@ -3,11 +3,10 @@
 
 mod common;
 
-use common::{echo_command, mcpdial, run, start, temp_home, Mode, Recorded};
+use common::{echo_command, mcpdial, run, start, temp_home, timed, Mode, Recorded};
 use serde_json::Value;
 use std::io::Write;
 use std::process::Stdio;
-use std::time::Instant;
 
 fn methods(reqs: &[Recorded]) -> Vec<String> {
     reqs.iter()
@@ -123,8 +122,7 @@ fn a_server_that_stays_unavailable_fails_after_exactly_two_attempts() {
     let s = start(Mode::Unavailable);
     let home = temp_home("retry-twice");
 
-    let started = Instant::now();
-    let o = run(mcpdial(&home).args(["--json", "--timeout", "1", "info", &s.url]));
+    let (took, o) = timed(mcpdial(&home).args(["--json", "--timeout", "1", "info", &s.url]));
     assert_eq!(o.code, 1, "{}", o.stderr);
     let e: Value = serde_json::from_str(o.stderr.trim()).unwrap();
     assert_eq!(e["error"]["kind"], "http", "{}", o.stderr);
@@ -136,9 +134,8 @@ fn a_server_that_stays_unavailable_fails_after_exactly_two_attempts() {
         ["server/discover", "server/discover"]
     );
     assert!(
-        started.elapsed().as_secs() < 30,
-        "Retry-After: 3600 is capped at --timeout, took {:?}",
-        started.elapsed()
+        took.as_secs() < 30,
+        "Retry-After: 3600 is capped at --timeout, took {took:?}"
     );
 
     let o = run(mcpdial(&home).args(["--no-retry", "--json", "info", &s.url]));

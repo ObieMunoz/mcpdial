@@ -11,7 +11,7 @@ use std::io::{self, Read};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -1403,6 +1403,41 @@ pub fn run(cmd: &mut Command) -> Out {
         stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
     }
+}
+
+/// [`run`], and how long the command took.
+///
+/// The clock stops when the process exits, and the output is collected through
+/// files rather than pipes. Deliberately not an `Instant` around [`run`]:
+/// `Command::output` returns only once every copy of the pipe's write end is
+/// closed, and on macOS the standard library still makes those pipes with
+/// `pipe()` and marks the two descriptors close-on-exec afterwards, which is
+/// not one step. A sibling test that spawns inside that window inherits them
+/// and holds them for the whole of its own life, so a command that finished in
+/// a second reads as however long the sibling ran. That is measuring the
+/// suite, not the command.
+pub fn timed(cmd: &mut Command) -> (Duration, Out) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = temp_home(&format!("timed-{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+    let (out, err) = (dir.join("stdout"), dir.join("stderr"));
+    let capture = |path: &std::path::Path| std::fs::File::create(path).expect("a capture file");
+    let started = std::time::Instant::now();
+    let status = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(capture(&out))
+        .stderr(capture(&err))
+        .status()
+        .expect("spawn mcpdial");
+    let took = started.elapsed();
+    let said = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+    (
+        took,
+        Out {
+            code: status.code().unwrap_or(-1),
+            stdout: said(&out),
+            stderr: said(&err),
+        },
+    )
 }
 
 // -- the wall clock ----------------------------------------------------------
