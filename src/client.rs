@@ -891,6 +891,41 @@ fn still_current(rec: &ProbeRecord, key: u64, now: u64) -> bool {
     rec.key == key && now.saturating_sub(rec.checked_at) < STATUS_TTL.as_secs()
 }
 
+/// One saved server without dialing it: what was configured, and what the last
+/// probe left behind, when that probe still describes this server.
+pub struct Saved {
+    pub name: String,
+    pub kind: &'static str,
+    /// The last probe's status and how many seconds ago it ran. `None` for a
+    /// server never dialed, and for one whose configuration or credential has
+    /// changed since, because that probe describes a different server.
+    pub last: Option<(Status, u64)>,
+}
+
+/// Every saved server as the last probe left it, dialing nothing at all.
+/// [`STATUS_TTL`] does not come into it, because this answers what is known
+/// rather than what is true now; how old that answer is travels beside it.
+pub fn saved(store: &Store) -> Result<Vec<Saved>> {
+    let servers = store.servers()?;
+    let keys = probe_keys(store, &servers);
+    let probes = store.probes().unwrap_or_default();
+    let now = now();
+    Ok(servers
+        .iter()
+        .map(|(name, cfg)| Saved {
+            name: name.clone(),
+            kind: cfg.kind(),
+            last: probes
+                .get(name)
+                .filter(|rec| rec.key == keys[name])
+                .and_then(|rec| {
+                    let status = serde_json::from_value(rec.status.clone()).ok()?;
+                    Some((status, now.saturating_sub(rec.checked_at)))
+                }),
+        })
+        .collect())
+}
+
 /// Every saved server with a status, dialing only the ones the remembered
 /// probes cannot answer for.
 pub fn listing(store: &Store, opts: &Options, freshness: Freshness) -> Result<Vec<Listing>> {

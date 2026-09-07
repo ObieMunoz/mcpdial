@@ -12,8 +12,14 @@
 //! Nothing here happens without a person. [`Presenter::asks`] is the same
 //! question the schema prompts ask, false for every pipe, every `--json` and
 //! every `--plain`, and this module refuses to run when it is false. A bare
-//! `mcpdial` under a pipe never reaches the module at all: it gets clap's
-//! usage error and exit 2, exactly as it always has.
+//! `mcpdial` under a pipe gets clap's usage error and exit 2, exactly as it
+//! always has, and [`bare`] is where that is settled.
+//!
+//! With nothing saved there is nothing to pick, and a first run gets
+//! [`welcome`] instead: a few lines saying what mcpdial is and how to get a
+//! server into it, and the prompt back. The catalog is one of the ways it
+//! names, offered as a command rather than sprung as a full-screen checklist
+//! that has to be fetched before it can be drawn.
 //!
 //! [`fzf`] and [`numbered`] are the two halves of picking one of a list, and
 //! they are shared: `fzf` when it is on `PATH`, else the list numbered and
@@ -39,12 +45,73 @@ pub fn at_a_terminal(cli: &crate::Cli) -> bool {
     !crate::present::wants_plain(cli) && std::io::stdin().is_terminal()
 }
 
-/// Whether a bare `mcpdial` opens the picker rather than printing clap's usage
-/// error: a person at a terminal, and a build with a `Rich` presenter to ask
-/// them anything with. It is the same answer [`Presenter::asks`] gives, asked
-/// before there is a command to make a presenter for.
-pub fn wanted(cli: &crate::Cli) -> bool {
-    cfg!(feature = "rich") && at_a_terminal(cli)
+/// What a bare `mcpdial` says. Nothing here dials anything: that is the whole
+/// point of it, and [`client::saved`] is chosen over [`client::listing`] for
+/// exactly that reason.
+pub fn welcome(ui: &dyn Presenter, store: &Store) -> Result<(), Failure> {
+    ui.line(ABOUT);
+    let saved = client::saved(store)?;
+    let Some(first) = saved.first() else {
+        ui.line(NOTHING_SAVED);
+        return Ok(());
+    };
+    let counted = match saved.len() {
+        1 => "1 server saved, as the last dial left it".to_string(),
+        n => format!("{n} servers saved, as the last dial left them"),
+    };
+    ui.line(&format!("\n{counted}:\n"));
+    let rows: Vec<Vec<String>> = saved.iter().map(row).collect();
+    ui.table(&SAVED_HEADERS, &rows);
+    ui.line(&format!(
+        "\nwhat next:\n  \
+         mcpdial pick          # pick a server and a tool, and make the call\n  \
+         mcpdial ls            # dial them all for a status that is current\n  \
+         mcpdial tools {:<8}# what one server offers\n\n\
+         `mcpdial --help` lists every command.",
+        shell_word(&first.name)
+    ));
+    Ok(())
+}
+
+/// What mcpdial is, in the two lines someone who has just installed it needs.
+const ABOUT: &str = "\
+mcpdial dials MCP servers from the shell: what a server offers, a call to one of
+its tools, and a name to keep it under.";
+
+/// The rest of a first run: the three ways to get a server, and what to do once
+/// there is one.
+const NOTHING_SAVED: &str = "
+No servers are saved yet.
+
+getting started:
+  mcpdial import        # the servers Claude, Cursor and VS Code already have
+  mcpdial browse        # tick what you want from a reviewed catalog
+  mcpdial add wiki --http https://mcp.deepwiki.com/mcp
+
+Then `mcpdial ls` says what is saved and whether it answers, and `mcpdial pick`
+picks a server and a tool and makes the call. `mcpdial --help` lists every
+command.";
+
+const SAVED_HEADERS: [&str; 4] = ["NAME", "TYPE", "STATUS", "CHECKED"];
+
+fn row(s: &client::Saved) -> Vec<String> {
+    let (status, checked) = match &s.last {
+        Some((status, age)) => (status.label(), checked_label(*age)),
+        None => ("-".into(), "never".into()),
+    };
+    vec![s.name.clone(), s.kind.into(), status, checked]
+}
+
+/// How long ago a probe ran. `ls` counts in minutes because what it shows was
+/// taken seconds ago; this column may be showing a status from months back, and
+/// the point of it is how much salt to take that with.
+fn checked_label(seconds: u64) -> String {
+    match seconds {
+        s if s < 60 => "just now".into(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 /// A server, a tool, its arguments, and the call.

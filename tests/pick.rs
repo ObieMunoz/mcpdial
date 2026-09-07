@@ -41,6 +41,12 @@ const SERVER_QUESTION: &str = "server (1-";
 const TOOL_QUESTION: &str = "tool (1-";
 const ARGUMENT_QUESTION: &str = "message (string, required)";
 
+/// The heading a first run at a terminal prints, and the line `browse` draws
+/// across the top of the screen it takes over. A first run says the one and
+/// never the other.
+const GETTING_STARTED: &str = "getting started:";
+const CHECKLIST: &str = "Space ticks, / filters, Enter applies";
+
 fn home_with_echo(tag: &str) -> PathBuf {
     let home = temp_home(tag);
     let saved = mcpdial(&home)
@@ -304,43 +310,133 @@ fn no_pty() -> bool {
 /// The rule the whole feature lives under. A bare `mcpdial` with anything but a
 /// person on the other end is clap's usage error on stderr, nothing at all on
 /// stdout and exit 2 - and it arrives, rather than waiting for a keystroke that
-/// is not coming.
+/// is not coming. An empty config is the same rule: the greeting a first run
+/// gets at a terminal is for a person, and no program has ever seen it.
 #[test]
 fn a_bare_mcpdial_under_a_pipe_is_todays_usage_error_and_never_waits() {
-    let home = home_with_echo("pick-pipe");
-    for (args, env) in [
-        (vec![], vec![]),
-        (vec!["--json"], vec![]),
-        (vec!["--plain"], vec![]),
-        (vec![], vec![("MCPDIAL_PLAIN", "1")]),
-        (vec![], vec![("MCPDIAL_JSON", "1")]),
-        (vec![], vec![("TERM", "dumb")]),
+    for home in [
+        home_with_echo("pick-pipe"),
+        temp_home("pick-pipe-first-run"),
     ] {
-        let done = with_a_silent_pipe_on_stdin(&home, &args, &env);
-        assert_eq!(done.code, 2, "{args:?} {env:?}: {}", done.output);
-        assert!(
-            done.output.contains(TODAYS_USAGE),
-            "{args:?} {env:?}: {}",
-            done.output
-        );
-        for asked in [SERVER_QUESTION, TOOL_QUESTION, ARGUMENT_QUESTION] {
+        for (args, env) in [
+            (vec![], vec![]),
+            (vec!["--json"], vec![]),
+            (vec!["--plain"], vec![]),
+            (vec![], vec![("MCPDIAL_PLAIN", "1")]),
+            (vec![], vec![("MCPDIAL_JSON", "1")]),
+            (vec![], vec![("TERM", "dumb")]),
+        ] {
+            let done = with_a_silent_pipe_on_stdin(&home, &args, &env);
+            assert_eq!(done.code, 2, "{args:?} {env:?}: {}", done.output);
             assert!(
-                !done.output.contains(asked),
-                "{args:?} {env:?} offered {asked:?} to a pipe: {}",
+                done.output.contains(TODAYS_USAGE),
+                "{args:?} {env:?}: {}",
                 done.output
             );
+            for asked in [
+                SERVER_QUESTION,
+                TOOL_QUESTION,
+                ARGUMENT_QUESTION,
+                GETTING_STARTED,
+            ] {
+                assert!(
+                    !done.output.contains(asked),
+                    "{args:?} {env:?} offered {asked:?} to a pipe: {}",
+                    done.output
+                );
+            }
+            assert!(
+                done.took < BOUND,
+                "{args:?} {env:?} took {:?}, which is the bound",
+                done.took
+            );
+            assert_eq!(
+                stdout_of(&home, &args, &env),
+                "",
+                "{args:?} {env:?} wrote to stdout, which clap's usage error never has"
+            );
         }
+    }
+}
+
+/// The first run. Nothing is saved yet, so there is nothing to pick and no
+/// reason to seize the screen: a person is told what mcpdial is and the three
+/// ways to get a server into it, and gets their prompt back. The catalog
+/// checklist is one of the three, offered as a command rather than sprung as a
+/// full-screen list nobody asked for - and nothing is fetched to draw it.
+#[test]
+fn a_first_run_at_a_terminal_says_what_to_do_and_hands_the_prompt_back() {
+    if no_pty() {
+        return;
+    }
+    let home = temp_home("pick-first-run");
+    let done = under_pty(&home, &[], &[]);
+    assert_eq!(done.code, 0, "{}", done.output);
+    for said in [
+        GETTING_STARTED,
+        "No servers are saved yet.",
+        "mcpdial import",
+        "mcpdial browse",
+        "mcpdial add wiki --http",
+        "mcpdial ls",
+        "mcpdial --help",
+    ] {
         assert!(
-            done.took < BOUND,
-            "{args:?} {env:?} took {:?}, which is the bound",
-            done.took
-        );
-        assert_eq!(
-            stdout_of(&home, &args, &env),
-            "",
-            "{args:?} {env:?} wrote to stdout, which clap's usage error never has"
+            done.output.contains(said),
+            "the first run never said {said:?}: {}",
+            done.output
         );
     }
+    assert!(
+        !done.output.contains(CHECKLIST),
+        "the first run opened the checklist instead of saying how to: {}",
+        done.output
+    );
+    assert!(
+        !done.output.contains(TODAYS_USAGE),
+        "the first run answered a person with a usage error: {}",
+        done.output
+    );
+    assert!(done.took < BOUND, "took {:?}, the bound", done.took);
+}
+
+/// The other half of the same rule. With servers saved there is something to
+/// pick, but a bare `mcpdial` still says where things stand rather than acting:
+/// the saved servers as the last probe left them, and the commands that do
+/// something. `probes.json` is the witness - dialing a server writes one, and
+/// a bare run must leave the file exactly as it found it.
+#[test]
+fn a_bare_mcpdial_with_servers_saved_greets_and_dials_nothing() {
+    if no_pty() {
+        return;
+    }
+    let home = home_with_echo("pick-greet-saved");
+    let probes = home.join("probes.json");
+    assert!(
+        !probes.exists(),
+        "`add --no-probe` left a probe behind, so the witness proves nothing"
+    );
+
+    let done = under_pty(&home, &[], &[]);
+    assert_eq!(done.code, 0, "{}", done.output);
+    for said in ["echo", "mcpdial pick", "mcpdial ls", "mcpdial --help"] {
+        assert!(
+            done.output.contains(said),
+            "the greeting never said {said:?}: {}",
+            done.output
+        );
+    }
+    assert!(
+        !done.output.contains(SERVER_QUESTION),
+        "a bare run opened the picker: {}",
+        done.output
+    );
+    assert!(
+        !probes.exists(),
+        "a bare run dialed the saved server: {}",
+        std::fs::read_to_string(&probes).unwrap_or_default()
+    );
+    assert!(done.took < BOUND, "took {:?}, the bound", done.took);
 }
 
 /// `mcpdial pick`, the explicit spelling of the bare form, refuses a pipe
@@ -438,15 +534,15 @@ fn at_a_terminal_a_picked_call_runs_and_prints_the_command_it_ran() {
     let home = home_with_echo("pick-tty");
     if !cfg!(feature = "rich") {
         // The agent-only build has no `Rich` to ask with, so a terminal is a
-        // pipe here too and the bare form is the usage error it always was.
-        let done = under_pty(&home, &[], &[]);
+        // pipe here too and `pick` refuses it rather than reading it.
+        let done = under_pty(&home, &["pick"], &[]);
         assert_eq!(done.code, 2, "{}", done.output);
-        assert!(done.output.contains(TODAYS_USAGE), "{}", done.output);
+        assert!(done.output.contains("pick needs a"), "{}", done.output);
         assert!(!done.output.contains(SERVER_QUESTION), "{}", done.output);
         assert!(done.took < BOUND, "took {:?}, the bound", done.took);
         return;
     }
-    for args in [vec![], vec!["pick"]] {
+    for args in [vec!["pick"]] {
         let mut child = pty(&home, &call_line(&args), &[])
             .spawn()
             .expect("spawn script");
@@ -539,7 +635,7 @@ fn the_server_picker_hands_fzf_a_header_and_narrows_the_search_to_the_name() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let done = under_pty(&home, &[], &[]);
+    let done = under_pty(&home, &["pick"], &[]);
     // Exit 130 from fzf is a person leaving the picker, which is not a failure.
     assert_eq!(done.code, 0, "{}", done.output);
     let recorded = std::fs::read_to_string(&recorded).expect("the shim recorded its arguments");
