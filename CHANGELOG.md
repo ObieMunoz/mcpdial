@@ -12,6 +12,13 @@ Every pull request title is a conventional commit subject, and the next section 
 built from those at release time.
 
 
+## [0.2.2] - 2026-09-07
+
+### Fixed
+
+- Never dial from a bare mcpdial (#169)
+
+
 ## [0.2.1] - 2026-09-06
 
 ### Fixed
