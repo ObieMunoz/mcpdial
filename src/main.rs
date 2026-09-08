@@ -40,6 +40,7 @@ mod args;
 mod brief;
 mod browse;
 mod cli;
+mod cmd;
 mod diagnose;
 mod env_defaults;
 mod failure;
@@ -306,7 +307,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
     let plain = present::wants_plain(&cli);
 
     match cli.cmd {
-        Cmd::Add {
+        Cmd::Add(cmd::servers::AddFlags {
             name,
             http,
             catalog,
@@ -321,7 +322,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             deny,
             force,
             no_probe,
-        } => {
+        }) => {
             // A registry entry is saved without being run, as documented: its
             // command usually needs values the user has yet to supply.
             let dial = !no_probe && registry.is_none();
@@ -447,13 +448,13 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Set {
+        Cmd::Set(cmd::servers::SetFlags {
             name,
             allow,
             deny,
             clear_allow,
             clear_deny,
-        } => {
+        }) => {
             let Some(mut cfg) = store.server(&name)? else {
                 return Err(Error::usage(format!("no server named {name:?}")).into());
             };
@@ -511,12 +512,12 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Search {
+        Cmd::Search(cmd::discover::SearchFlags {
             query,
             limit,
             refresh,
             offline,
-        } => {
+        }) => {
             let query = query.join(" ");
             if query.trim().is_empty() {
                 return Err(Failure::hinted(
@@ -600,7 +601,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Import { file, from, force } => {
+        Cmd::Import(cmd::servers::ImportFlags { file, from, force }) => {
             let files: Vec<std::path::PathBuf> = match file {
                 Some(f) => vec![f],
                 None => mcpdial::import_config::candidates(from)
@@ -678,11 +679,11 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Export {
+        Cmd::Export(cmd::servers::ExportFlags {
             names,
             format,
             merge,
-        } => {
+        }) => {
             let out = mcpdial::export_config::export(&store, &names, format, merge.as_deref())?;
             ui.out(&out.document);
             for note in out.notes {
@@ -894,13 +895,13 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Prompt {
+        Cmd::Prompt(cmd::invoke::PromptFlags {
             target,
             name,
             arguments,
             elicit,
             no_browser,
-        } => {
+        }) => {
             opts.elicit = elicitation(ui, elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
             let arguments = match form.json() {
@@ -1031,7 +1032,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             }
         }
 
-        Cmd::Ls { no_probe, refresh } => {
+        Cmd::Ls(cmd::servers::LsFlags { no_probe, refresh }) => {
             if no_probe {
                 let servers = store.servers()?;
                 let creds = store.credentials()?;
@@ -1134,9 +1135,9 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Tools {
+        Cmd::Tools(cmd::invoke::ToolsFlags {
             target: None, long, ..
-        } => {
+        }) => {
             let mut probes = client::probe_all(&store, &opts, true)?;
             if cli.json {
                 for p in &mut probes {
@@ -1179,14 +1180,14 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Tools {
+        Cmd::Tools(cmd::invoke::ToolsFlags {
             target: Some(target),
             long,
             all,
             snapshot: to_file,
             check,
             strict,
-        } => {
+        }) => {
             // Both files are answered before anything is dialed: a path that
             // could never be written, and a snapshot that is not one, cost no
             // connection.
@@ -1260,7 +1261,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Call {
+        Cmd::Call(cmd::invoke::CallFlags {
             target,
             tool,
             arguments,
@@ -1271,7 +1272,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             task,
             detach,
             ttl,
-        } => {
+        }) => {
             let promised = check.as_deref().map(snapshot::read).transpose()?;
             opts.elicit = elicitation(ui, elicit.as_deref(), no_browser, cli.json, false)?;
             let form = args::form(&arguments)?;
@@ -1416,7 +1417,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
 
-        Cmd::Serve {
+        Cmd::Serve(cmd::runtime::ServeFlags {
             target,
             listen,
             stdio,
@@ -1424,7 +1425,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             bearer_env,
             allow,
             deny,
-        } => Ok(serve::run(
+        }) => Ok(serve::run(
             store,
             opts,
             &target,
@@ -1439,7 +1440,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             },
         )?),
 
-        Cmd::Login {
+        Cmd::Login(cmd::auth::LoginFlags {
             target,
             grant,
             scope,
@@ -1451,7 +1452,7 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             client_secret_env,
             redirect_host,
             no_browser,
-        } => {
+        }) => {
             let r = client::resolve(&store, &target)?;
             let dialed = r.config.expanded(|var| std::env::var(var).ok())?;
             let Some(url) = dialed.http else {
