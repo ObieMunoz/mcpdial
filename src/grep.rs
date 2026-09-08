@@ -19,6 +19,7 @@
 //! waits rather than the minute a call gets, for the reason `ls` is: one server
 //! that is down must not hold the whole search.
 
+use crate::cmd::Ctx;
 use crate::diagnose::{advertises, NO_SERVERS};
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::present::{truncate_at, Presenter};
@@ -66,13 +67,11 @@ pub struct Flags {
     max_count: Option<usize>,
 }
 
-pub fn run(
-    ui: &dyn Presenter,
-    store: &Store,
-    opts: &Options,
-    json: bool,
-    flags: Flags,
-) -> Result<u8, Failure> {
+pub fn run(cx: &Ctx<'_>, flags: Flags) -> Result<u8, Failure> {
+    let ui = cx.ui;
+    let store = &cx.store;
+    let opts = &cx.opts;
+    let json = cx.json;
     let matcher = Matcher::new(&flags.pattern, flags.regex, flags.ignore_case)?;
     let wanted = Wanted::of(&flags);
     let readings = match &flags.target {
