@@ -9,7 +9,7 @@
 //! [`choose`]: dyn Presenter::choose
 
 use crate::cli::Cli;
-use crate::{Failure, Health};
+use crate::Failure;
 use mcpdial::catalog;
 use mcpdial::session::{Media, ResourceBody};
 use mcpdial::Error;
@@ -28,6 +28,20 @@ pub mod style;
 
 /// Set (to anything but `0`) to get what a pipe would get, even at a terminal.
 pub const ENV_PLAIN: &str = "MCPDIAL_PLAIN";
+
+/// How a shell session is, as the dot in its prompt shows it.
+///
+/// The dot is a reminder rather than an announcement: each of these states is
+/// also said once, in one dim line, at the moment it becomes true.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Health {
+    /// Connected, with nothing said against it.
+    Fine,
+    /// The saved token runs out within [`TOKEN_RUNNING_OUT`].
+    Expiring,
+    /// The transport failed; the next command dials again.
+    Lost,
+}
 
 pub trait Presenter {
     /// Text on stdout, as given.
