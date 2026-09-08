@@ -27,11 +27,13 @@
 //! an `enum` allows with the same two.
 
 use crate::diagnose::shell_word;
+use crate::failure::{Failure, EXIT_ERROR};
 use crate::media::MediaFiles;
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
-use crate::{args, prompt, Failure, EXIT_ERROR};
+use crate::render::print_tool_result;
+use crate::{args, prompt};
 use mcpdial::client::{self, Freshness, Listing, Options};
 use mcpdial::session::render_content;
 use mcpdial::{Error, Store};
@@ -211,8 +213,7 @@ pub fn run(
         // A picked call is a person's, so it is never `--json`: `asks` is only
         // true where `Rich` was chosen, and `--json` chooses `Plain`.
         let text = crate::rendered(ui, &mut result, false, &files, render_content)?;
-        let failed =
-            ui.paged(|| crate::print_tool_result(ui, out, &result, &text, false, false))?;
+        let failed = ui.paged(|| print_tool_result(ui, out, &result, &text, false, false))?;
         Ok(if failed { EXIT_ERROR } else { 0 })
     });
     // However the call went, the line that made it is the thing to keep: a

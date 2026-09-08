@@ -6,8 +6,9 @@
 //! advertised. Each of those is a different sentence, and picking the right one is
 //! all this file does. Nothing here dials, and nothing here decides an exit code.
 
+use crate::args;
+use crate::failure::Failure;
 use crate::validate::requote_object;
-use crate::{args, Failure};
 use mcpdial::client::describe_params;
 use mcpdial::protocol::{is_not_found, INVALID_PARAMS, METHOD_NOT_FOUND};
 use mcpdial::{client, Error};

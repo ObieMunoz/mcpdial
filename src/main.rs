@@ -2,7 +2,15 @@ use crate::diagnose::{
     call_hint, closest, find_tool, is_argument_error, json_arg_hint, missing_capability,
     missing_item, reads_as_argument_error, server_refused, shell_word, NO_SERVERS,
 };
+use crate::failure::{error_json, refuse_denied, Failure};
+use crate::failure::{EXIT_DRIFT, EXIT_ERROR};
 use crate::media::{emit, emit_resource, file_stem, rendered, resource_stem, MediaFiles};
+use crate::render::{
+    credential_store, daemon_label, expiry_label, listed, listing_row, print_hint, print_json,
+    print_prompts, print_tools, print_value, printed_result, saved_row, tool_lists,
+    tool_lists_lines, truncate, Servers, LISTING_HEADERS,
+};
+use crate::validate::idle_duration;
 use crate::validate::{
     parse_headers, read_json_arg, read_secret, validate_location, validate_patterns,
     validate_timeout,
@@ -10,11 +18,11 @@ use crate::validate::{
 use clap::{CommandFactory, Parser};
 use cli::{Cli, Cmd, Completing, ConfigCmd, TokenCmd};
 use mcpdial::catalog;
-use mcpdial::client::{self, describe_params, Listing, Options, Status};
+use mcpdial::client::{self, Options};
 use mcpdial::config::Source;
 use mcpdial::registry::{Pick, Registry, Resolved};
 use mcpdial::serve;
-use mcpdial::session::{render_content, render_messages};
+use mcpdial::session::render_messages;
 use mcpdial::transport::trace::Trace;
 use mcpdial::{
     daemon, keychain, oauth, Backend, Credential, Elicit, Error, ServerConfig, Store, USER_AGENT,
@@ -25,7 +33,6 @@ use present::{truncate_at, Presenter};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -35,6 +42,7 @@ mod browse;
 mod cli;
 mod diagnose;
 mod env_defaults;
+mod failure;
 mod grep;
 mod media;
 mod notices;
@@ -43,14 +51,11 @@ mod path;
 mod pick;
 mod present;
 mod prompt;
+mod render;
 mod shell;
 mod snapshot;
 mod tasks;
 mod validate;
-
-const EXIT_ERROR: u8 = 1; // the server said no: JSON-RPC error, HTTP error, or tool isError
-const EXIT_USAGE: u8 = 2; // bad arguments or config; nothing was sent
-const EXIT_DRIFT: u8 = 3; // --check: the server no longer matches the snapshot
 
 fn main() -> ExitCode {
     let mut cli = match Cli::try_parse() {
@@ -104,163 +109,6 @@ fn bare_mcpdial(e: clap::Error) -> ExitCode {
             f.report(ui.as_ref());
             ExitCode::from(f.exit_code())
         }
-    }
-}
-
-/// A command that failed, plus an optional hint that spells out what was
-/// expected instead. The hint is a second block of prose for a human and an
-/// `error.hint` string under `--json`, so neither has to guess a tool's shape.
-struct Failure {
-    error: Error,
-    hint: Option<String>,
-    /// The tool the error is about, as `error.tool` under `--json`.
-    tool: Option<String>,
-}
-
-impl Failure {
-    fn hinted(error: Error, hint: impl Into<String>) -> Self {
-        Self {
-            error,
-            hint: Some(hint.into()),
-            tool: None,
-        }
-    }
-
-    /// What the process exits with: a request that was never going to work is
-    /// told apart from one that failed on its way out.
-    fn exit_code(&self) -> u8 {
-        match self.error {
-            Error::Usage(_) | Error::Config(_) => EXIT_USAGE,
-            _ => EXIT_ERROR,
-        }
-    }
-
-    fn report(&self, ui: &dyn Presenter) {
-        ui.error(&self.error.to_string(), self.hint.as_deref());
-    }
-
-    fn to_json(&self) -> Value {
-        let mut v = error_json(&self.error);
-        if let Some(hint) = &self.hint {
-            v["error"]["hint"] = json!(hint);
-        }
-        if let Some(tool) = &self.tool {
-            v["error"]["tool"] = json!(tool);
-        }
-        v
-    }
-}
-
-impl From<Error> for Failure {
-    fn from(error: Error) -> Self {
-        Self {
-            error,
-            hint: None,
-            tool: None,
-        }
-    }
-}
-
-/// The refusal a saved server's allow and deny lists make before anything is
-/// sent for `tool`; `Ok` when they permit it.
-fn refuse_denied(cfg: &ServerConfig, name: &str, tool: &str) -> Result<(), Failure> {
-    cfg.refuse_denied(name, tool).map_err(|error| Failure {
-        error,
-        hint: None,
-        tool: Some(tool.to_string()),
-    })
-}
-
-fn print_json(ui: &dyn Presenter, v: &impl serde::Serialize) {
-    ui.json(&serde_json::to_string_pretty(v).expect("a JSON value is serializable"));
-}
-
-fn print_value(ui: &dyn Presenter, v: &Value, compact: bool) {
-    ui.json(&output::document(v, compact));
-}
-
-/// A note on stderr: prose for a human, `{"note": ...}` under `--json`, where
-/// every line on either stream has to be an object.
-fn print_note(ui: &dyn Presenter, note: &str, json: bool) {
-    if json {
-        ui.err_line(&json!({ "note": note }).to_string());
-    } else {
-        ui.note(note);
-    }
-}
-
-/// A hint on stderr: prose for a human, `{"hint": ...}` under `--json`, where
-/// every line on either stream has to be an object.
-fn print_hint(ui: &dyn Presenter, hint: &str, json: bool) {
-    if json {
-        ui.err_line(&json!({ "hint": hint }).to_string());
-    } else {
-        ui.err_line(hint);
-    }
-}
-
-/// A tool result on stdout, and a marker on stderr when the tool reported an
-/// error: a failure whose text is a plain sentence otherwise reads as success
-/// to anyone not checking `$?`. Under `--json` the object carries `isError`
-/// itself. Returns whether the tool reported an error.
-fn print_tool_result(
-    ui: &dyn Presenter,
-    out: &Output,
-    result: &Value,
-    text: &str,
-    json: bool,
-    one_line: bool,
-) -> Result<bool, Failure> {
-    let failed = result["isError"].as_bool().unwrap_or(false);
-    let payload = if json {
-        Payload::Json {
-            value: result,
-            one_line,
-        }
-    } else {
-        Payload::Text(text)
-    };
-    let sent = out.deliver(payload, failed)?;
-    output::show(ui, sent, shape(json), json, || {
-        if json {
-            print_value(ui, result, one_line);
-        } else if !text.is_empty() {
-            ui.text(text);
-        }
-    });
-    if !json && failed {
-        ui.err_line("(tool reported an error)");
-    }
-    Ok(failed)
-}
-
-/// A `tools/call` result on stdout, however it was fetched: the one the call
-/// waited for, and the one a finished task was holding. Returns whether the
-/// tool reported an error.
-fn printed_result(
-    ui: &dyn Presenter,
-    out: &Output,
-    result: &mut Value,
-    json: bool,
-    save_dir: Option<&Path>,
-    stem: &str,
-) -> Result<(bool, String), Failure> {
-    let files = MediaFiles {
-        dir: save_dir,
-        stem: file_stem(stem),
-    };
-    let text = rendered(ui, result, json, &files, render_content)?;
-    let failed = ui.paged(|| print_tool_result(ui, out, result, &text, json, false))?;
-    Ok((failed, text))
-}
-
-/// A result goes out as a document under `--json` and as the server's own text
-/// otherwise, cut or whole.
-fn shape(json: bool) -> As {
-    if json {
-        As::Json
-    } else {
-        As::Text
     }
 }
 
@@ -411,53 +259,6 @@ fn name_and_args(rest: &str) -> (&str, &str) {
         "" => (name, "{}"),
         args => (name, args),
     }
-}
-
-/// One JSON object per error, so a program can branch on `kind` without parsing prose.
-fn error_json(e: &Error) -> Value {
-    let mut v = json!({ "message": e.to_string() });
-    match e {
-        Error::Rpc { code, data, .. } => {
-            v["kind"] = json!("rpc");
-            v["code"] = json!(code);
-            if let Some(d) = data {
-                v["data"] = d.clone();
-            }
-        }
-        Error::Http {
-            status,
-            www_authenticate,
-            ..
-        } => {
-            v["kind"] = json!("http");
-            v["status"] = json!(status);
-            if let Some(w) = www_authenticate {
-                v["www_authenticate"] = json!(w);
-            }
-        }
-        Error::Transport(_) => v["kind"] = json!("transport"),
-        Error::Auth(_) => v["kind"] = json!("auth"),
-        Error::Config(_) => v["kind"] = json!("config"),
-        Error::Usage(_) => v["kind"] = json!("usage"),
-    }
-    json!({ "error": v })
-}
-
-/// The allow and deny lists a server has, under the keys they are saved as.
-fn tool_lists(cfg: &ServerConfig) -> Vec<(&'static str, Vec<String>)> {
-    [("allow", &cfg.allow), ("deny", &cfg.deny)]
-        .into_iter()
-        .filter(|(_, patterns)| !patterns.is_empty())
-        .map(|(list, patterns)| (list, patterns.clone()))
-        .collect()
-}
-
-/// One line per list that is set, for the receipt a human reads.
-fn tool_lists_lines(lists: &[(&str, Vec<String>)]) -> Vec<String> {
-    lists
-        .iter()
-        .map(|(list, patterns)| format!("{list}: {}", patterns.join(", ")))
-        .collect()
 }
 
 fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
@@ -1873,163 +1674,4 @@ fn run(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             Ok(0)
         }
     }
-}
-
-/// How a credential store is named in a sentence.
-fn credential_store(backend: Backend) -> &'static str {
-    match backend {
-        Backend::File => "credentials.json",
-        Backend::Keychain => "the OS keychain",
-    }
-}
-
-const LISTING_HEADERS: [&str; 8] = [
-    "NAME", "TYPE", "STATUS", "AGE", "AUTH", "DAEMON", "SERVER", "TOOLS",
-];
-
-/// `tools` with no target: the probes under a key, as `tools TARGET` puts its
-/// own list under `tools`. A bare array could never grow a field beside them.
-#[derive(serde::Serialize)]
-struct Servers<'a> {
-    servers: &'a [client::Probe],
-}
-
-/// What was saved about one server, as every `ls --json` row carries it. A probe
-/// adds its status fields on top of these rather than in place of them, so a
-/// program reading a row never has to know whether `--no-probe` was passed.
-fn saved_row(name: &str, cfg: &ServerConfig, credential: bool, running: bool) -> Value {
-    json!({
-        "name": name, "kind": cfg.kind(), "location": cfg.location(),
-        "headers": cfg.headers, "token_env": cfg.token_env,
-        "credential": credential,
-        "source": cfg.source, "timeout": cfg.timeout,
-        "running": running,
-        "allow": cfg.allow, "deny": cfg.deny,
-    })
-}
-
-/// One server as `ls` shows it, which is also what `add` shows after dialing.
-fn listing_row(l: &Listing) -> Vec<String> {
-    vec![
-        l.name.clone(),
-        l.kind.into(),
-        l.status.label(),
-        age_label(l.age_seconds),
-        auth_label(l),
-        daemon_label(l.running),
-        l.server
-            .clone()
-            .or_else(|| l.status.detail().map(truncate))
-            .unwrap_or_else(|| "-".into()),
-        l.tools.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
-    ]
-}
-
-fn auth_label(l: &Listing) -> String {
-    match (l.auth, &l.status) {
-        (client::AuthUsed::Env, _) => l
-            .token_env
-            .as_ref()
-            .map_or_else(|| "env".into(), |var| format!("${var}")),
-        (client::AuthUsed::Saved, _) => "saved".into(),
-        (client::AuthUsed::None, Status::AuthRequired) => "needed".into(),
-        (client::AuthUsed::None, Status::TokenRejected) => "rejected".into(),
-        (client::AuthUsed::None, _) => "-".into(),
-    }
-}
-
-fn daemon_label(running: bool) -> String {
-    if running { "running" } else { "-" }.into()
-}
-
-/// `--idle SECS` as a duration; zero or less would be a daemon that quits at once.
-fn idle_duration(secs: Option<f64>) -> Result<Option<Duration>, Failure> {
-    match secs {
-        None => Ok(None),
-        Some(s) if s > 0.0 => Ok(Some(Duration::from_secs_f64(s))),
-        Some(_) => Err(Error::usage("--idle needs a positive number of seconds").into()),
-    }
-}
-
-fn age_label(seconds: u64) -> String {
-    match seconds {
-        0 => "now".into(),
-        s if s < 60 => format!("{s}s"),
-        s => format!("{}m", s / 60),
-    }
-}
-
-fn expiry_label(cred: &Credential) -> String {
-    match cred.expires_at {
-        None => "no expiry recorded".into(),
-        Some(t) => {
-            let now = mcpdial::config::now();
-            if t <= now {
-                "expired".into()
-            } else {
-                let secs = t - now;
-                if secs >= 86_400 {
-                    format!("expires in {}d", secs / 86_400)
-                } else if secs >= 3600 {
-                    format!("expires in {}h", secs / 3600)
-                } else {
-                    format!("expires in {}m", (secs / 60).max(1))
-                }
-            }
-        }
-    }
-}
-
-fn truncate(s: &str) -> String {
-    truncate_at(s.lines().next().unwrap_or(""), 60)
-}
-
-fn print_tools(ui: &dyn Presenter, tools: &[Value], long: bool) {
-    // A `--long` listing has room to spell out what calling a tool does; the
-    // short one carries only the hint a caller cannot afford to miss.
-    let hints: &dyn Fn(&Value) -> String = if long {
-        &client::hint_tags
-    } else {
-        &client::hint_mark
-    };
-    ui.named(tools, long, "parameters", &describe_params, hints);
-}
-
-/// A `--long` listing reads like a document and may run past the screen; the
-/// short one is a summary that belongs on it.
-fn listed(ui: &dyn Presenter, long: bool, print: impl FnOnce()) {
-    if long {
-        ui.paged(print);
-    } else {
-        print();
-    }
-}
-
-fn print_prompts(ui: &dyn Presenter, prompts: &[Value], long: bool) {
-    ui.named(prompts, long, "arguments", &describe_prompt_args, &|_| {
-        String::new()
-    });
-}
-
-/// A prompt's arguments carry no schema: every one of them is a string.
-fn describe_prompt_args(prompt: &Value) -> Vec<String> {
-    prompt["arguments"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
-        .iter()
-        .map(|a| {
-            let mut line = a["name"].as_str().unwrap_or("?").to_string();
-            if a["required"].as_bool().unwrap_or(false) {
-                line.push_str(" (required)");
-            }
-            if let Some(d) = a["description"].as_str() {
-                let first = d.trim().lines().next().unwrap_or("");
-                if !first.is_empty() {
-                    line.push_str(&format!(" - {first}"));
-                }
-            }
-            line
-        })
-        .collect()
 }
