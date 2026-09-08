@@ -148,115 +148,15 @@ pub(crate) struct Cli {
 #[derive(Subcommand)]
 pub(crate) enum Cmd {
     /// Save a server under a name
-    Add {
-        /// The name to save it under, and to dial it by from then on
-        name: String,
-        /// Streamable HTTP endpoint
-        #[arg(
-            long,
-            value_name = "URL",
-            conflicts_with_all = ["stdio", "registry", "catalog"],
-            required_unless_present_any = ["stdio", "registry", "catalog"]
-        )]
-        http: Option<String>,
-        /// An entry of the curated catalog, by its id (`mcpdial catalog` lists them)
-        #[arg(long, value_name = "ID", conflicts_with_all = ["stdio", "registry"])]
-        catalog: Option<String>,
-        /// Command that speaks MCP on stdio
-        #[arg(long, value_name = "CMD", conflicts_with = "registry")]
-        stdio: Option<String>,
-        /// A server in the MCP registry, by its registry name (io.github.owner/server)
-        #[arg(long, value_name = "NAME")]
-        registry: Option<String>,
-        /// Run this package type from the registry entry rather than the first offered
-        #[arg(
-            long,
-            value_name = "TYPE",
-            value_parser = ["npm", "pypi", "oci"],
-            requires = "registry",
-            conflicts_with = "remote"
-        )]
-        package: Option<String>,
-        /// Use the registry entry's remote endpoint rather than a package
-        #[arg(long, requires = "registry")]
-        remote: bool,
-        /// A value the registry entry leaves to you, repeatable, in the order listed
-        #[arg(long, value_name = "VALUE", requires = "registry")]
-        arg: Vec<String>,
-        /// Environment variable for the stdio process, repeatable
-        #[arg(long, value_name = "KEY=VALUE")]
-        env: Vec<String>,
-        /// Working directory for the stdio process
-        #[arg(long, value_name = "DIR")]
-        cwd: Option<String>,
-        /// Offer only tools matching this glob (`*`, `?`), repeatable
-        #[arg(long, value_name = "PATTERN")]
-        allow: Vec<String>,
-        /// Hide and refuse tools matching this glob, repeatable; beats --allow
-        #[arg(long, value_name = "PATTERN")]
-        deny: Vec<String>,
-        /// Replace a server already saved under this name
-        #[arg(long)]
-        force: bool,
-        /// Save without dialing the server for its status
-        #[arg(long)]
-        no_probe: bool,
-    },
+    Add(crate::cmd::servers::AddFlags),
     /// Change a saved server's tool allow and deny lists, or show them
-    Set {
-        #[arg(help = SAVED_NAME_HELP)]
-        name: String,
-        /// Replace the allow list with these globs (`*`, `?`), repeatable
-        #[arg(long, value_name = "PATTERN", conflicts_with = "clear_allow")]
-        allow: Vec<String>,
-        /// Replace the deny list with these globs, repeatable; beats --allow
-        #[arg(long, value_name = "PATTERN", conflicts_with = "clear_deny")]
-        deny: Vec<String>,
-        /// Remove the allow list, so every tool not denied is offered
-        #[arg(long)]
-        clear_allow: bool,
-        /// Remove the deny list
-        #[arg(long)]
-        clear_deny: bool,
-    },
+    Set(crate::cmd::servers::SetFlags),
     /// Search the MCP registry, ranked, over a local copy of its whole list
-    Search {
-        /// Words that must all appear in an entry's name, title or description
-        query: Vec<String>,
-        /// How many matches to show
-        #[arg(long, default_value_t = 20, value_name = "N")]
-        limit: usize,
-        /// Fetch the whole list again, even if the local copy is recent
-        #[arg(long, conflicts_with = "offline")]
-        refresh: bool,
-        /// Search the local copy as it is, without touching the network
-        #[arg(long)]
-        offline: bool,
-    },
+    Search(crate::cmd::discover::SearchFlags),
     /// Import servers from a host's config (Claude, Cursor, Windsurf, VS Code, Codex, OpenCode)
-    Import {
-        /// A host's config: JSON with an `mcpServers`, `servers` (VS Code) or `mcp`
-        /// (OpenCode) object, or Codex's `config.toml`. Omit to scan the usual locations.
-        file: Option<std::path::PathBuf>,
-        /// Scan one host's locations only: vscode, codex, opencode, claude, cursor or windsurf
-        #[arg(long, value_name = "HOST", conflicts_with = "file")]
-        from: Option<mcpdial::import_config::Host>,
-        /// Overwrite servers that already exist under the same name
-        #[arg(long)]
-        force: bool,
-    },
+    Import(crate::cmd::servers::ImportFlags),
     /// Write saved servers out in a host's own shape, to stdout for you to redirect
-    Export {
-        /// Servers to export; every saved server when none is named
-        #[arg(value_name = "NAME")]
-        names: Vec<String>,
-        /// Shape to write: mcpservers (Claude, Cursor, Windsurf), vscode or codex
-        #[arg(long, default_value = "mcpservers", value_name = "FORMAT")]
-        format: mcpdial::export_config::Format,
-        /// Print this host file with the exported servers merged in; it is never written
-        #[arg(long, value_name = "FILE")]
-        merge: Option<std::path::PathBuf>,
-    },
+    Export(crate::cmd::servers::ExportFlags),
     /// List the curated catalog of servers, grouped by category
     Catalog {
         /// Use the copy built into the binary instead of refreshing it
@@ -311,35 +211,9 @@ pub(crate) enum Cmd {
         name: String,
     },
     /// List saved servers with their connection status
-    Ls {
-        /// Do not connect; just show the configuration
-        #[arg(long)]
-        no_probe: bool,
-        /// Dial every server again instead of reusing a status from the last few minutes
-        #[arg(long, conflicts_with = "no_probe")]
-        refresh: bool,
-    },
+    Ls(crate::cmd::servers::LsFlags),
     /// Show the tools a server offers (every server when no target is given)
-    Tools {
-        /// A saved name, an http(s):// URL, or stdio:<command>; every saved server when omitted
-        target: Option<String>,
-        /// Show full descriptions and parameters
-        #[arg(short, long)]
-        long: bool,
-        /// Include the tools the server's allow and deny lists hide, marked (denied)
-        #[arg(long, requires = "target")]
-        all: bool,
-        /// Write the tools in full to FILE, which must not exist, instead of listing them
-        #[arg(long, value_name = "FILE", requires = "target", conflicts_with_all = ["long", "all"])]
-        snapshot: Option<PathBuf>,
-        /// Report how the tools differ from a snapshot; exit 3 when a caller would break
-        #[arg(long, value_name = "FILE", requires = "target",
-              conflicts_with_all = ["snapshot", "long", "all"])]
-        check: Option<PathBuf>,
-        /// With --check: hold every snapshotted tool to the object the snapshot holds
-        #[arg(long, requires = "check")]
-        strict: bool,
-    },
+    Tools(crate::cmd::invoke::ToolsFlags),
     /// Search tools, resources, prompts and instructions across saved servers
     Grep(grep::Flags),
     /// Initialize and show server identity and capabilities
@@ -348,35 +222,7 @@ pub(crate) enum Cmd {
         target: String,
     },
     /// Call a tool
-    Call {
-        #[arg(help = TARGET_HELP)]
-        target: String,
-        /// A tool name from `mcpdial tools TARGET`
-        tool: String,
-        /// One JSON object (inline, @file, or - for stdin), or key=value pairs
-        arguments: Vec<String>,
-        /// Answers for anything the server elicits mid-call: a JSON object or @file
-        #[arg(long, value_name = "JSON")]
-        elicit: Option<String>,
-        /// Print a url-mode elicitation's address instead of opening a browser
-        #[arg(long)]
-        no_browser: bool,
-        /// Refuse to call when TOOL has drifted from this snapshot; exit 3 with the differences
-        #[arg(long, value_name = "FILE")]
-        check: Option<PathBuf>,
-        /// With --check: hold TOOL to the object the snapshot holds
-        #[arg(long, requires = "check")]
-        strict: bool,
-        /// Have the server run TOOL in the background, and poll until it finishes
-        #[arg(long, conflicts_with = "detach")]
-        task: bool,
-        /// Start TOOL in the background, print the task id, and exit
-        #[arg(long)]
-        detach: bool,
-        /// Seconds the server is asked to keep a --task or --detach task for (default 3600)
-        #[arg(long, value_name = "SECS")]
-        ttl: Option<u64>,
-    },
+    Call(crate::cmd::invoke::CallFlags),
     /// Show one tool's name, description, and input and output schemas
     Schema {
         #[arg(help = TARGET_HELP)]
@@ -415,20 +261,7 @@ pub(crate) enum Cmd {
         long: bool,
     },
     /// Render a prompt into the messages it expands to
-    Prompt {
-        #[arg(help = TARGET_HELP)]
-        target: String,
-        /// A prompt name from `mcpdial prompts TARGET`
-        name: String,
-        /// One JSON object (inline, @file, or - for stdin), or key=value pairs
-        arguments: Vec<String>,
-        /// Answers for anything the server elicits mid-call: a JSON object or @file
-        #[arg(long, value_name = "JSON")]
-        elicit: Option<String>,
-        /// Print a url-mode elicitation's address instead of opening a browser
-        #[arg(long)]
-        no_browser: bool,
-    },
+    Prompt(crate::cmd::invoke::PromptFlags),
     /// List the background tasks a server is running, or get, wait for, or cancel one
     Tasks(tasks::Flags),
     /// Send any JSON-RPC method; a saved server's allow and deny lists do not apply
@@ -442,33 +275,7 @@ pub(crate) enum Cmd {
         params: String,
     },
     /// Expose a saved server to a client that must not see its credentials
-    Serve {
-        #[arg(help = TARGET_HELP)]
-        target: String,
-        /// Address to listen on; port 0 picks a free one and reports it
-        #[arg(
-            long,
-            value_name = "ADDR",
-            default_value = "127.0.0.1:0",
-            conflicts_with = "stdio"
-        )]
-        listen: String,
-        /// Speak MCP on this process's own stdin and stdout instead of listening
-        #[arg(long)]
-        stdio: bool,
-        /// Allow --listen on an address other than loopback
-        #[arg(long, conflicts_with = "stdio")]
-        listen_any: bool,
-        /// Env var holding the bearer token clients must present
-        #[arg(long, value_name = "VAR", conflicts_with = "stdio")]
-        bearer_env: Option<String>,
-        /// Expose only tools matching this glob, on top of the server's own lists
-        #[arg(long, value_name = "PATTERN")]
-        allow: Vec<String>,
-        /// Never expose tools matching this glob, repeatable; beats --allow
-        #[arg(long, value_name = "PATTERN")]
-        deny: Vec<String>,
-    },
+    Serve(crate::cmd::runtime::ServeFlags),
     /// Print the usage guide written for programs and agents that call mcpdial
     Guide,
     /// Print a shell completion script for bash, zsh, fish, elvish or powershell
@@ -478,54 +285,7 @@ pub(crate) enum Cmd {
         shell: Shell,
     },
     /// Authorize in the browser once and save the token (HTTP servers)
-    Login {
-        /// A saved name, or an http(s):// URL
-        target: String,
-        /// authorization-code (a browser, once) or client-credentials (a confidential
-        /// client's --client-id and secret, no human)
-        #[arg(
-            long,
-            value_name = "GRANT",
-            default_value = "authorization-code",
-            value_parser = ["authorization-code", "client-credentials"]
-        )]
-        grant: String,
-        /// Space-separated scopes (default: whatever the server advertises)
-        #[arg(long)]
-        scope: Option<String>,
-        /// Fixed loopback port for the redirect (default: any free port)
-        #[arg(long)]
-        port: Option<u16>,
-        /// Use a pre-registered client id instead of a client metadata document or
-        /// dynamic registration
-        #[arg(long)]
-        client_id: Option<String>,
-        /// Present this client ID metadata document as the client id, instead of the
-        /// one the project publishes, whether or not the server advertises support
-        #[arg(long, value_name = "URL", conflicts_with_all = ["client_id", "no_client_metadata"])]
-        client_metadata_url: Option<String>,
-        /// Register dynamically even when the server accepts client metadata documents
-        #[arg(long)]
-        no_client_metadata: bool,
-        /// Read that client's secret from stdin. Never from an argument.
-        #[arg(long, requires = "client_id")]
-        client_secret: bool,
-        /// Read that client's secret from $VAR instead of stdin
-        #[arg(
-            long,
-            value_name = "VAR",
-            requires = "client_id",
-            conflicts_with = "client_secret"
-        )]
-        client_secret_env: Option<String>,
-        /// Loopback host in the redirect URI: 127.0.0.1 (default, with a localhost
-        /// fallback if the server refuses it) or localhost
-        #[arg(long, value_name = "HOST", value_parser = ["127.0.0.1", "localhost"])]
-        redirect_host: Option<String>,
-        /// Print the URL but do not try to open a browser
-        #[arg(long)]
-        no_browser: bool,
-    },
+    Login(crate::cmd::auth::LoginFlags),
     /// Delete the saved credential for a server
     Logout {
         #[arg(help = CREDENTIAL_TARGET_HELP)]
