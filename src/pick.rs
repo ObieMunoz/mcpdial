@@ -29,8 +29,10 @@
 use crate::diagnose::shell_word;
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::media::MediaFiles;
+use crate::media::{file_stem, rendered};
 use crate::notices::Notices;
 use crate::output::Output;
+use crate::present::truncate_at;
 use crate::present::Presenter;
 use crate::render::print_tool_result;
 use crate::{args, prompt};
@@ -208,11 +210,11 @@ pub fn run(
     let finished = outcome.and_then(|mut result| {
         let files = MediaFiles {
             dir: save_dir,
-            stem: crate::file_stem(&tool),
+            stem: file_stem(&tool),
         };
         // A picked call is a person's, so it is never `--json`: `asks` is only
         // true where `Rich` was chosen, and `--json` chooses `Plain`.
-        let text = crate::rendered(ui, &mut result, false, &files, render_content)?;
+        let text = rendered(ui, &mut result, false, &files, render_content)?;
         let failed = ui.paged(|| print_tool_result(ui, out, &result, &text, false, false))?;
         Ok(if failed { EXIT_ERROR } else { 0 })
     });
@@ -279,7 +281,7 @@ fn tool_lines(tools: &[Value]) -> (String, Vec<String>) {
                     .trim();
                 vec![
                     t["name"].as_str().unwrap_or("?").to_string(),
-                    crate::truncate_at(about, 80),
+                    truncate_at(about, 80),
                 ]
             })
             .collect::<Vec<_>>(),

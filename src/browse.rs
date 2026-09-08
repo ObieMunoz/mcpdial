@@ -11,6 +11,7 @@
 
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::pick::on_path;
+use crate::present::truncate_at;
 use crate::present::Presenter;
 use crate::render::{listing_row, LISTING_HEADERS};
 use mcpdial::catalog::{self, Entry};
@@ -269,11 +270,11 @@ pub(crate) fn render(items: &[Item], checked: &[bool]) -> Vec<String> {
             let mut line = format!(
                 "[{}] {:<kw$}  {:<nw$}  {:<tw$}  {:<aw$}  {}",
                 if on { 'x' } else { ' ' },
-                crate::truncate_at(&i.key, kw),
-                crate::truncate_at(&i.name, nw),
-                crate::truncate_at(&i.transport, tw),
+                truncate_at(&i.key, kw),
+                truncate_at(&i.name, nw),
+                truncate_at(&i.transport, tw),
                 i.auth,
-                crate::truncate_at(&i.summary, 80),
+                truncate_at(&i.summary, 80),
             );
             if let Some(saved) = &i.installed {
                 line.push_str(&format!("  (saved as {saved})"));
