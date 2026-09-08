@@ -15,15 +15,18 @@ mod history;
 mod input;
 mod status;
 
+use crate::diagnose::{
+    advertises, closest, find_tool, missing_capability, missing_item, shell_word, tool_usage,
+};
+use crate::media::{emit_rendered, emit_resource, file_stem, rendered, resource_stem, MediaFiles};
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::path::Filter;
 use crate::present::{truncate_at, Health, Presenter};
+use crate::validate::parse_object;
 use crate::{
-    advertises, args, brief, closest, elicitation, emit_rendered, emit_resource, file_stem,
-    find_tool, listed, missing_capability, missing_item, name_and_args, parse_object, path,
-    print_prompts, print_tools, print_value, refuse_denied, rendered, resource_stem, shell_word,
-    tool_usage, Failure, MediaFiles, EXIT_ERROR,
+    args, brief, elicitation, listed, name_and_args, path, print_prompts, print_tools, print_value,
+    refuse_denied, Failure, EXIT_ERROR,
 };
 use command::{
     names_a_result, no_such_tool, print_rerun, shell_call, shell_call_hint, shell_failed,

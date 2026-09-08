@@ -1,7 +1,9 @@
 //! `edit`: the last call's arguments through `$EDITOR` and back.
 
 use super::history::{History, Origin};
-use crate::{file_stem, output, parse_object};
+use crate::media::file_stem;
+use crate::output;
+use crate::validate::parse_object;
 use mcpdial::Error;
 use serde_json::Value;
 use std::path::Path;

@@ -17,7 +17,7 @@
 //! where it is larger than the whole budget on its own, because `_` has to name
 //! something. Nothing is written to disk, and nothing outlives the process.
 
-use crate::{file_stem, resource_stem};
+use crate::media::{file_stem, resource_stem};
 use mcpdial::session::{extension_for, media, media_blocks, resource_bodies, Media, ResourceBody};
 use mcpdial::Error;
 use serde_json::{Map, Value};

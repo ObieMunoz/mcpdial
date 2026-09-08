@@ -19,8 +19,9 @@
 //! waits rather than the minute a call gets, for the reason `ls` is: one server
 //! that is down must not hold the whole search.
 
+use crate::diagnose::{advertises, NO_SERVERS};
 use crate::present::{truncate_at, Presenter};
-use crate::{advertises, Failure, EXIT_ERROR, NO_SERVERS};
+use crate::{Failure, EXIT_ERROR};
 use mcpdial::client::{self, Options, Status, PROBE_TIMEOUT};
 use mcpdial::config::ServerConfig;
 use mcpdial::{Error, Store};

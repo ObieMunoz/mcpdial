@@ -26,10 +26,12 @@
 //! answered by its number or by the line itself. `prompt.rs` picks the values
 //! an `enum` allows with the same two.
 
+use crate::diagnose::shell_word;
+use crate::media::MediaFiles;
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
-use crate::{args, prompt, shell_word, Failure, MediaFiles, EXIT_ERROR};
+use crate::{args, prompt, Failure, EXIT_ERROR};
 use mcpdial::client::{self, Freshness, Listing, Options};
 use mcpdial::session::render_content;
 use mcpdial::{Error, Store};

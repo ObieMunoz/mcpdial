@@ -6,7 +6,8 @@
 //! and stays text where it says `string`. `key:=json` skips the schema and takes
 //! the value as written, which is how arrays, objects and a forced string arrive.
 
-use crate::{closest, parse_object, shell_word};
+use crate::diagnose::{closest, shell_word};
+use crate::validate::parse_object;
 use mcpdial::schema;
 use mcpdial::transport::stdio::split_command;
 use mcpdial::{Error, Result};
