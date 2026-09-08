@@ -50,12 +50,12 @@
 //! - *Finished tasks.* Dropped from the note as soon as anything here sees them
 //!   terminal, and dropped anyway once their ttl has passed.
 
+use crate::diagnose::advertises;
+use crate::diagnose::{missing_capability, shell_word};
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
-use crate::{
-    info_hint, missing_capability, print_hint, print_json, shell_word, Failure, EXIT_ERROR,
-};
+use crate::{info_hint, print_hint, print_json, Failure, EXIT_ERROR};
 use mcpdial::client::{Connection, Options};
 use mcpdial::config::TaskRecord;
 use mcpdial::protocol::METHOD_NOT_FOUND;
@@ -633,7 +633,7 @@ fn declares(conn: &Connection, part: &str) -> bool {
 }
 
 fn offers_any_tasks(conn: &Connection) -> bool {
-    crate::advertises(&conn.server_info, "tasks")
+    advertises(&conn.server_info, "tasks")
 }
 
 /// A tool that will not run in the foreground at all.

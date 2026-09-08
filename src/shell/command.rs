@@ -9,15 +9,16 @@ use super::help::{SAVE, SHOW_USAGE};
 use super::history::{History, Keep, Origin, Recorded};
 use super::input::shell_tools;
 use super::shell_watched;
+use crate::diagnose::{
+    call_hint, find_tool, is_argument_error, reads_as_argument_error, server_refused, shell_word,
+    suggest_tool,
+};
+use crate::media::{emit_rendered, file_stem, rendered, MediaFiles};
 use crate::notices::Notices;
 use crate::output::{As, Output, Payload};
 use crate::path::{Filter, Filtered};
 use crate::present::Presenter;
-use crate::{
-    call_hint, emit_rendered, file_stem, find_tool, is_argument_error, output, print_hint,
-    print_note, print_tool_result, print_value, prompt, reads_as_argument_error, rendered,
-    server_refused, shell_word, suggest_tool, Failure, MediaFiles,
-};
+use crate::{output, print_hint, print_note, print_tool_result, print_value, prompt, Failure};
 use mcpdial::session::{render_content, resource_bodies};
 use mcpdial::subscribe::Subscriptions;
 use mcpdial::{client, Error};

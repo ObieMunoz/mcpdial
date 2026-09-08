@@ -7,9 +7,10 @@
 use super::input::Lists;
 use super::shell_watched;
 use super::status::Says;
+use crate::diagnose::missing_item;
 use crate::notices::Notices;
 use crate::present::Presenter;
-use crate::{missing_item, print_value, Failure};
+use crate::{print_value, Failure};
 use mcpdial::session::render_resource;
 use mcpdial::subscribe::{Mechanism, Sink, Subscriptions};
 use mcpdial::{client, Error};

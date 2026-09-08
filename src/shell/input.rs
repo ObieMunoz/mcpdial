@@ -5,8 +5,9 @@
 //! was not asked for, because nothing is going to complete against it.
 
 use super::complete::{ShellHelper, Suggests};
+use crate::diagnose::field_values;
+use crate::present;
 use crate::present::{Health, Presenter};
-use crate::{field_values, present};
 use mcpdial::{client, Error, Store};
 use serde_json::Value;
 use std::cell::RefCell;
