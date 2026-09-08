@@ -24,7 +24,7 @@
 //! the shell's reader, which needs a terminal on both stdin and stdout; a piped
 //! session reads lines itself and never constructs a helper, let alone calls one.
 
-use crate::SHELL_COMMANDS;
+use super::help::SHELL_COMMANDS;
 use mcpdial::schema;
 use serde_json::{json, Map, Value};
 use std::rc::Rc;
@@ -329,7 +329,7 @@ impl Opening {
     /// A scan of unfinished JSON, which stops at anything it cannot read rather
     /// than guessing: an unbalanced `}`, an array, a nesting deeper than
     /// [`NESTING`], or a cursor sitting just past a value that is already whole.
-    fn read(text: &str) -> Option<Self> {
+    pub(crate) fn read(text: &str) -> Option<Self> {
         let mut stack: Vec<Frame> = Vec::new();
         let mut open: Option<(usize, String, bool)> = None;
         let mut closed: Option<String> = None;
