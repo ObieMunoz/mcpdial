@@ -89,7 +89,7 @@ const TERMINAL: [&str; 3] = ["completed", "failed", "cancelled"];
 
 #[derive(clap::Args)]
 pub struct Flags {
-    #[arg(help = crate::TARGET_HELP)]
+    #[arg(help = crate::cli::TARGET_HELP)]
     target: String,
     #[command(subcommand)]
     what: Option<Which>,
