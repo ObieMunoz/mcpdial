@@ -15,6 +15,7 @@ mod history;
 mod input;
 mod status;
 
+use crate::cmd::{elicitation, name_and_args};
 use crate::diagnose::{
     advertises, closest, find_tool, missing_capability, missing_item, shell_word, tool_usage,
 };
@@ -26,7 +27,7 @@ use crate::path::Filter;
 use crate::present::{truncate_at, Health, Presenter};
 use crate::render::{listed, print_prompts, print_tools, print_value};
 use crate::validate::parse_object;
-use crate::{args, brief, elicitation, name_and_args, path};
+use crate::{args, brief, path};
 use command::{
     names_a_result, no_such_tool, print_rerun, shell_call, shell_call_hint, shell_failed,
     shell_fill, shell_filter, shell_named, shell_save, split_filter, split_word, takes_a_filter,

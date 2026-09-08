@@ -50,9 +50,9 @@
 //! - *Finished tasks.* Dropped from the note as soon as anything here sees them
 //!   terminal, and dropped anyway once their ttl has passed.
 
+use crate::cmd::info_hint;
 use crate::diagnose::{advertises, missing_capability, shell_word};
 use crate::failure::{Failure, EXIT_ERROR};
-use crate::info_hint;
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
@@ -308,7 +308,7 @@ pub fn run(
     notices: &mut Notices<'_>,
     flags: Flags,
 ) -> Result<u8, Failure> {
-    let mut conn = crate::dial(store, opts, &flags.target)?;
+    let mut conn = crate::cmd::dial(store, opts, &flags.target)?;
     speaks_tasks(&conn)?;
     let json = printing.json;
     match flags.what {
