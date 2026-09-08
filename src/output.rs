@@ -7,8 +7,8 @@
 //! release emitted, and a written file is named by the summary that replaces
 //! it. Neither flag given, every byte is the one that was always there.
 
+use crate::cli::{Cli, Cmd};
 use crate::present::Presenter;
-use crate::{Cli, Cmd};
 use mcpdial::session::ResourceBody;
 use mcpdial::Error;
 use serde_json::{json, Map, Value};
