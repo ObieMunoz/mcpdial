@@ -9,9 +9,10 @@
 //! whole screen. A pipe, `--json` or `--plain` gets the entries as objects,
 //! exactly what `catalog --json` prints, so the agent surface holds.
 
+use crate::failure::{Failure, EXIT_ERROR};
 use crate::pick::on_path;
 use crate::present::Presenter;
-use crate::{listing_row, Failure, EXIT_ERROR, LISTING_HEADERS};
+use crate::render::{listing_row, LISTING_HEADERS};
 use mcpdial::catalog::{self, Entry};
 use mcpdial::client::{self, Options, Status};
 use mcpdial::config::{self, ServerConfig};

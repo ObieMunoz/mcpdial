@@ -6,10 +6,12 @@
 //! reason: it is settled off the wire, and a malformed object costs no dial.
 
 use crate::diagnose::json_kind;
+use crate::failure::Failure;
 use crate::present::{truncate_at, Presenter};
 use mcpdial::{Error, ServerConfig};
 use serde_json::{json, Value};
 use std::io::{IsTerminal, Read};
+use std::time::Duration;
 
 /// A secret from `$VAR`, or from stdin. Never from an argument, where `ps` and the
 /// shell history would both keep a copy.
@@ -167,6 +169,15 @@ pub(crate) fn parse_headers(items: &[String]) -> Result<Vec<(String, String)>, E
             ))),
         })
         .collect()
+}
+
+/// `--idle SECS` as a duration; zero or less would be a daemon that quits at once.
+pub(crate) fn idle_duration(secs: Option<f64>) -> Result<Option<Duration>, Failure> {
+    match secs {
+        None => Ok(None),
+        Some(s) if s > 0.0 => Ok(Some(Duration::from_secs_f64(s))),
+        Some(_) => Err(Error::usage("--idle needs a positive number of seconds").into()),
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@
 //! [`choose`]: dyn Presenter::choose
 
 use crate::cli::Cli;
-use crate::Failure;
+use crate::failure::Failure;
 use mcpdial::catalog;
 use mcpdial::session::{Media, ResourceBody};
 use mcpdial::Error;

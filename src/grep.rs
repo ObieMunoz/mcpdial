@@ -20,8 +20,9 @@
 //! that is down must not hold the whole search.
 
 use crate::diagnose::{advertises, NO_SERVERS};
+use crate::failure::{Failure, EXIT_ERROR};
 use crate::present::{truncate_at, Presenter};
-use crate::{Failure, EXIT_ERROR};
+use crate::render::print_json;
 use mcpdial::client::{self, Options, Status, PROBE_TIMEOUT};
 use mcpdial::config::ServerConfig;
 use mcpdial::{Error, Store};
@@ -104,7 +105,7 @@ pub fn run(
     }
 
     if json {
-        crate::print_json(
+        print_json(
             ui,
             &Found {
                 matches: &matches,

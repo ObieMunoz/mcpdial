@@ -50,12 +50,13 @@
 //! - *Finished tasks.* Dropped from the note as soon as anything here sees them
 //!   terminal, and dropped anyway once their ttl has passed.
 
-use crate::diagnose::advertises;
-use crate::diagnose::{missing_capability, shell_word};
+use crate::diagnose::{advertises, missing_capability, shell_word};
+use crate::failure::{Failure, EXIT_ERROR};
+use crate::info_hint;
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
-use crate::{info_hint, print_hint, print_json, Failure, EXIT_ERROR};
+use crate::render::{print_hint, print_json, printed_result};
 use mcpdial::client::{Connection, Options};
 use mcpdial::config::TaskRecord;
 use mcpdial::protocol::METHOD_NOT_FOUND;
@@ -454,7 +455,7 @@ fn collected(
         .map_or_else(|| id.to_string(), |note| note.tool.clone());
     let state = fetched(store, conn, id)?;
     let mut result = seen_through(ui, store, conn, id, &state, notices)?;
-    let (failed, _) = crate::printed_result(
+    let (failed, _) = printed_result(
         ui,
         printing.out,
         &mut result,

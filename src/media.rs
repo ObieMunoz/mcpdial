@@ -5,9 +5,11 @@
 //! and leaves a line saying so; without it the block is described rather than
 //! printed. Either way the text around it is rendered exactly as it always was.
 
+use crate::failure::Failure;
+use crate::output;
 use crate::output::{As, Output, Payload};
 use crate::present::Presenter;
-use crate::{output, print_value, shape, Failure};
+use crate::render::{print_value, shape};
 use mcpdial::session::{
     extension_for, render_resource, resource_bodies, save_media, Media, MediaSink,
 };
