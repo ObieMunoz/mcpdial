@@ -15,16 +15,15 @@ mod history;
 mod input;
 mod status;
 
-use crate::cmd::{elicitation, name_and_args};
+use crate::cmd::{elicitation, name_and_args, Ctx};
 use crate::diagnose::{
     advertises, closest, find_tool, missing_capability, missing_item, shell_word, tool_usage,
 };
 use crate::failure::{refuse_denied, Failure, EXIT_ERROR};
 use crate::media::{emit_rendered, emit_resource, file_stem, rendered, resource_stem, MediaFiles};
 use crate::notices::Notices;
-use crate::output::Output;
 use crate::path::Filter;
-use crate::present::{truncate_at, Health, Presenter};
+use crate::present::{truncate_at, Health};
 use crate::render::{listed, print_prompts, print_tools, print_value};
 use crate::validate::parse_object;
 use crate::{args, brief, path};
@@ -41,15 +40,13 @@ use help::{
 };
 use history::{History, Origin};
 use input::{shell_tools, Input, Lent, Lists};
-use mcpdial::client::Options;
 use mcpdial::notify::Notice;
 use mcpdial::session::{render_messages, Watcher};
 use mcpdial::subscribe::{Mechanism, Subscriptions};
-use mcpdial::{client, Error, Store};
+use mcpdial::{client, Error};
 use serde_json::{json, Value};
 use status::{connected_line, dropped_the_session, expiring_line, Says};
 use std::io::IsTerminal;
-use std::path::Path;
 use std::rc::Rc;
 
 /// One shell request with somebody listening to what the server says on the
@@ -92,20 +89,14 @@ impl Watcher for ShellWatch<'_, '_> {
     }
 }
 
-// Every one of these is a share of what `run` in `main.rs` holds; they become
-// one context when the other commands move out beside this one.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run(
-    ui: &dyn Presenter,
-    store: &Store,
-    opts: &mut Options,
-    out: &Output,
-    notices: &mut Notices<'_>,
-    save_dir: Option<&Path>,
-    json: bool,
-    target: String,
-    no_browser: bool,
-) -> Result<u8, Failure> {
+pub(crate) fn run(cx: &mut Ctx<'_>, target: String, no_browser: bool) -> Result<u8, Failure> {
+    let ui = cx.ui;
+    let store = &cx.store;
+    let opts = &mut cx.opts;
+    let out = &cx.out;
+    let notices = &mut cx.notices;
+    let save_dir = cx.save_dir.as_deref();
+    let json = cx.json;
     opts.elicit = elicitation(ui, None, no_browser, json, true)?;
     let r = client::resolve(store, &target)?;
     let mut conn = client::connect(store, &r, opts)?;

@@ -51,13 +51,14 @@
 //!   terminal, and dropped anyway once their ttl has passed.
 
 use crate::cmd::info_hint;
+use crate::cmd::Ctx;
 use crate::diagnose::{advertises, missing_capability, shell_word};
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::notices::Notices;
 use crate::output::Output;
 use crate::present::Presenter;
 use crate::render::{print_hint, print_json, printed_result};
-use mcpdial::client::{Connection, Options};
+use mcpdial::client::Connection;
 use mcpdial::config::TaskRecord;
 use mcpdial::protocol::METHOD_NOT_FOUND;
 use mcpdial::{Error, KnownVersion, Store};
@@ -300,14 +301,16 @@ pub fn print_detached(ui: &dyn Presenter, task: &Value, json: bool) {
 }
 
 /// `tasks`: the listing, or one of the three things done to a single task.
-pub fn run(
-    ui: &dyn Presenter,
-    store: &Store,
-    opts: &Options,
-    printing: Printing<'_>,
-    notices: &mut Notices<'_>,
-    flags: Flags,
-) -> Result<u8, Failure> {
+pub fn run(cx: &mut Ctx<'_>, flags: Flags) -> Result<u8, Failure> {
+    let ui = cx.ui;
+    let store = &cx.store;
+    let opts = &cx.opts;
+    let printing = Printing {
+        out: &cx.out,
+        save_dir: cx.save_dir.as_deref(),
+        json: cx.json,
+    };
+    let notices = &mut cx.notices;
     let mut conn = crate::cmd::dial(store, opts, &flags.target)?;
     speaks_tasks(&conn)?;
     let json = printing.json;

@@ -26,22 +26,21 @@
 //! answered by its number or by the line itself. `prompt.rs` picks the values
 //! an `enum` allows with the same two.
 
+use crate::cmd::Ctx;
 use crate::diagnose::shell_word;
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::media::MediaFiles;
 use crate::media::{file_stem, rendered};
-use crate::notices::Notices;
-use crate::output::Output;
 use crate::present::truncate_at;
 use crate::present::Presenter;
 use crate::render::print_tool_result;
 use crate::{args, prompt};
-use mcpdial::client::{self, Freshness, Listing, Options};
+use mcpdial::client::{self, Freshness, Listing};
 use mcpdial::session::render_content;
 use mcpdial::{Error, Store};
 use serde_json::{json, Value};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 /// A person at a terminal on both streams, which is what a question needs and
@@ -121,14 +120,13 @@ fn checked_label(seconds: u64) -> String {
 }
 
 /// A server, a tool, its arguments, and the call.
-pub fn run(
-    ui: &dyn Presenter,
-    store: &Store,
-    opts: &Options,
-    out: &Output,
-    notices: &mut Notices<'_>,
-    save_dir: Option<&Path>,
-) -> Result<u8, Failure> {
+pub fn run(cx: &mut Ctx<'_>) -> Result<u8, Failure> {
+    let ui = cx.ui;
+    let store = &cx.store;
+    let opts = &cx.opts;
+    let out = &cx.out;
+    let notices = &mut cx.notices;
+    let save_dir = cx.save_dir.as_deref();
     // Both halves of what a question needs, worded as one refusal because the
     // agent surface is one set of bytes: a build without `rich` must answer a
     // pipe exactly as a build with it does.

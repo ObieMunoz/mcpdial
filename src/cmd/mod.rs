@@ -177,17 +177,7 @@ pub(crate) fn dispatch(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Export(flags) => servers::export(&mut cx, flags),
 
-        Cmd::Shell { target, no_browser } => shell::run(
-            cx.ui,
-            &cx.store,
-            &mut cx.opts,
-            &cx.out,
-            &mut cx.notices,
-            cx.save_dir.as_deref(),
-            cx.json,
-            target,
-            no_browser,
-        ),
+        Cmd::Shell { target, no_browser } => shell::run(&mut cx, target, no_browser),
 
         Cmd::Start { name, idle } => runtime::start(&mut cx, name, idle),
 
@@ -215,9 +205,7 @@ pub(crate) fn dispatch(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
             offline,
             preview,
         } => browse::run(
-            cx.ui,
-            &cx.store,
-            &cx.opts,
+            &cx,
             browse::Flags {
                 all,
                 offline,
@@ -228,15 +216,7 @@ pub(crate) fn dispatch(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Pick => {
             cx.opts.elicit = elicitation(cx.ui, None, false, cx.json, false)?;
-            let save_dir = cx.save_dir.clone();
-            pick::run(
-                cx.ui,
-                &cx.store,
-                &cx.opts,
-                &cx.out,
-                &mut cx.notices,
-                save_dir.as_deref(),
-            )
+            pick::run(&mut cx)
         }
 
         Cmd::Completions { shell } => {
@@ -266,27 +246,13 @@ pub(crate) fn dispatch(ui: &dyn Presenter, cli: Cli) -> Result<u8, Failure> {
 
         Cmd::Tools(flags) => invoke::tools(&mut cx, flags),
 
-        Cmd::Grep(flags) => grep::run(cx.ui, &cx.store, &cx.opts, cx.json, flags),
+        Cmd::Grep(flags) => grep::run(&cx, flags),
 
         Cmd::Info { target } => discover::info(&mut cx, target),
 
         Cmd::Call(flags) => invoke::call(&mut cx, flags),
 
-        Cmd::Tasks(flags) => {
-            let save_dir = cx.save_dir.clone();
-            tasks::run(
-                cx.ui,
-                &cx.store,
-                &cx.opts,
-                tasks::Printing {
-                    out: &cx.out,
-                    save_dir: save_dir.as_deref(),
-                    json: cx.json,
-                },
-                &mut cx.notices,
-                flags,
-            )
-        }
+        Cmd::Tasks(flags) => tasks::run(&mut cx, flags),
 
         Cmd::Raw {
             target,

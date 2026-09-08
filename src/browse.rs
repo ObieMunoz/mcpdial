@@ -9,6 +9,7 @@
 //! whole screen. A pipe, `--json` or `--plain` gets the entries as objects,
 //! exactly what `catalog --json` prints, so the agent surface holds.
 
+use crate::cmd::Ctx;
 use crate::failure::{Failure, EXIT_ERROR};
 use crate::pick::on_path;
 use crate::present::truncate_at;
@@ -39,7 +40,10 @@ pub struct Flags {
 /// written before fzf starts and removed when it is done.
 const PREVIEW_FILE: &str = "browse-preview.json";
 
-pub fn run(ui: &dyn Presenter, store: &Store, opts: &Options, flags: Flags) -> Result<u8, Failure> {
+pub fn run(cx: &Ctx<'_>, flags: Flags) -> Result<u8, Failure> {
+    let ui = cx.ui;
+    let store = &cx.store;
+    let opts = &cx.opts;
     if let Some(key) = &flags.preview {
         ui.out(&preview_for(store, key));
         return Ok(0);
