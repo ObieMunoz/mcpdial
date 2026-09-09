@@ -12,6 +12,19 @@ Every pull request title is a conventional commit subject, and the next section 
 built from those at release time.
 
 
+## [0.2.3] - 2026-09-09
+
+### Changed
+
+- Move the command-line definition into its own module (#172)
+- Give the interactive shell its own module (#173)
+- Separate media handling, diagnostics and validation (#174)
+- Collect the output helpers into a render module (#175)
+- Give each command's flags a module of its own (#176)
+- Reduce main to a dispatch (#177)
+- Every command takes the context (#179)
+
+
 ## [0.2.2] - 2026-09-07
 
 ### Fixed
